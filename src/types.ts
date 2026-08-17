@@ -226,6 +226,8 @@ export interface HealthSnapshot {
     heapTotal: number;
     rss: number;
     external: number;
+    /** v8.getHeapStatistics().heap_size_limit — the ceiling V8 may grow to. */
+    heapSizeLimit?: number;
   };
   cpu: { userMicros: number; systemMicros: number; percent: number };
   eventLoopLagMs: number;
