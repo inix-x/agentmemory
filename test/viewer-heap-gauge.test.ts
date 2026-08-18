@@ -6,6 +6,10 @@ import { readFileSync } from "node:fs";
 // committed, not what it may grow to. The gauge now measures against
 // heapSizeLimit, and it divides raw byte values so it cannot disagree with
 // evaluateHealth over a rounding step.
+//
+// Asserting on the emitted source rather than running the gauge follows
+// viewer-graph-cooldown and viewer-memories-sort: the viewer ships as one
+// HTML file with inline JS, so there is no module to import and execute.
 describe("viewer heap gauge", () => {
   const viewer = readFileSync("src/viewer/index.html", "utf-8");
 
