@@ -22,10 +22,19 @@ describe("viewer heap gauge", () => {
 
   it("computes the percentage from raw bytes, not the MB-rounded label values", () => {
     expect(viewer).toMatch(
-      /heapPct\s*=\s*ceilingBytes\s*>\s*0\s*\?\s*Math\.round\(\(\(snap\.memory\.heapUsed\s*\|\|\s*0\)\s*\/\s*ceilingBytes\)\s*\*\s*100\)/,
+      /heapPercent\s*=\s*ceilingBytes\s*>\s*0\s*\?\s*\(\(snap\.memory\.heapUsed\s*\|\|\s*0\)\s*\/\s*ceilingBytes\)\s*\*\s*100/,
     );
     // The old form divided two already-rounded MB numbers.
     expect(viewer).not.toMatch(/heapPct\s*=\s*heapTotal\s*>\s*0\s*\?\s*Math\.round\(\(heapUsed\s*\/\s*heapTotal\)/);
+  });
+
+  it("picks the gauge colour on the unrounded percentage", () => {
+    // Rounding first put the gauge a whole point out of step with
+    // evaluateHealth, which compares the raw value: at 80.4% health warns
+    // while a rounded 80 left the bar on the lower colour.
+    expect(viewer).toMatch(/heapPct\s*=\s*Math\.round\(heapPercent\)/);
+    expect(viewer).toMatch(/heapColor\s*=\s*\(heapPercent\s*>\s*80\s*&&\s*rssAboveFloor\)/);
+    expect(viewer).toMatch(/\(heapPercent\s*>\s*60\s*&&\s*rssAboveFloor\)/);
   });
 
   it("rounds only for the displayed label", () => {
