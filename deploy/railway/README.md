@@ -65,7 +65,9 @@ For an authenticated call, your client must send `Authorization: Bearer <secret>
 ## Viewer access (port 3113 stays internal)
 
 Railway only exposes the single public port from your service's
-`PORT` env var (which we map to 3111). The viewer stays bound to
+`PORT` env var. The container always serves on 3111 (the app reads
+`III_REST_PORT`, never `PORT`), so the service's target port must be set to
+3111 in the Railway dashboard. The viewer stays bound to
 localhost inside the container. `railway ssh` is an interactive shell
 only — it does not support `-L`-style port forwarding, so reach the
 viewer with one of the following.
@@ -89,6 +91,39 @@ process to the image and start it from `entrypoint.sh` on a fixed port,
 expose that port through a second Railway TCP Proxy, then use a native
 `ssh -L 3113:localhost:3113 <proxy-host> -p <proxy-port>` from your laptop.
 This is the heavier path; option A is what most users will want.
+
+## Self-healing
+
+Railway only queries `healthcheckPath` at deploy time and only restarts on a
+process **exit**, so a container that stops serving without exiting is invisible
+to the platform. Every wedge observed so far has the same shape: the iii engine
+process dies and the node process keeps running, reconnecting forever. The
+engine owns the REST listener, the stream port, and the state store, so nothing
+can be served once it is gone.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AGENTMEMORY_EXIT_ON_ENGINE_DEATH` | **on** | Exits non-zero when the engine dies more than 5s after it was spawned, so the platform restarts the container. Set `0` to disable. |
+| `AGENTMEMORY_HEALTH_ESCALATE` | unset (**off**) | Exits after 10 consecutive failures of the 30s KV probe. |
+
+`AGENTMEMORY_EXIT_ON_ENGINE_DEATH` is on by default because it acts on a
+process-exit event rather than a probe: there is no threshold to tune and no
+false positive to trade against. Deaths within the first 5 seconds keep the
+startup-failure path, which reports a clearer message.
+
+`AGENTMEMORY_HEALTH_ESCALATE` is a probe and stays off. Do not enable it until an
+external uptime check exists against `/agentmemory/livez`. It forces process
+exits and `restartPolicyMaxRetries` is 10, so a wedge recurring on every boot
+reaches a stopped deployment in under an hour with nothing notifying you.
+Truthy spellings are `1`, `true`, `TRUE`. **`yes` and `on` are rejected.**
+
+`restartPolicyType` is `ALWAYS` rather than `ON_FAILURE`: the SIGTERM shutdown
+path ends in `process.exit(0)`, which `ON_FAILURE` reads as success and would not
+restart.
+
+An earlier revision of this file documented an in-container shell watchdog
+(`AGENTMEMORY_WATCHDOG*`). That was removed on 2026-08-26 in favour of the
+engine-exit handler above plus external uptime monitoring.
 
 ## Rotate the HMAC secret
 
@@ -132,5 +167,5 @@ See <https://railway.com/pricing> for the current rate card.
   or use the dashboard's manual snapshot feature.
 - The Dockerfile builds on Railway's builder on every deploy. First
   deploy is ~2 minutes; cached layers make subsequent rebuilds quick.
-  Pin `AGENTMEMORY_VERSION` / `III_VERSION` build args in the
+  Pin the `III_VERSION` build arg in the
   service's *Variables* tab to lock a specific release.

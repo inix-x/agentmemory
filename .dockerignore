@@ -1,0 +1,10 @@
+node_modules
+.git
+dist
+eval
+benchmark
+test
+.claude
+.serena
+docs
+*.log

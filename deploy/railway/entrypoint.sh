@@ -67,7 +67,9 @@ workers:
           file_path: /data/stream_store
   - name: iii-observability
     config:
-      enabled: true
+      # false, unlike the other three deploy targets: the in-memory OTEL
+      # exporter drove heap growth that crashed the container (2026-08-23).
+      enabled: false
       service_name: agentmemory
       exporter: memory
       sampling_ratio: 1.0
