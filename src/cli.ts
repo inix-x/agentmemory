@@ -936,6 +936,7 @@ function spawnEngineBackground(
   if (!isDocker && typeof child.pid === "number") {
     writeEnginePidfile(child.pid);
   }
+  const spawnedAt = Date.now();
   const stderrChunks: Buffer[] = [];
   let stderrBytes = 0;
   const MAX_STDERR_CAPTURE = 16 * 1024;
@@ -965,11 +966,43 @@ function spawnEngineBackground(
       }
       if (!isDocker) clearEnginePidfile();
       clearEngineState();
+
+      // The engine owns the REST listener, the stream port and the state store.
+      // When it dies the surviving node process cannot serve anything, but it
+      // stays up reconnecting forever, so the platform sees a healthy container
+      // and no HTTP. That is the shape of every wedge observed so far.
+      //
+      // Report it and exit, so a supervisor can restart the whole container.
+      // This is a process-exit event, not a heuristic probe, so there is no
+      // false-positive to tune. Death during startup keeps the old path: the
+      // startup code below reads `startupFailure` and renders a better message.
+      const engineRanFor = Date.now() - spawnedAt;
+      if (engineRanFor > ENGINE_STARTUP_GRACE_MS) {
+        console.error(
+          `[agentmemory] engine exited after ${Math.round(engineRanFor / 1000)}s ` +
+            `(code=${code} signal=${signal}); nothing can be served without it, exiting`,
+        );
+        if (stderr.trim()) console.error(`[agentmemory] engine stderr:\n${stderr}`);
+        if (process.env["AGENTMEMORY_EXIT_ON_ENGINE_DEATH"] !== "0") {
+          process.exit(1);
+        }
+      }
     }
   });
   child.unref();
   return child;
 }
+
+// Engine deaths inside this window are treated as startup failures, which the
+// startup path reports with a better message. Later deaths mean a running
+// deployment lost its engine, which is fatal to serving.
+//
+// Keep this SHORT. It is a hole in the only mechanism that catches engine death:
+// an engine that dies inside the window after startup already completed leaves
+// the container up and serving nothing, which is the original bug. A failed
+// spawn surfaces within a second or two, so a few seconds is all the startup
+// path needs.
+const ENGINE_STARTUP_GRACE_MS = 5_000;
 
 function startIiiBin(iiiBin: string, configPath: string): boolean {
   const s = p.spinner();
