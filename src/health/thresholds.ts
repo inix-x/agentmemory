@@ -30,6 +30,12 @@ export function evaluateHealth(
   let critical = false;
   let degraded = false;
 
+  // NOTE: unreachable in production today. iii-sdk's setConnectionState only
+  // assigns a private field and emits nothing, so the "connection_state"
+  // listener in monitor.ts never fires and connectionState stays "connected"
+  // for the life of the process. Kept because the field is part of the
+  // snapshot contract and a future SDK may emit it; do not rely on it as a
+  // liveness signal until it does.
   if (
     snapshot.connectionState === "disconnected" ||
     snapshot.connectionState === "failed"
@@ -39,6 +45,18 @@ export function evaluateHealth(
   } else if (snapshot.connectionState === "reconnecting") {
     alerts.push("connection_reconnecting");
     degraded = true;
+  }
+
+  // The KV probe in collectHealth is the only check that exercises the state
+  // store end to end (set then get, raced against a 5s timeout). A store that
+  // stops answering takes the HTTP workers down with it, so a failed probe is
+  // the earliest reliable signal of that failure and belongs at critical.
+  // kvConnectivity is optional on the snapshot, and older persisted snapshots
+  // predate it, so an absent or malformed value must read as "no signal"
+  // rather than as a failure.
+  if (snapshot.kvConnectivity?.status === "error") {
+    alerts.push("kv_probe_failed");
+    critical = true;
   }
 
   if (snapshot.eventLoopLagMs > cfg.eventLoopLagCriticalMs) {

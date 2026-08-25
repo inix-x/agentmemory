@@ -172,3 +172,48 @@ describe("evaluateHealth memory severity — denominator", () => {
     expect(evaluateHealth(s).status).toBe("critical");
   });
 });
+
+describe("evaluateHealth KV connectivity", () => {
+  it("goes critical when the KV probe fails", () => {
+    const s = snap({
+      kvConnectivity: { status: "error", error: "kv_probe_failed", latencyMs: 5000 },
+    });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("critical");
+    expect(alerts).toContain("kv_probe_failed");
+  });
+
+  it("adds no KV alert when the probe succeeds", () => {
+    const { status, alerts } = evaluateHealth(snap());
+    expect(status).toBe("healthy");
+    expect(alerts.find((a) => a.startsWith("kv_"))).toBeUndefined();
+  });
+
+  // kvConnectivity is optional on HealthSnapshot, and snapshots persisted before
+  // the field existed still come back from KV, so absence must read as "no
+  // signal" rather than as a failure.
+  it("stays healthy when kvConnectivity is absent", () => {
+    const s = snap();
+    delete s.kvConnectivity;
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("healthy");
+    expect(alerts.find((a) => a.startsWith("kv_"))).toBeUndefined();
+  });
+
+  it("does not throw or alert on a malformed kvConnectivity", () => {
+    const s = snap({ kvConnectivity: { status: undefined as unknown as string } });
+    expect(() => evaluateHealth(s)).not.toThrow();
+    expect(evaluateHealth(s).alerts.find((a) => a.startsWith("kv_"))).toBeUndefined();
+  });
+
+  it("reports the KV alert alongside other critical signals", () => {
+    const s = snap({
+      kvConnectivity: { status: "error", error: "kv_probe_failed" },
+      eventLoopLagMs: 900,
+    });
+    const { status, alerts } = evaluateHealth(s);
+    expect(status).toBe("critical");
+    expect(alerts).toContain("kv_probe_failed");
+    expect(alerts.find((a) => a.startsWith("event_loop_lag_critical_"))).toBeDefined();
+  });
+});
