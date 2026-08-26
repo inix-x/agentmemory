@@ -88,6 +88,14 @@ function makeVector(id = "obs_1"): VectorIndex {
   return vector;
 }
 
+function seeded(count: number): VectorIndex {
+  const vector = new VectorIndex();
+  for (let i = 0; i < count; i++) {
+    vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+  }
+  return vector;
+}
+
 async function getBm25Manifest(kv: MockKV): Promise<TestIndexShardManifest> {
   const manifest = await kv.get<TestIndexShardManifest>(
     BM25_SCOPE,
@@ -851,14 +859,6 @@ describe("IndexPersistence vector bucketing", () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  function seeded(count: number): VectorIndex {
-    const vector = new VectorIndex();
-    for (let i = 0; i < count; i++) {
-      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
-    }
-    return vector;
-  }
-
   it("writes O(1) buckets when one vector is added, not O(corpus)", async () => {
     const vector = seeded(60);
     const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
@@ -1163,14 +1163,6 @@ describe("IndexPersistence vector layout changes", () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  function seeded(count: number): VectorIndex {
-    const vector = new VectorIndex();
-    for (let i = 0; i < count; i++) {
-      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
-    }
-    return vector;
-  }
-
   it("reclaims buckets stranded by a smaller bucket count", async () => {
     await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
       shardChars: 400,
@@ -1273,14 +1265,6 @@ describe("IndexPersistence torn vector save", () => {
     kv = countingKV();
   });
   afterEach(() => vi.useRealTimers());
-
-  function seeded(count: number): VectorIndex {
-    const vector = new VectorIndex();
-    for (let i = 0; i < count; i++) {
-      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
-    }
-    return vector;
-  }
 
   it("loses nothing when a save dies partway through writing buckets", async () => {
     await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
@@ -1386,14 +1370,6 @@ describe("IndexPersistence vector save/load hazards", () => {
     kv = countingKV();
   });
   afterEach(() => vi.useRealTimers());
-
-  function seeded(count: number): VectorIndex {
-    const vector = new VectorIndex();
-    for (let i = 0; i < count; i++) {
-      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
-    }
-    return vector;
-  }
 
   async function loadedSize(): Promise<number> {
     const loaded = await new IndexPersistence(
@@ -1504,14 +1480,6 @@ describe("IndexPersistence vector layout version", () => {
     kv = countingKV();
   });
   afterEach(() => vi.useRealTimers());
-
-  function seeded(count: number): VectorIndex {
-    const vector = new VectorIndex();
-    for (let i = 0; i < count; i++) {
-      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
-    }
-    return vector;
-  }
 
   it("rewrites everything when the stored layout version differs", async () => {
     const vector = seeded(20);
