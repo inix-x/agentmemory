@@ -1478,13 +1478,6 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            // Read the precomputed snapshot rather than enumerating the graph.
-            // KV.graphSnapshot exists for exactly this (#814, state/schema.ts):
-            // it carries the same aggregate counts in one small key. Listing
-            // the scopes instead pulled every node and edge over the engine
-            // transport — on a real corpus that is a multi-hundred-MB frame
-            // against a 16 MiB limit (state/frame-guard.ts), which kills the
-            // worker connection every time this resource is read.
             const snapshot = await kv.get<GraphSnapshot>(
               KV.graphSnapshot,
               "current",
@@ -1502,8 +1495,6 @@ export function registerMcpEndpoints(
                       totalEdges: stats?.totalEdges ?? 0,
                       nodesByType: stats?.nodesByType ?? {},
                       edgesByType: stats?.edgesByType ?? {},
-                      // Absent snapshot reports zeros rather than falling back
-                      // to a scope enumeration: the fallback is the failure.
                       ...(snapshot ? {} : { pending: true }),
                     }),
                   },
