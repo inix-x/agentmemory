@@ -5,8 +5,7 @@ import type {
   SessionSummary,
   Memory,
   Session,
-  GraphNode,
-  GraphEdge,
+  GraphSnapshot,
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
@@ -1479,14 +1478,18 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const nodes = await kv.list<GraphNode>(KV.graphNodes);
-            const edges = await kv.list<GraphEdge>(KV.graphEdges);
-            const nodesByType: Record<string, number> = {};
-            for (const n of nodes)
-              nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
-            const edgesByType: Record<string, number> = {};
-            for (const e of edges)
-              edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+            // Read the precomputed snapshot rather than enumerating the graph.
+            // KV.graphSnapshot exists for exactly this (#814, state/schema.ts):
+            // it carries the same aggregate counts in one small key. Listing
+            // the scopes instead pulled every node and edge over the engine
+            // transport — on a real corpus that is a multi-hundred-MB frame
+            // against a 16 MiB limit (state/frame-guard.ts), which kills the
+            // worker connection every time this resource is read.
+            const snapshot = await kv.get<GraphSnapshot>(
+              KV.graphSnapshot,
+              "current",
+            );
+            const stats = snapshot?.stats;
             return {
               status_code: 200,
               body: {
@@ -1495,10 +1498,13 @@ export function registerMcpEndpoints(
                     uri,
                     mimeType: "application/json",
                     text: JSON.stringify({
-                      totalNodes: nodes.length,
-                      totalEdges: edges.length,
-                      nodesByType,
-                      edgesByType,
+                      totalNodes: stats?.totalNodes ?? 0,
+                      totalEdges: stats?.totalEdges ?? 0,
+                      nodesByType: stats?.nodesByType ?? {},
+                      edgesByType: stats?.edgesByType ?? {},
+                      // Absent snapshot reports zeros rather than falling back
+                      // to a scope enumeration: the fallback is the failure.
+                      ...(snapshot ? {} : { pending: true }),
                     }),
                   },
                 ],
