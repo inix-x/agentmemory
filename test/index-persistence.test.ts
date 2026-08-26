@@ -10,6 +10,8 @@ const BM25_MANIFEST_KEY = "data:manifest";
 const VECTOR_LEGACY_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
 const VECTOR_BUCKET_SCOPE = "mem:index:bm25:vectors:v2";
+// Mirrors the cap isValidBucketEntry enforces at load time.
+const MAX_BUCKET_CHUNKS = 10_000;
 
 // Mirrors the production key builder. Chunk keys carry the bucket's content
 // hash so a bucket is never overwritten in place.
@@ -1113,6 +1115,39 @@ describe("IndexPersistence vector bucketing", () => {
     // Every other bucket still loads.
     expect(loaded.vector!.size).toBeGreaterThan(0);
     expect(loaded.vector!.size).toBeLessThan(30);
+  });
+
+  // isValidBucketEntry rejects any entry above MAX_BUCKET_CHUNKS, so a save
+  // that publishes one hands the next boot a bucket it classifies as corrupt —
+  // dropping vectors whose bytes are entirely intact, and marking every load
+  // incomplete from then on. A small configured shardChars is all it takes.
+  it("fails the save rather than publish a bucket the loader will reject", async () => {
+    const vector = seeded(200);
+    // Asserted, not assumed: at one chunk per character the bucket has to clear
+    // the cap, or a shorter serialisation would leave this testing nothing.
+    const [, body] = [...vector.serializeBuckets(1)][0]!;
+    expect(body.length).toBeGreaterThan(MAX_BUCKET_CHUNKS);
+
+    // A good save first, so there is something to lose.
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+      vectorBuckets: 1,
+    }).save();
+
+    // save() funnels the failure through logFailure, so nothing throws out
+    // here. What has to hold is that the live manifest still names a readable
+    // bucket rather than an oversized one the loader will throw away.
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 1,
+      vectorBuckets: 1,
+    }).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(200);
   });
 });
 

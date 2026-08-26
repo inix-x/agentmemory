@@ -402,6 +402,16 @@ export class IndexPersistence {
       const bucketKey = vectorBucketKey(bucket);
       const hash = contentHash(body);
       const chunks = Math.max(1, Math.ceil(body.length / chunkChars));
+      // The loader rejects anything above this cap, so publishing it would
+      // hand the next boot a bucket it drops as corrupt while its bytes sit
+      // on disk intact. Fail the save instead and keep the previous manifest
+      // live: a small configured chunkChars is a misconfiguration, not data
+      // loss, and the next save with a sane one succeeds.
+      if (chunks > MAX_BUCKET_CHUNKS) {
+        throw new Error(
+          `vector bucket ${bucketKey} needs ${chunks} chunks, above MAX_BUCKET_CHUNKS`,
+        );
+      }
       const priorEntry = isValidBucketEntry(prior[bucketKey])
         ? prior[bucketKey]
         : undefined;
