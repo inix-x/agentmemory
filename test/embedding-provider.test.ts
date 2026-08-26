@@ -20,6 +20,8 @@ describe("createEmbeddingProvider", () => {
     delete process.env["EMBEDDING_PROVIDER"];
     delete process.env["OPENAI_EMBEDDING_API_KEY"];
     delete process.env["OPENAI_EMBEDDING_DIMENSIONS"];
+    delete process.env["OPENAI_BASE_URL"];
+    delete process.env["OPENAI_EMBEDDING_BASE_URL"];
   });
 
   afterEach(() => {
