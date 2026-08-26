@@ -227,18 +227,73 @@ function describeCorpusSize(check: GraphEnumerationCheck): string {
   return `the snapshot counts ${check.totalNodes} nodes`;
 }
 
+const ENUMERATION_WARN_INTERVAL_MS = 60_000;
+const enumerationWarnState = new Map<
+  string,
+  { lastAt: number; suppressed: number }
+>();
+
+function warnEnumerationThrottled(
+  key: string,
+  msg: string,
+  fields: Record<string, unknown>,
+): void {
+  const now = Date.now();
+  const state = enumerationWarnState.get(key) ?? { lastAt: 0, suppressed: 0 };
+  if (state.lastAt > 0 && now - state.lastAt < ENUMERATION_WARN_INTERVAL_MS) {
+    state.suppressed += 1;
+    enumerationWarnState.set(key, state);
+    return;
+  }
+  logger.warn(msg, { ...fields, suppressedSinceLastWarning: state.suppressed });
+  enumerationWarnState.set(key, { lastAt: now, suppressed: 0 });
+}
+
 export async function listGraphScopes(
   kv: StateKV,
+  caller: string,
 ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; enumerated: boolean }> {
   const check = await checkGraphEnumerable(kv);
   if (!check.enumerable) {
+    warnEnumerationThrottled(
+      `refused:${caller}`,
+      "Graph scope enumeration refused",
+      {
+        caller,
+        scopes: `${KV.graphNodes}, ${KV.graphEdges}`,
+        totalNodes: check.totalNodes,
+        ceiling: check.ceiling,
+        reason: describeCorpusSize(check),
+        remedy:
+          'POST /agentmemory/graph/snapshot-rebuild {"force": true} on a ' +
+          "corpus known to be small, or POST /agentmemory/graph/reset",
+      },
+    );
     return { nodes: [], edges: [], enumerated: false };
   }
+  let failed = false;
+  const onListFailure =
+    (scope: string) =>
+    (err: unknown): [] => {
+      failed = true;
+      warnEnumerationThrottled(
+        `failed:${scope}`,
+        "Graph scope enumeration failed",
+        {
+          caller,
+          scope,
+          totalNodes: check.totalNodes,
+          ceiling: check.ceiling,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return [];
+    };
   const [nodes, edges] = await Promise.all([
-    kv.list<GraphNode>(KV.graphNodes).catch(() => [] as GraphNode[]),
-    kv.list<GraphEdge>(KV.graphEdges).catch(() => [] as GraphEdge[]),
+    kv.list<GraphNode>(KV.graphNodes).catch(onListFailure(KV.graphNodes)),
+    kv.list<GraphEdge>(KV.graphEdges).catch(onListFailure(KV.graphEdges)),
   ]);
-  return { nodes, edges, enumerated: true };
+  return { nodes, edges, enumerated: !failed };
 }
 
 function nameIndexKey(type: string, name: string): string {

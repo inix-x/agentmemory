@@ -15,7 +15,37 @@ function mockKV(
   for (const e of edges) edgesMap.set(e.id, e);
   store.set("mem:graph:edges", edgesMap);
 
+  // GraphRetrieval reads the snapshot before it will enumerate either
+  // graph scope, so a fixture with rows but no snapshot exercises the
+  // legacy-corpus refusal rather than the traversal under test. Seed the
+  // snapshot persistGraphDelta would have written for these rows.
+  store.set(
+    "mem:graph:snapshot",
+    new Map<string, unknown>([
+      [
+        "current",
+        {
+          version: 1,
+          topNodes: [],
+          topEdges: [],
+          topDegrees: {},
+          stats: {
+            totalNodes: nodes.length,
+            totalEdges: edges.length,
+            nodesByType: {},
+            edgesByType: {},
+          },
+          updatedAt: "2026-08-27T00:00:00Z",
+          dirty: false,
+        },
+      ],
+    ]),
+  );
+
+  const listedScopes: string[] = [];
+
   return {
+    listedScopes,
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
@@ -28,6 +58,7 @@ function mockKV(
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
+      listedScopes.push(scope);
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
@@ -109,9 +140,12 @@ describe("GraphRetrieval", () => {
   });
 
   it("returns empty for no matches", async () => {
-    const kv = mockKV([], []);
+    // Seeded with a node that does not match: an empty corpus would
+    // satisfy this assertion without the name filter ever running.
+    const kv = mockKV([makeNode("n1", "React", "library", ["obs_1"])], []);
     const retrieval = new GraphRetrieval(kv as never);
     const results = await retrieval.searchByEntities(["nonexistent"]);
+    expect(kv.listedScopes).toContain("mem:graph:nodes");
     expect(results).toEqual([]);
   });
 
@@ -130,12 +164,20 @@ describe("GraphRetrieval", () => {
   });
 
   it("does not duplicate already-seen observations in expansion", async () => {
-    const nodes = [makeNode("n1", "file.ts", "file", ["obs_1", "obs_2"])];
-    const kv = mockKV(nodes, []);
+    // The reached node has to carry obs_1 for the visitedObs guard to be
+    // exercised at all. With no edges the traversal yields no paths, so
+    // the "not.toContain" assertion holds vacuously.
+    const nodes = [
+      makeNode("n1", "file.ts", "file", ["obs_1"]),
+      makeNode("n2", "other.ts", "file", ["obs_1", "obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
     const results = await retrieval.expandFromChunks(["obs_1"]);
     const obsIds = results.map((r) => r.obsId);
+    expect(obsIds).toContain("obs_2");
     expect(obsIds).not.toContain("obs_1");
   });
 
@@ -159,9 +201,12 @@ describe("GraphRetrieval", () => {
   });
 
   it("returns null entity for unknown name", async () => {
-    const kv = mockKV([], []);
+    // Same reasoning as "returns empty for no matches": seed a node so
+    // the null comes from the name lookup, not from an empty corpus.
+    const kv = mockKV([makeNode("n1", "Alice", "person", ["obs_1"])], []);
     const retrieval = new GraphRetrieval(kv as never);
     const result = await retrieval.temporalQuery("Unknown");
+    expect(kv.listedScopes).toContain("mem:graph:nodes");
     expect(result.entity).toBeNull();
   });
 

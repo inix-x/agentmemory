@@ -115,7 +115,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         checkpoints,
         accessLogs,
       ] = await Promise.all([
-        listGraphScopes(kv),
+        listGraphScopes(kv, "mem::export"),
         kv.list<SemanticMemory>(KV.semantic).catch(() => []),
         kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
         kv.list<Action>(KV.actions).catch(() => []),

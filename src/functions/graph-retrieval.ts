@@ -2,8 +2,8 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../types.js";
-import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { listGraphScopes } from "./graph.js";
 
 export interface GraphRetrievalResult {
   obsId: string;
@@ -41,13 +41,24 @@ function buildGraphContext(
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
+  private async loadGraph(
+    caller: string,
+  ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
+    const graph = await listGraphScopes(this.kv, caller);
+    return {
+      nodes: graph.nodes.filter((n) => !n.stale),
+      edges: graph.edges.filter((e) => !e.stale),
+    };
+  }
+
   async searchByEntities(
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
+      "GraphRetrieval.searchByEntities",
+    );
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -119,8 +130,9 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
+      "GraphRetrieval.expandFromChunks",
+    );
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),
@@ -163,8 +175,9 @@ export class GraphRetrieval {
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
+      "GraphRetrieval.temporalQuery",
+    );
 
     const entity = allNodes.find(
       (n) => n.name.toLowerCase() === entityName.toLowerCase(),

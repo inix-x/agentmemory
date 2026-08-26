@@ -4,7 +4,9 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+import { logger } from "../src/logger.js";
 import { registerGraphFunction } from "../src/functions/graph.js";
+import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import type {
@@ -65,13 +67,13 @@ const mockProvider = {
   summarize: vi.fn().mockResolvedValue(""),
 };
 
-function node(name: string): GraphNode {
+function node(name: string, sourceObservationIds: string[] = []): GraphNode {
   return {
     id: `node_${name}`,
     type: "concept",
     name,
     properties: {},
-    sourceObservationIds: [],
+    sourceObservationIds,
     createdAt: "2026-08-01T00:00:00Z",
   } as GraphNode;
 }
@@ -117,8 +119,27 @@ async function seedGraph(kv: ReturnType<typeof mockKV>, names: string[]) {
   }
 }
 
+async function seedRetrievalGraph(
+  kv: ReturnType<typeof mockKV>,
+  names: string[],
+) {
+  for (const n of names) {
+    await kv.set(NODES, `node_${n}`, node(n, [`obs_${n}`]));
+  }
+  for (let i = 0; i + 1 < names.length; i++) {
+    const e = edge(names[i]!, names[i + 1]!);
+    await kv.set(EDGES, e.id, e);
+  }
+}
+
 function graphScopesListed(kv: ReturnType<typeof mockKV>): string[] {
   return kv.listedScopes.filter((s) => s === NODES || s === EDGES);
+}
+
+function warnCallsFor(msg: string): unknown[][] {
+  return vi
+    .mocked(logger.warn)
+    .mock.calls.filter((c) => c[0] === msg) as unknown[][];
 }
 
 describe("graph scope enumeration guard", () => {
@@ -401,6 +422,177 @@ describe("graph scope enumeration guard", () => {
         "gamma",
       ]);
       expect(result.graphEdges).toHaveLength(2);
+    });
+  });
+
+  describe("GraphRetrieval (mem::search / mem::smart-search graph stream)", () => {
+    let clock = Date.parse("2026-08-27T00:00:00Z");
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      clock += 10 * 60_000;
+      vi.setSystemTime(clock);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("does not enumerate graph scopes for entity search when the snapshot reports a corpus past the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      const results = await new GraphRetrieval(kv as never).searchByEntities([
+        "alpha",
+      ]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(results).toEqual([]);
+    });
+
+    it("does not enumerate graph scopes for chunk expansion when the snapshot reports a corpus past the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      const results = await new GraphRetrieval(kv as never).expandFromChunks([
+        "obs_alpha",
+      ]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(results).toEqual([]);
+    });
+
+    it("does not enumerate graph scopes for temporal queries when the snapshot reports a corpus past the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      const result = await new GraphRetrieval(kv as never).temporalQuery(
+        "alpha",
+      );
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.entity).toBeNull();
+    });
+
+    it("does not enumerate graph scopes for entity search on a legacy corpus with no snapshot", async () => {
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+    });
+
+    it("does not enumerate a reset corpus whose snapshot counts only post-reset nodes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        snapshot(3, { resetAt: "2026-08-26T00:00:00Z" }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta", "gamma"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+    });
+
+    it("names the caller, the refused scopes and the ceiling in a warning", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Graph scope enumeration refused",
+        expect.objectContaining({
+          caller: "GraphRetrieval.searchByEntities",
+          scopes: `${NODES}, ${EDGES}`,
+          totalNodes: 30000,
+          ceiling: 25000,
+        }),
+      );
+    });
+
+    it("throttles the refusal warning rather than logging once per search", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+      const retrieval = new GraphRetrieval(kv as never);
+
+      for (let i = 0; i < 5; i++) await retrieval.searchByEntities(["alpha"]);
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(1);
+
+      vi.setSystemTime(clock + 61_000);
+      await retrieval.searchByEntities(["alpha"]);
+
+      const calls = warnCallsFor("Graph scope enumeration refused");
+      expect(calls).toHaveLength(2);
+      expect(calls[1]![1]).toMatchObject({ suppressedSinceLastWarning: 4 });
+    });
+
+    it("still answers an entity search from the live graph under the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedRetrievalGraph(kv, ["alpha", "beta", "gamma"]);
+
+      const results = await new GraphRetrieval(kv as never).searchByEntities(
+        ["alpha"],
+        2,
+      );
+
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(results.map((r) => r.obsId).sort()).toEqual([
+        "obs_alpha",
+        "obs_beta",
+        "obs_gamma",
+      ]);
+      expect(results.find((r) => r.obsId === "obs_alpha")!.score).toBe(1);
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(0);
+    });
+
+    it("still expands from chunks on the live graph under the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedRetrievalGraph(kv, ["alpha", "beta", "gamma"]);
+
+      const results = await new GraphRetrieval(kv as never).expandFromChunks([
+        "obs_alpha",
+      ]);
+
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(results.map((r) => r.obsId)).toEqual(["obs_beta"]);
+    });
+
+    it("still answers a temporal query on the live graph under the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedRetrievalGraph(kv, ["alpha", "beta", "gamma"]);
+
+      const result = await new GraphRetrieval(kv as never).temporalQuery(
+        "beta",
+      );
+
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(result.entity?.name).toBe("beta");
+      expect(result.currentState).toHaveLength(2);
+    });
+
+    it("reports a swallowed enumeration failure instead of returning a silently empty graph", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+      kv.list = async () => {
+        throw new Error("Invocation timeout after 180000ms: state::list");
+      };
+
+      const results = await new GraphRetrieval(kv as never).searchByEntities([
+        "alpha",
+      ]);
+
+      expect(results).toEqual([]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Graph scope enumeration failed",
+        expect.objectContaining({
+          caller: "GraphRetrieval.searchByEntities",
+          scope: NODES,
+          error: "Invocation timeout after 180000ms: state::list",
+        }),
+      );
     });
   });
 });

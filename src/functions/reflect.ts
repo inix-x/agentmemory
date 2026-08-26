@@ -173,7 +173,7 @@ export function registerReflectFunctions(
       const maxTotal = 50;
 
       const [graph, semanticMemories, lessons, crystals] = await Promise.all([
-        listGraphScopes(kv),
+        listGraphScopes(kv, "mem::reflect"),
         kv.list<SemanticMemory>(KV.semantic).catch(() => []),
         kv.list<Lesson>(KV.lessons).catch(() => []),
         kv.list<Crystal>(KV.crystals).catch(() => []),
