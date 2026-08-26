@@ -1323,3 +1323,119 @@ describe("IndexPersistence torn vector save", () => {
     expect(loaded.vector!.size).toBe(41);
   });
 });
+
+// A failed read is not an empty store, and a mid-save mutation is not a
+// deletion. Both were measured to destroy data before these guards existed.
+describe("IndexPersistence vector save/load hazards", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function seeded(count: number): VectorIndex {
+    const vector = new VectorIndex();
+    for (let i = 0; i < count; i++) {
+      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+    }
+    return vector;
+  }
+
+  async function loadedSize(): Promise<number> {
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    return loaded.vector?.size ?? 0;
+  }
+
+  it("does not persist empty buckets when the index is cleared mid-save", async () => {
+    const vector = seeded(60);
+    // rebuildIndex() calls vectorIndex.clear() synchronously before its first
+    // await, so a search-triggered rebuild lands between two bucket writes.
+    let clearedAt = 0;
+    const clearing = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === VECTOR_BUCKET_SCOPE && ++clearedAt === 2) vector.clear();
+        return kv.set(scope, key, data);
+      },
+    };
+
+    await new IndexPersistence(clearing as never, new SearchIndex(), vector, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // Reading the live Map lazily would serialise every later bucket as "[]",
+    // hash it, publish it as truth, and reclaim the real content behind it.
+    expect(await loadedSize()).toBe(60);
+  });
+
+  it("does not wipe the index when the manifest read fails at load", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(60), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const blindKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === BM25_SCOPE && key === VECTOR_MANIFEST_KEY) {
+          throw new Error("manifest read timed out");
+        }
+        return kv.get(scope, key);
+      },
+    };
+    // Same instance loads then saves, exactly as src/index.ts does.
+    const persistence = new IndexPersistence(
+      blindKv as never,
+      new SearchIndex(),
+      new VectorIndex(),
+      { shardChars: 400, vectorBuckets: 8 },
+    );
+    await persistence.load();
+    await persistence.save();
+
+    expect(await loadedSize()).toBe(60);
+  });
+
+  it("does not delete a bucket whose chunk read failed at load", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(60), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const manifest = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const [victim] = Object.keys(manifest!.shards);
+    const victimChunk = chunkKey(victim, manifest!.shards[victim].hash, 0);
+
+    const flakyKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === VECTOR_BUCKET_SCOPE && key === victimChunk) {
+          throw new Error("chunk read timed out");
+        }
+        return kv.get(scope, key);
+      },
+    };
+    const persistence = new IndexPersistence(
+      flakyKv as never,
+      new SearchIndex(),
+      new VectorIndex(),
+      { shardChars: 400, vectorBuckets: 8 },
+    );
+    const partial = await persistence.load();
+    expect(partial.vector!.size).toBeLessThan(60);
+
+    // The blip must not be converted into a permanent delete.
+    await persistence.save();
+    expect(await loadedSize()).toBe(60);
+  });
+});

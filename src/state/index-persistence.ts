@@ -211,6 +211,17 @@ function isValidShardDescriptor(
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
+  /**
+   * Set when a vector load could not read everything the manifest named.
+   *
+   * `.catch(() => null)` on a read makes "I could not read this" look identical
+   * to "this does not exist", and reclaim treats absence as authority to
+   * delete. One timed-out read at boot would otherwise leave the in-memory
+   * index short, and the next save would serialise that gap and permanently
+   * delete the buckets behind it. While this is set, save preserves every
+   * unread bucket instead of reclaiming it.
+   */
+  private vectorLoadIncomplete = false;
 
   constructor(
     private kv: StateKV,
@@ -412,6 +423,13 @@ export class IndexPersistence {
     for (const [bucketKey, priorEntry] of Object.entries(prior)) {
       if (bucketKey in nextShards) continue;
       if (!isValidBucketEntry(priorEntry)) continue;
+      if (this.vectorLoadIncomplete) {
+        // This bucket is missing from memory because we could not read it, not
+        // because anything was deleted. Keep naming it so it stays reachable
+        // and a later clean load can recover it.
+        nextShards[bucketKey] = priorEntry;
+        continue;
+      }
       for (const key of bucketChunkKeys(bucketKey, priorEntry)) {
         pendingDeletes.push({ scope: VECTOR_BUCKET_SCOPE, key });
       }
@@ -691,9 +709,20 @@ export class IndexPersistence {
    * the next save rewrites it.
    */
   private async loadVectorBuckets(): Promise<VectorIndex | null> {
-    const manifest = await this.kv
-      .get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY)
-      .catch(() => null);
+    let manifest: unknown;
+    try {
+      manifest = await this.kv.get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY);
+    } catch (err) {
+      // A read that failed is not a store that is empty. Falling through to the
+      // v1 path here finds nothing (v1 was migrated away), load returns a null
+      // vector index, and the next save reclaims every bucket the manifest
+      // still names. One transient timeout, whole index gone.
+      logger.warn("index persistence: vector manifest read failed", {
+        message: errorMessage(err),
+      });
+      this.vectorLoadIncomplete = true;
+      return new VectorIndex();
+    }
     if (!isVectorBucketManifest(manifest)) return null;
 
     const entries = Object.entries(manifest.shards);
@@ -737,6 +766,10 @@ export class IndexPersistence {
       index.mergeSerialized(body);
     }
     if (missing > 0 || corrupt > 0) {
+      // Anything not read is still on disk and still referenced. Mark the load
+      // incomplete so the next save preserves those buckets rather than
+      // treating their absence from memory as a deletion.
+      this.vectorLoadIncomplete = true;
       logger.warn("index persistence: vector buckets skipped", {
         missing,
         corrupt,

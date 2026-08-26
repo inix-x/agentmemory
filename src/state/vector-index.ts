@@ -168,27 +168,42 @@ export class VectorIndex {
    * previous manifest and deletes them.
    */
   *serializeBuckets(bucketCount: number): Generator<[number, string]> {
-    const groups = new Map<number, string[]>();
-    for (const obsId of this.vectors.keys()) {
+    // Snapshot entry references up front rather than reading the live Map as
+    // each bucket is yielded.
+    //
+    // The caller awaits a KV write between yields, and rebuildIndex() calls
+    // vectorIndex.clear() synchronously before its first await
+    // (src/functions/search.ts). A search that triggers a rebuild mid-save
+    // would therefore empty the Map underneath this loop, every remaining
+    // bucket would serialise to "[]", and those empty buckets would be hashed,
+    // written, and published as the bucket's true content — with the manifest
+    // and disk in perfect agreement, so the load-time hash check cannot see it.
+    //
+    // Holding references costs nothing: the Float32Arrays already exist and are
+    // not copied. Only one bucket's base64 is materialised at a time, which is
+    // the memory property that matters.
+    const groups = new Map<
+      number,
+      Array<[string, { embedding: Float32Array; sessionId: string }]>
+    >();
+    for (const [obsId, entry] of this.vectors) {
       const bucket = vectorBucketOf(obsId, bucketCount);
-      const ids = groups.get(bucket);
-      if (ids) ids.push(obsId);
-      else groups.set(bucket, [obsId]);
+      const rows = groups.get(bucket);
+      if (rows) rows.push([obsId, entry]);
+      else groups.set(bucket, [[obsId, entry]]);
     }
-    for (const [bucket, ids] of groups) {
-      const rows: Array<[string, { embedding: string; sessionId: string }]> = [];
-      for (const obsId of ids) {
-        const entry = this.vectors.get(obsId);
-        if (!entry) continue;
-        rows.push([
-          obsId,
-          {
-            embedding: float32ToBase64(entry.embedding),
-            sessionId: entry.sessionId,
-          },
-        ]);
-      }
-      yield [bucket, JSON.stringify(rows)];
+    for (const [bucket, rows] of groups) {
+      const serialised = rows.map(
+        ([obsId, entry]) =>
+          [
+            obsId,
+            {
+              embedding: float32ToBase64(entry.embedding),
+              sessionId: entry.sessionId,
+            },
+          ] as [string, { embedding: string; sessionId: string }],
+      );
+      yield [bucket, JSON.stringify(serialised)];
     }
   }
 
