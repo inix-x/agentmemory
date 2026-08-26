@@ -230,6 +230,18 @@ export class IndexPersistence {
    * unread bucket instead of reclaiming it.
    */
   private vectorLoadIncomplete = false;
+  /**
+   * Set when every bucket the manifest named failed its content check.
+   *
+   * Unlike a failed read, this does not heal on its own: the bytes are intact
+   * and the keys are reachable, but no later load can verify them either. The
+   * in-memory index stays empty, so save has nothing to publish and preserves
+   * the manifest untouched — bytes and manifest in perfect agreement, vectors
+   * unreadable forever. Nothing else notices, because rebuild is gated on the
+   * BM25 index being empty and BM25 loaded fine. Reported so the caller can
+   * rebuild, which is the only thing that ends this state.
+   */
+  private vectorLoadRejected = false;
 
   constructor(
     private kv: StateKV,
@@ -281,6 +293,7 @@ export class IndexPersistence {
   async load(): Promise<{
     bm25: SearchIndex | null;
     vector: VectorIndex | null;
+    vectorRejected: boolean;
   }> {
     let bm25: SearchIndex | null = null;
     let vector: VectorIndex | null = null;
@@ -301,7 +314,7 @@ export class IndexPersistence {
       }
     }
 
-    return { bm25, vector };
+    return { bm25, vector, vectorRejected: this.vectorLoadRejected };
   }
 
   stop(): void {
@@ -727,6 +740,7 @@ export class IndexPersistence {
    * the next save rewrites it.
    */
   private async loadVectorBuckets(): Promise<VectorIndex | null> {
+    this.vectorLoadRejected = false;
     let manifest: unknown;
     try {
       manifest = await this.kv.get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY);
@@ -783,6 +797,10 @@ export class IndexPersistence {
       }
       index.mergeSerialized(body);
     }
+    // Deliberately narrower than `missing`. A read that failed may succeed on
+    // the next boot, and the existing preserve-and-wait policy covers it. A
+    // content check that failed will fail identically every time.
+    this.vectorLoadRejected = entries.length > 0 && corrupt === entries.length;
     if (missing > 0 || corrupt > 0) {
       // Anything not read is still on disk and still referenced. Mark the load
       // incomplete so the next save preserves those buckets rather than

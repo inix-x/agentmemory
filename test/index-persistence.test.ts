@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { IndexPersistence } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
@@ -1515,5 +1516,105 @@ describe("IndexPersistence vector layout version", () => {
       null,
     ).load();
     expect(loaded.vector!.size).toBe(20);
+  });
+});
+
+// Stands in for a store written by a build whose contentHash was a different
+// function: same bodies, same manifest shape, chunk keys still derived from the
+// hash the manifest records — so every chunk is found and every hash fails.
+async function rehashStoreUnder(
+  kv: ReturnType<typeof countingKV>,
+  algorithm: string,
+): Promise<void> {
+  const manifest = (await kv.get<TestVectorBucketManifest>(
+    BM25_SCOPE,
+    VECTOR_MANIFEST_KEY,
+  ))!;
+  const shards: TestVectorBucketManifest["shards"] = {};
+  for (const [bucketKey, entry] of Object.entries(manifest.shards)) {
+    const parts: string[] = [];
+    for (let i = 0; i < entry.chunks; i++) {
+      parts.push(
+        (await kv.get<string>(
+          VECTOR_BUCKET_SCOPE,
+          chunkKey(bucketKey, entry.hash, i),
+        ))!,
+      );
+    }
+    const rehashed = createHash(algorithm)
+      .update(parts.join(""))
+      .digest("hex");
+    for (let i = 0; i < entry.chunks; i++) {
+      await kv.delete(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i));
+      await kv.set(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(bucketKey, rehashed, i),
+        parts[i],
+      );
+    }
+    shards[bucketKey] = { hash: rehashed, chunks: entry.chunks };
+  }
+  await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, { ...manifest, shards });
+}
+
+describe("IndexPersistence vector hash-format change", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("recovers when a hash change makes every bucket unverifiable", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    await rehashStoreUnder(kv, "sha512");
+    const alien = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+
+    // Boot. The live index starts empty and only ever holds what load hands it.
+    const live = new VectorIndex();
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      live,
+      { shardChars: 400 },
+    );
+    const loaded = await persistence.load();
+    if (loaded.vector && loaded.vector.size > 0) live.restoreFrom(loaded.vector);
+    expect(live.size).toBe(0);
+
+    // A debounce flush can land long before any rebuild finishes. It must not
+    // turn "could not verify" into a delete.
+    await persistence.save();
+    for (const [bucketKey, entry] of Object.entries(alien.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        expect(
+          await kv.get(
+            VECTOR_BUCKET_SCOPE,
+            chunkKey(bucketKey, entry.hash, i),
+          ),
+        ).not.toBeNull();
+      }
+    }
+
+    // Stands in for rebuildIndex(), which src/index.ts fires on this signal and
+    // which refills the live index before scheduling a save. Nothing else ever
+    // re-reads those buckets, so without the signal the vectors stay on disk
+    // and unreadable for the life of the store.
+    if (loaded.vectorRejected) live.restoreFrom(seeded(20));
+    await persistence.save();
+
+    const reopened = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reopened.vector!.size).toBe(20);
   });
 });
