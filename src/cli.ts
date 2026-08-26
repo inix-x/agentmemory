@@ -54,6 +54,7 @@ import {
   type ConnectManifest,
   type RemoveOptions,
 } from "./cli/remove-plan.js";
+import { createEngineLogForwarder } from "./cli/engine-log.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
@@ -917,6 +918,28 @@ type StartupFailure = {
 
 let startupFailure: StartupFailure | null = null;
 
+// Off by default. The engine's own stdout is the only place a frame's
+// `function_id` exists, but an unbounded log path here once wrote 137 GB
+// (issue #519), so the forwarder is opt-in and hard-capped.
+const ENGINE_LOG_ENABLED =
+  process.env["AGENTMEMORY_ENGINE_LOG"] === "1" ||
+  process.env["AGENTMEMORY_ENGINE_LOG"] === "true";
+
+function attachEngineLog(
+  stream: NodeJS.ReadableStream | null,
+  prefix: string,
+): void {
+  if (!stream) return;
+  const forwarder = createEngineLogForwarder({
+    prefix,
+    write: (line) => {
+      process.stderr.write(`${line}\n`);
+    },
+  });
+  stream.on("data", (chunk: Buffer) => forwarder.push(chunk));
+  stream.on("end", () => forwarder.flush());
+}
+
 // Spawn a background engine and collect any startup stderr for a short
 // window. The process is unref'd so the CLI parent can exit cleanly; we
 // only care about stderr that shows up BEFORE the health check succeeds,
@@ -929,12 +952,16 @@ function spawnEngineBackground(
   vlog(`spawn: ${bin} ${spawnArgs.join(" ")}`);
   const child = spawn(bin, spawnArgs, {
     detached: true,
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", ENGINE_LOG_ENABLED ? "pipe" : "ignore", "pipe"],
     windowsHide: true,
   });
   const isDocker = label.includes("Docker");
   if (!isDocker && typeof child.pid === "number") {
     writeEnginePidfile(child.pid);
+  }
+  if (ENGINE_LOG_ENABLED) {
+    attachEngineLog(child.stdout, "[engine]");
+    attachEngineLog(child.stderr, "[engine:err]");
   }
   const spawnedAt = Date.now();
   const stderrChunks: Buffer[] = [];
