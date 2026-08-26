@@ -90,6 +90,15 @@ export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = new Map<string, number>();
   private queue: Promise<void> = Promise.resolve();
+  /**
+   * A save that is queued but has not started running yet.
+   *
+   * It will serialise the index as it stands at the moment it runs, so it
+   * already covers every caller that arrives before then. Handing them this
+   * promise instead of queueing another identical save is what keeps a delete
+   * from waiting out an unbounded line of saves ahead of it.
+   */
+  private pendingSave: Promise<void> | null = null;
 
   constructor(
     private kv: StateKV,
@@ -114,7 +123,21 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    return this.enqueue(() => this.runSave());
+    // Coalesce onto a save that is queued but has not started. It has not taken
+    // its snapshot yet, so it will include whatever this caller just changed.
+    // Only a save that is ALREADY RUNNING must not be handed back: its snapshot
+    // predates this caller's mutation, and reporting success for it would tell
+    // a delete it was durable when it was not.
+    if (this.pendingSave) return this.pendingSave;
+
+    const pending = this.enqueue(() => {
+      // Running now. Its snapshot is fixed from here, so the next caller needs
+      // a save of its own.
+      if (this.pendingSave === pending) this.pendingSave = null;
+      return this.runSave();
+    });
+    this.pendingSave = pending;
+    return pending;
   }
 
   /**

@@ -1168,3 +1168,54 @@ describe("IndexPersistence", () => {
     await expect(persistence.load()).resolves.toBeDefined();
   });
 });
+
+describe("IndexPersistence save coalescing", () => {
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = mockKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("does not queue a second identical save behind one that has not started", async () => {
+    // flushIndexSave awaits save() on every delete path. Serialising every one
+    // of them means a delete waits out every save ahead of it, which is fine
+    // when a save takes a second and is an outage when saves are timing out at
+    // 180s. A save that is queued but not yet running will serialise the index
+    // as it stands when it runs, so it already covers these callers.
+    let manifestWrites = 0;
+    let releaseFirst!: () => void;
+    const firstStarted = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let started = 0;
+    const slowKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          manifestWrites++;
+          if (++started === 1) await firstStarted;
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+
+    const persistence = new IndexPersistence(
+      slowKv as never,
+      makeBm25("obs_1", "alpha"),
+      null,
+      { shardChars: 400 },
+    );
+
+    const first = persistence.save();
+    // Five more delete-path flushes arrive while the first is still running.
+    const rest = Array.from({ length: 5 }, () => persistence.save());
+    releaseFirst();
+    await Promise.all([first, ...rest]);
+
+    // One running save plus at most one queued behind it covers all six
+    // callers. Six serialised saves would be the regression.
+    expect(manifestWrites).toBeLessThanOrEqual(2);
+  });
+});
