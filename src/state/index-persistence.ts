@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { SearchIndex } from "./search-index.js";
 import { VectorIndex } from "./vector-index.js";
 import type { StateKV } from "./kv.js";
@@ -13,9 +14,13 @@ const BM25_MANIFEST_KEY = "data:manifest";
 const BM25_SHARD_SCOPE_PREFIX = `${KV.bm25Index}:bm25:`;
 const VECTOR_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
-const VECTOR_SHARD_SCOPE_PREFIX = `${KV.bm25Index}:vectors:`;
 const INDEX_SHARD_KEY = "data";
 const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
+
+// Fixed scope for bucketed vector shards. No generation component: bucket keys
+// are deterministic and overwritten in place, so nothing can be stranded.
+const VECTOR_BUCKET_SCOPE = `${KV.bm25Index}:vectors:v2`;
+const DEFAULT_VECTOR_BUCKETS = 256;
 
 type IndexShardManifest = {
   v: 1;
@@ -24,10 +29,85 @@ type IndexShardManifest = {
   chars: number;
 };
 
+/**
+ * Bucketed vector manifest.
+ *
+ * `shards` maps bucket key -> that bucket's content hash, chunk count, and
+ * length, and holds only non-empty buckets.
+ *
+ * Keeping the hashes *in the manifest* rather than in process memory is what
+ * makes this work in production: the service restarts often, and an in-memory
+ * cache would force a full rewrite of every bucket after each restart, which
+ * is the cost this change exists to remove.
+ *
+ * A bucket is still chunked to `shardChars`, because bucket size is unbounded
+ * — it grows with the corpus — and the engine rejects an oversized
+ * `state::set` payload. Chunking is what bounds the payload; bucketing is what
+ * bounds how much gets rewritten. They solve different problems and both are
+ * needed.
+ */
+type VectorBucketEntry = { hash: string; chunks: number; chars: number };
+
+type VectorBucketManifest = {
+  v: 2;
+  buckets: number;
+  shards: Record<string, VectorBucketEntry>;
+};
+
+function isVectorBucketManifest(value: unknown): value is VectorBucketManifest {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<VectorBucketManifest>;
+  return (
+    candidate.v === 2 &&
+    Number.isInteger(candidate.buckets) &&
+    (candidate.buckets as number) >= 1 &&
+    !!candidate.shards &&
+    typeof candidate.shards === "object"
+  );
+}
+
+function isValidBucketEntry(value: unknown): value is VectorBucketEntry {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<VectorBucketEntry>;
+  return (
+    typeof candidate.hash === "string" &&
+    candidate.hash.length > 0 &&
+    Number.isInteger(candidate.chunks) &&
+    (candidate.chunks as number) >= 1 &&
+    Number.isInteger(candidate.chars) &&
+    (candidate.chars as number) >= 0
+  );
+}
+
+function vectorBucketKey(bucket: number): string {
+  return `b${String(bucket).padStart(4, "0")}`;
+}
+
+function vectorChunkKey(bucketKey: string, chunk: number): string {
+  return `${bucketKey}:${String(chunk).padStart(5, "0")}`;
+}
+
+// sha1 over the bucket body. This one IS a content check — a collision means a
+// changed bucket is silently never persisted — so it must not be the 32-bit
+// hash used for bucket assignment.
+function contentHash(value: string): string {
+  return createHash("sha1").update(value).digest("hex");
+}
+
 type IndexPersistenceOptions = {
   shardChars?: number;
   createGeneration?: () => string;
+  vectorBuckets?: number;
 };
+
+function vectorBucketCount(options: IndexPersistenceOptions): number {
+  const configured = options.vectorBuckets;
+  if (typeof configured !== "number" || !Number.isFinite(configured)) {
+    return DEFAULT_VECTOR_BUCKETS;
+  }
+  const whole = Math.floor(configured);
+  return whole >= 1 ? whole : DEFAULT_VECTOR_BUCKETS;
+}
 
 function shardChars(options: IndexPersistenceOptions): number {
   const configured = options.shardChars;
@@ -95,7 +175,7 @@ export class IndexPersistence {
     try {
       await this.saveBm25Index(this.bm25.serialize());
       if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
+        await this.saveVectorBuckets(this.vector);
       }
     } catch (err) {
       this.logFailure(err);
@@ -114,9 +194,15 @@ export class IndexPersistence {
       bm25 = SearchIndex.deserialize(bm25Data);
     }
 
-    const vecData = await this.loadVectorData();
-    if (vecData && typeof vecData === "string") {
-      vector = VectorIndex.deserialize(vecData);
+    // v2 (bucketed) is read directly into an index; the v1 offset-chunked
+    // path still exists so an upgrade loses nothing and a downgrade is only a
+    // rebuild, not data loss.
+    vector = await this.loadVectorBuckets();
+    if (!vector) {
+      const vecData = await this.loadVectorData();
+      if (vecData && typeof vecData === "string") {
+        vector = VectorIndex.deserialize(vecData);
+      }
     }
 
     return { bm25, vector };
@@ -157,13 +243,109 @@ export class IndexPersistence {
     );
   }
 
-  private async saveVectorIndex(serialized: string): Promise<void> {
-    await this.saveShardedIndex(
-      serialized,
+  /**
+   * Persist the vector index as fixed, independently-addressed buckets,
+   * writing only the buckets whose contents actually changed.
+   *
+   * The offset-chunked format this replaces was O(entire corpus) per change:
+   * shard boundaries are character offsets into one serialised blob, so a
+   * single inserted vector shifts every downstream byte and rewrites every
+   * shard. In production that was 431 MB per save against a corpus of 35 MB of
+   * observations, and no save had completed in over four hours.
+   *
+   * Cross-bucket atomicity is deliberately given up here. It buys nothing
+   * today, because the atomic save never completes. Recovery is convergent
+   * instead: a bucket written before a crash disagrees with the manifest that
+   * was never published, so the next save sees the hash mismatch and rewrites
+   * it. Vectors are immutable per obsId, so a surviving older bucket is still
+   * correct rather than stale.
+   */
+  private async saveVectorBuckets(vector: VectorIndex): Promise<void> {
+    const previous = await this.kv
+      .get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY)
+      .catch(() => null);
+    const buckets = vectorBucketCount(this.options);
+    const chunkChars = shardChars(this.options);
+
+    // Only trust previous hashes when the bucket count matches. A different
+    // count remaps every obsId, so every stored bucket is meaningless.
+    const previousV2 = isVectorBucketManifest(previous) ? previous : null;
+    const previousShards =
+      previousV2 && previousV2.buckets === buckets ? previousV2.shards : {};
+
+    const nextShards: Record<string, VectorBucketEntry> = {};
+    // Nothing is deleted until the manifest naming its replacement is live.
+    // Deleting first is how a failed publish destroys data the still-current
+    // manifest points at — the old manifest survives the failure, so anything
+    // it names has to survive with it.
+    const pendingDeletes: string[] = [];
+    let written = 0;
+
+    for (const [bucket, body] of vector.serializeBuckets(buckets)) {
+      const bucketKey = vectorBucketKey(bucket);
+      const hash = contentHash(body);
+      const chunks = Math.max(1, Math.ceil(body.length / chunkChars));
+      const prior = isValidBucketEntry(previousShards[bucketKey])
+        ? previousShards[bucketKey]
+        : undefined;
+      nextShards[bucketKey] = { hash, chunks, chars: body.length };
+      if (prior?.hash === hash) continue;
+
+      for (let i = 0; i < chunks; i++) {
+        await this.kv.set(
+          VECTOR_BUCKET_SCOPE,
+          vectorChunkKey(bucketKey, i),
+          body.slice(i * chunkChars, (i + 1) * chunkChars),
+        );
+      }
+      written++;
+      // This bucket shrank: its old tail chunks are no longer addressed.
+      for (let i = chunks; i < (prior?.chunks ?? 0); i++) {
+        pendingDeletes.push(vectorChunkKey(bucketKey, i));
+      }
+    }
+
+    // Buckets that emptied entirely since the last save.
+    for (const [bucketKey, prior] of Object.entries(previousShards)) {
+      if (bucketKey in nextShards) continue;
+      if (!isValidBucketEntry(prior)) continue;
+      for (let i = 0; i < prior.chunks; i++) {
+        pendingDeletes.push(vectorChunkKey(bucketKey, i));
+      }
+    }
+
+    const nextManifest: VectorBucketManifest = { v: 2, buckets, shards: nextShards };
+    await this.kv.set<VectorBucketManifest>(
+      KV.bm25Index,
       VECTOR_MANIFEST_KEY,
-      VECTOR_KEY,
-      VECTOR_SHARD_SCOPE_PREFIX,
+      nextManifest,
     );
+
+    // Safe from here: the new manifest is live and names none of these.
+    for (const key of pendingDeletes) {
+      await this.deleteKey(VECTOR_BUCKET_SCOPE, key, "vector_bucket_reclaim");
+    }
+
+    await this.auditIndexPersistence(
+      "vector_bucket_publish",
+      [statePath(KV.bm25Index, VECTOR_MANIFEST_KEY)],
+      {
+        manifestKey: VECTOR_MANIFEST_KEY,
+        buckets,
+        written,
+        unchanged: Object.keys(nextShards).length - written,
+        reclaimed: pendingDeletes.length,
+      },
+    );
+
+    // One-time migration off the offset-chunked format. A v1 manifest names
+    // its own shards, so this needs no enumeration — which matters, because
+    // StateKV.list returns values, not keys, and cannot be used here.
+    const legacy = previous as IndexShardManifest | null;
+    if (legacy?.v === 1 && Array.isArray(legacy.shards)) {
+      await this.deleteShards(legacy.shards, "vector_v1_migration");
+    }
+    await this.deleteKey(KV.bm25Index, VECTOR_KEY, "legacy_cleanup");
   }
 
   private async saveShardedIndex(
@@ -344,6 +526,71 @@ export class IndexPersistence {
 
   private async loadVectorData(): Promise<string | null> {
     return this.loadShardedData(VECTOR_KEY, VECTOR_MANIFEST_KEY, "vector");
+  }
+
+  /**
+   * Read the bucketed vector index, or null when the store is still on the v1
+   * format so the caller can fall back.
+   *
+   * A missing or unreadable bucket is skipped rather than failing the whole
+   * load. Unlike an offset-chunked shard — where a hole corrupts the single
+   * JSON document and the index must be rejected wholesale — each bucket is an
+   * independent document, so losing one costs exactly the vectors it held and
+   * the next save rewrites it.
+   */
+  private async loadVectorBuckets(): Promise<VectorIndex | null> {
+    const manifest = await this.kv
+      .get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY)
+      .catch(() => null);
+    if (!isVectorBucketManifest(manifest)) return null;
+
+    const entries = Object.entries(manifest.shards);
+    if (entries.length === 0) return new VectorIndex();
+
+    const index = new VectorIndex();
+    let missing = 0;
+    let corrupt = 0;
+    for (const [bucketKey, entry] of entries) {
+      if (!isValidBucketEntry(entry)) {
+        corrupt++;
+        continue;
+      }
+      const parts: string[] = [];
+      let complete = true;
+      for (let i = 0; i < entry.chunks; i++) {
+        const chunk = await this.kv
+          .get<string>(VECTOR_BUCKET_SCOPE, vectorChunkKey(bucketKey, i))
+          .catch(() => null);
+        if (typeof chunk !== "string") {
+          complete = false;
+          break;
+        }
+        parts.push(chunk);
+      }
+      if (!complete) {
+        missing++;
+        continue;
+      }
+      const body = parts.join("");
+      // Verifying the hash is what makes a torn write safe. A bucket half
+      // rewritten before a crash reassembles into invalid JSON; without this
+      // check it would be silently parsed as empty and its vectors lost with
+      // no signal. Skipping it instead costs only that bucket, and the next
+      // save rewrites it because the hash still disagrees.
+      if (contentHash(body) !== entry.hash) {
+        corrupt++;
+        continue;
+      }
+      index.mergeSerialized(body);
+    }
+    if (missing > 0 || corrupt > 0) {
+      logger.warn("index persistence: vector buckets skipped", {
+        missing,
+        corrupt,
+        total: entries.length,
+      });
+    }
+    return index;
   }
 
   private async loadShardedData(

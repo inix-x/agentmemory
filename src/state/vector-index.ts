@@ -20,6 +20,30 @@ function base64ToFloat32(b64: string): Float32Array {
   );
 }
 
+// FNV-1a. Only needs to spread obsIds evenly across buckets and be stable
+// across processes — it is never a content check, so a non-cryptographic
+// 32-bit hash is the right size. Math.imul keeps the multiply in int32.
+function fnv1a32(str: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Which bucket an observation's vector belongs to.
+ *
+ * Deterministic and stable, which is the whole point: bucket keys are reused
+ * in place on every save, so there is no generation to strand and orphaned
+ * shards are structurally impossible (unlike the offset-chunked format, where
+ * one insert shifts every downstream chunk boundary and rewrites everything).
+ */
+export function vectorBucketOf(obsId: string, bucketCount: number): number {
+  return fnv1a32(obsId) % bucketCount;
+}
+
 function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   if (a.length !== b.length) return 0;
   let dot = 0;
@@ -133,6 +157,73 @@ export class VectorIndex {
       ]);
     }
     return JSON.stringify(data);
+  }
+
+  /**
+   * Serialise one bucket at a time, in the same row shape `serialize()` emits
+   * so both formats deserialise through one code path.
+   *
+   * A generator rather than a `Map<number, string>` on purpose: materialising
+   * every bucket would hold the whole index as strings at once (~266 MB in
+   * production) inside an already memory-constrained process. Yielding lets the
+   * caller write and drop each bucket, so the peak is a single bucket.
+   *
+   * Grouping first costs one pass and holds ids only, not embeddings.
+   * Empty buckets are not yielded — the caller reconciles those against the
+   * previous manifest and deletes them.
+   */
+  *serializeBuckets(bucketCount: number): Generator<[number, string]> {
+    const groups = new Map<number, string[]>();
+    for (const obsId of this.vectors.keys()) {
+      const bucket = vectorBucketOf(obsId, bucketCount);
+      const ids = groups.get(bucket);
+      if (ids) ids.push(obsId);
+      else groups.set(bucket, [obsId]);
+    }
+    for (const [bucket, ids] of groups) {
+      const rows: Array<[string, { embedding: string; sessionId: string }]> = [];
+      for (const obsId of ids) {
+        const entry = this.vectors.get(obsId);
+        if (!entry) continue;
+        rows.push([
+          obsId,
+          {
+            embedding: float32ToBase64(entry.embedding),
+            sessionId: entry.sessionId,
+          },
+        ]);
+      }
+      yield [bucket, JSON.stringify(rows)];
+    }
+  }
+
+  /** Merge serialised rows into this index. Malformed rows are skipped. */
+  mergeSerialized(json: string): void {
+    let data: unknown;
+    try {
+      data = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(data)) return;
+    for (const row of data) {
+      try {
+        if (!Array.isArray(row) || row.length < 2) continue;
+        const [obsId, entry] = row;
+        if (
+          typeof obsId !== "string" ||
+          typeof entry?.embedding !== "string" ||
+          typeof entry?.sessionId !== "string"
+        )
+          continue;
+        this.vectors.set(obsId, {
+          embedding: base64ToFloat32(entry.embedding),
+          sessionId: entry.sessionId,
+        });
+      } catch {
+        continue;
+      }
+    }
   }
 
   static deserialize(json: string): VectorIndex {
