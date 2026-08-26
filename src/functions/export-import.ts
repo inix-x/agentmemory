@@ -6,8 +6,6 @@ import type {
   SessionSummary,
   ProjectProfile,
   ExportData,
-  GraphNode,
-  GraphEdge,
   SemanticMemory,
   ProceduralMemory,
   Action,
@@ -28,6 +26,7 @@ import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
+import { listGraphScopes } from "./graph.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
@@ -100,8 +99,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       const [
-        graphNodes,
-        graphEdges,
+        graph,
         semanticMemories,
         proceduralMemories,
         actions,
@@ -117,8 +115,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         checkpoints,
         accessLogs,
       ] = await Promise.all([
-        kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-        kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
+        listGraphScopes(kv),
         kv.list<SemanticMemory>(KV.semantic).catch(() => []),
         kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
         kv.list<Action>(KV.actions).catch(() => []),
@@ -135,6 +132,14 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
       ]);
 
+      if (!graph.enumerated) {
+        logger.warn("Export omitted graph collections", {
+          reason:
+            "graph scopes exceed the safe-enumeration ceiling or no snapshot " +
+            "vouches for their size",
+        });
+      }
+
       const exportData: ExportData = {
         version: VERSION,
         exportedAt: new Date().toISOString(),
@@ -143,8 +148,8 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         memories,
         summaries,
         profiles: profiles.length > 0 ? profiles : undefined,
-        graphNodes: graphNodes.length > 0 ? graphNodes : undefined,
-        graphEdges: graphEdges.length > 0 ? graphEdges : undefined,
+        graphNodes: graph.nodes.length > 0 ? graph.nodes : undefined,
+        graphEdges: graph.edges.length > 0 ? graph.edges : undefined,
         semanticMemories:
           semanticMemories.length > 0 ? semanticMemories : undefined,
         proceduralMemories:

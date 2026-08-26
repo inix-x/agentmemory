@@ -6,7 +6,9 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerGraphFunction } from "../src/functions/graph.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
+import { registerExportImportFunction } from "../src/functions/export-import.js";
 import type {
+  ExportData,
   GraphEdge,
   GraphNode,
   GraphQueryResult,
@@ -301,6 +303,41 @@ describe("graph scope enumeration guard", () => {
 
       expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
       expect(result.usedFallback).toBe(false);
+    });
+  });
+
+  describe("mem::export", () => {
+    it("does not enumerate graph scopes when the snapshot reports a corpus past the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedGraph(kv, ["alpha", "beta"]);
+      await kv.set("mem:memories", "m_1", {
+        id: "m_1",
+        project: "p",
+        content: "kept",
+      });
+      registerExportImportFunction(sdk as never, kv as never);
+
+      const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.graphNodes).toBeUndefined();
+      expect(result.memories.map((m) => m.id)).toEqual(["m_1"]);
+    });
+
+    it("still exports the whole graph under the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerExportImportFunction(sdk as never, kv as never);
+
+      const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(result.graphNodes?.map((n) => n.name).sort()).toEqual([
+        "alpha",
+        "beta",
+        "gamma",
+      ]);
+      expect(result.graphEdges).toHaveLength(2);
     });
   });
 });
