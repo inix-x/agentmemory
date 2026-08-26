@@ -182,6 +182,20 @@ describe("graph scope enumeration guard", () => {
       expect(result.warning).toBeTruthy();
     });
 
+    it("does not enumerate a reset corpus whose snapshot counts only post-reset nodes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        snapshot(3, { resetAt: "2026-08-26T00:00:00Z" }),
+      );
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+
+      await sdk.trigger("mem::graph-query", { query: "alpha" });
+
+      expect(graphScopesListed(kv)).toEqual([]);
+    });
+
     it("still answers a substring query from the live graph under the ceiling", async () => {
       await kv.set(SNAPSHOT, "current", snapshot(3));
       await seedGraph(kv, ["alpha", "beta", "gamma"]);
@@ -244,6 +258,23 @@ describe("graph scope enumeration guard", () => {
       expect(result.success).toBe(false);
     });
 
+    it("does not enumerate a reset corpus whose snapshot counts only post-reset nodes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        snapshot(3, { resetAt: "2026-08-26T00:00:00Z" }),
+      );
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", {})) as {
+        success: boolean;
+      };
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.success).toBe(false);
+    });
+
     it("still rebuilds a corpus the snapshot vouches for", async () => {
       await kv.set(SNAPSHOT, "current", snapshot(3));
       await seedGraph(kv, ["alpha", "beta", "gamma"]);
@@ -291,6 +322,23 @@ describe("graph scope enumeration guard", () => {
       expect(result.usedFallback).toBe(true);
     });
 
+    it("does not enumerate a reset corpus whose snapshot counts only post-reset nodes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        snapshot(3, { resetAt: "2026-08-26T00:00:00Z" }),
+      );
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerReflectFunctions(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        usedFallback: boolean;
+      };
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.usedFallback).toBe(true);
+    });
+
     it("still clusters from the live graph under the ceiling", async () => {
       await kv.set(SNAPSHOT, "current", snapshot(3));
       await seedGraph(kv, ["alpha", "beta", "gamma"]);
@@ -322,6 +370,21 @@ describe("graph scope enumeration guard", () => {
       expect(graphScopesListed(kv)).toEqual([]);
       expect(result.graphNodes).toBeUndefined();
       expect(result.memories.map((m) => m.id)).toEqual(["m_1"]);
+    });
+
+    it("does not enumerate a reset corpus whose snapshot counts only post-reset nodes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        snapshot(3, { resetAt: "2026-08-26T00:00:00Z" }),
+      );
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerExportImportFunction(sdk as never, kv as never);
+
+      const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.graphNodes).toBeUndefined();
     });
 
     it("still exports the whole graph under the ceiling", async () => {

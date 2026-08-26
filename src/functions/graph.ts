@@ -183,32 +183,47 @@ const SAFE_ENUMERATION_NODE_CEILING = 25000;
 type GraphEnumerationCheck = {
   enumerable: boolean;
   totalNodes: number | null;
+  orphaned: boolean;
   ceiling: number;
 };
 
-// A missing snapshot, or one reporting zero nodes, cannot vouch for the
-// scope: mem::graph-reset writes an empty snapshot and deliberately
-// leaves every legacy row on disk. Both cases fail closed.
+function hasOrphanRows(snap: GraphSnapshot): boolean {
+  return typeof snap.resetAt === "string" && Date.parse(snap.resetAt) > 0;
+}
+
+// The snapshot's count only covers rows it knows about, so it bounds the
+// scope in two cases and neither of them may be assumed. A missing
+// snapshot counts nothing at all. A post-reset snapshot counts only rows
+// written since the reset, while mem::graph-reset deliberately leaves
+// every prior row on disk, so its count can read low against an
+// arbitrarily large scope. Both fail closed, as does a zero count.
 async function checkGraphEnumerable(
   kv: StateKV,
 ): Promise<GraphEnumerationCheck> {
   const snap = await readSnapshot(kv);
   const totalNodes = snap ? snap.stats.totalNodes : null;
+  const orphaned = snap ? hasOrphanRows(snap) : false;
   return {
     enumerable:
+      !orphaned &&
       totalNodes !== null &&
       totalNodes > 0 &&
       totalNodes <= SAFE_ENUMERATION_NODE_CEILING,
     totalNodes,
+    orphaned,
     ceiling: SAFE_ENUMERATION_NODE_CEILING,
   };
 }
 
 function describeCorpusSize(check: GraphEnumerationCheck): string {
   if (check.totalNodes === null) return "no graph snapshot exists";
-  if (check.totalNodes === 0) {
-    return "the snapshot counts zero nodes (post-reset or empty corpus)";
+  if (check.orphaned) {
+    return (
+      `the snapshot counts ${check.totalNodes} post-reset nodes but ` +
+      "mem::graph-reset left an unbounded number of prior rows in the scope"
+    );
   }
+  if (check.totalNodes === 0) return "the snapshot counts zero nodes";
   return `the snapshot counts ${check.totalNodes} nodes`;
 }
 
