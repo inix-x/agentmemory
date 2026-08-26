@@ -501,11 +501,6 @@ export class IndexPersistence {
       });
     }
 
-    // ponytail: unbounded while EVERY delete keeps failing — each debounce
-    // appends a generation carrying all its shard descriptors, and
-    // reclaimGenerations only rewrites when something was actually reclaimed.
-    // Add a length cap if that ever shows up in the wild; a cap is not one
-    // line, and this needs a total delete outage to reach.
     await this.kv.set<IndexGcLedger>(
       KV.bm25Index,
       this.gcKey(manifestKey),
