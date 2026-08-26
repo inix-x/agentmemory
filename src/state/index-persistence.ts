@@ -90,15 +90,7 @@ export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = new Map<string, number>();
   private queue: Promise<void> = Promise.resolve();
-  /**
-   * A save that is queued but has not started running yet.
-   *
-   * It will serialise the index as it stands at the moment it runs, so it
-   * already covers every caller that arrives before then. Handing them this
-   * promise instead of queueing another identical save is what keeps a delete
-   * from waiting out an unbounded line of saves ahead of it.
-   */
-  private pendingSave: Promise<void> | null = null;
+  private unstartedSave: Promise<void> | null = null;
 
   constructor(
     private kv: StateKV,
@@ -123,20 +115,13 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    // Coalesce onto a save that is queued but has not started. It has not taken
-    // its snapshot yet, so it will include whatever this caller just changed.
-    // Only a save that is ALREADY RUNNING must not be handed back: its snapshot
-    // predates this caller's mutation, and reporting success for it would tell
-    // a delete it was durable when it was not.
-    if (this.pendingSave) return this.pendingSave;
+    if (this.unstartedSave) return this.unstartedSave;
 
     const pending = this.enqueue(() => {
-      // Running now. Its snapshot is fixed from here, so the next caller needs
-      // a save of its own.
-      if (this.pendingSave === pending) this.pendingSave = null;
+      if (this.unstartedSave === pending) this.unstartedSave = null;
       return this.runSave();
     });
-    this.pendingSave = pending;
+    this.unstartedSave = pending;
     return pending;
   }
 
@@ -524,11 +509,6 @@ export class IndexPersistence {
       });
     }
 
-    // ponytail: unbounded while EVERY delete keeps failing — each debounce
-    // appends a generation carrying all its shard descriptors, and
-    // reclaimGenerations only rewrites when something was actually reclaimed.
-    // Add a length cap if that ever shows up in the wild; a cap is not one
-    // line, and this needs a total delete outage to reach.
     await this.kv.set<IndexGcLedger>(
       KV.bm25Index,
       this.gcKey(manifestKey),
