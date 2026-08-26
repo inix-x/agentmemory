@@ -1566,6 +1566,27 @@ describe("IndexPersistence vector hash-format change", () => {
   });
   afterEach(() => vi.useRealTimers());
 
+  // Both hashes a bucket may legitimately carry. Whichever one this build
+  // publishes, the other stands for a store written either side of the
+  // migration — an older build's, or a newer build's after a rollback.
+  for (const algorithm of ["sha1", "sha256"]) {
+    it(`reads a bucket whose manifest records a ${algorithm} hash`, async () => {
+      await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+        shardChars: 400,
+      }).save();
+
+      await rehashStoreUnder(kv, algorithm);
+
+      const loaded = await new IndexPersistence(
+        kv as never,
+        new SearchIndex(),
+        null,
+      ).load();
+      expect(loaded.vector!.size).toBe(20);
+      expect(loaded.vectorRejected).toBe(false);
+    });
+  }
+
   it("recovers when a hash change makes every bucket unverifiable", async () => {
     await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
       shardChars: 400,

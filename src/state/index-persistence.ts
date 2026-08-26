@@ -41,8 +41,8 @@ type IndexShardManifest = {
  * size, since a bucket grows with the corpus and the engine rejects an
  * oversized `state::set`.
  */
-// No `chars`: the sha1 already proves both content and length. v1 needed a
-// length check only because it had no hash to check against.
+// No `chars`: the content hash already proves both content and length. v1
+// needed a length check only because it had no hash to check against.
 type VectorBucketEntry = { hash: string; chunks: number };
 
 /**
@@ -158,11 +158,32 @@ function bucketChunkKeys(bucketKey: string, entry: VectorBucketEntry): string[] 
   return keys;
 }
 
-// sha1 over the bucket body. This one IS a content check — a collision means a
+// The hash of a bucket body. This one IS a content check — a collision means a
 // changed bucket is silently never persisted — so it must not be the 32-bit
 // hash used for bucket assignment.
+const PUBLISHED_BUCKET_HASH = "sha1";
+
+/**
+ * Every hash a stored bucket may legitimately carry, published one first.
+ *
+ * The set a load accepts is deliberately wider than the one a save publishes.
+ * A bucket's chunk keys are derived from the hash the manifest records, so a
+ * build that only accepts its own hash finds every chunk and then rejects every
+ * one of them — and a rejected bucket cannot be rewritten, because its contents
+ * never reach memory to be re-serialised. Widening the accepted set is what
+ * turns a change of published hash into an ordinary rewrite, and it is also
+ * what lets a rollback read a store the newer build wrote.
+ */
+const ACCEPTED_BUCKET_HASHES = [PUBLISHED_BUCKET_HASH, "sha256"];
+
 function contentHash(value: string): string {
-  return createHash("sha1").update(value).digest("hex");
+  return createHash(PUBLISHED_BUCKET_HASH).update(value).digest("hex");
+}
+
+function bucketBodyMatches(body: string, expected: string): boolean {
+  return ACCEPTED_BUCKET_HASHES.some(
+    (algorithm) => createHash(algorithm).update(body).digest("hex") === expected,
+  );
 }
 
 type IndexPersistenceOptions = {
@@ -791,7 +812,7 @@ export class IndexPersistence {
       // check it would be silently parsed as empty and its vectors lost with
       // no signal. Skipping it instead costs only that bucket, and the next
       // save rewrites it because the hash still disagrees.
-      if (contentHash(body) !== entry.hash) {
+      if (!bucketBodyMatches(body, entry.hash)) {
         corrupt++;
         continue;
       }
