@@ -1,12 +1,7 @@
 import type { ISdk, ApiRequest } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import type {
-  SessionSummary,
-  Memory,
-  Session,
-  GraphSnapshot,
-} from "../types.js";
+import type { SessionSummary, Memory, Session } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -1478,11 +1473,10 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const snapshot = await kv.get<GraphSnapshot>(
-              KV.graphSnapshot,
-              "current",
-            );
-            const stats = snapshot?.stats;
+            const stats = await sdk.trigger({
+              function_id: "mem::graph-stats",
+              payload: {},
+            });
             return {
               status_code: 200,
               body: {
@@ -1490,13 +1484,7 @@ export function registerMcpEndpoints(
                   {
                     uri,
                     mimeType: "application/json",
-                    text: JSON.stringify({
-                      totalNodes: stats?.totalNodes ?? 0,
-                      totalEdges: stats?.totalEdges ?? 0,
-                      nodesByType: stats?.nodesByType ?? {},
-                      edgesByType: stats?.edgesByType ?? {},
-                      ...(snapshot ? {} : { pending: true }),
-                    }),
+                    text: JSON.stringify(stats),
                   },
                 ],
               },
