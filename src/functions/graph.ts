@@ -171,16 +171,60 @@ function paginateFromSnapshot(
   };
 }
 
-// #814 v2: the rebuild path won't terminate on corpora large enough
-// that kv.list returns a payload too big to JSON.parse without
-// starving the iii heartbeat. We don't actually know the corpus size
-// without enumerating, but we can refuse to start a rebuild if the
-// snapshot's recorded `totalNodes` already exceeds this threshold —
-// the rebuild path is unreliable above it, and an incremental
-// extract-driven snapshot is the right approach for those corpora.
+// #814 v2: no caller can survive a kv.list whose payload is too big to
+// JSON.parse without starving the iii heartbeat, and the response frame
+// is rejected at its length header before any node-side code can bound
+// it. We can't know the corpus size without enumerating, but the
+// snapshot's recorded `totalNodes` is a proxy we can read cheaply.
 // Operators above the threshold should use mem::graph-reset and let
 // future extracts rebuild incrementally.
-const REBUILD_SAFE_NODE_CEILING = 25000;
+const SAFE_ENUMERATION_NODE_CEILING = 25000;
+
+type GraphEnumerationCheck = {
+  enumerable: boolean;
+  totalNodes: number | null;
+  ceiling: number;
+};
+
+// A missing snapshot, or one reporting zero nodes, cannot vouch for the
+// scope: mem::graph-reset writes an empty snapshot and deliberately
+// leaves every legacy row on disk. Both cases fail closed.
+async function checkGraphEnumerable(
+  kv: StateKV,
+): Promise<GraphEnumerationCheck> {
+  const snap = await readSnapshot(kv);
+  const totalNodes = snap ? snap.stats.totalNodes : null;
+  return {
+    enumerable:
+      totalNodes !== null &&
+      totalNodes > 0 &&
+      totalNodes <= SAFE_ENUMERATION_NODE_CEILING,
+    totalNodes,
+    ceiling: SAFE_ENUMERATION_NODE_CEILING,
+  };
+}
+
+function describeCorpusSize(check: GraphEnumerationCheck): string {
+  if (check.totalNodes === null) return "no graph snapshot exists";
+  if (check.totalNodes === 0) {
+    return "the snapshot counts zero nodes (post-reset or empty corpus)";
+  }
+  return `the snapshot counts ${check.totalNodes} nodes`;
+}
+
+export async function listGraphScopes(
+  kv: StateKV,
+): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; enumerated: boolean }> {
+  const check = await checkGraphEnumerable(kv);
+  if (!check.enumerable) {
+    return { nodes: [], edges: [], enumerated: false };
+  }
+  const [nodes, edges] = await Promise.all([
+    kv.list<GraphNode>(KV.graphNodes).catch(() => [] as GraphNode[]),
+    kv.list<GraphEdge>(KV.graphEdges).catch(() => [] as GraphEdge[]),
+  ]);
+  return { nodes, edges, enumerated: true };
+}
 
 function nameIndexKey(type: string, name: string): string {
   return `${type}|${name}`;
@@ -793,7 +837,7 @@ export function registerGraphFunction(
       // inline by graph-extract, so for newly-built corpora it's
       // always current. For legacy corpora missing a snapshot the
       // operator must run mem::graph-snapshot-rebuild (safe under
-      // REBUILD_SAFE_NODE_CEILING) or mem::graph-reset to wipe and
+      // SAFE_ENUMERATION_NODE_CEILING) or mem::graph-reset to wipe and
       // rebuild incrementally from new observations.
       const noWalk = !data.query && !data.startNodeId;
       if (noWalk) {
@@ -819,6 +863,49 @@ export function registerGraphFunction(
         };
       }
 
+      const degradeToSnapshot = async (
+        warning: string,
+      ): Promise<GraphQueryResult> => {
+        const snap = await readSnapshot(kv);
+        if (snap) {
+          return {
+            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
+            warning,
+          };
+        }
+        return {
+          nodes: [],
+          edges: [],
+          depth: 0,
+          totalNodes: 0,
+          totalEdges: 0,
+          truncated: false,
+          limit,
+          offset,
+          warning,
+        };
+      };
+
+      // The wall-clock budget below cannot save a corpus whose response
+      // frame is over the transport ceiling: the frame is rejected at
+      // its length header and the worker dies before any timer fires.
+      // Refuse the enumeration outright unless the snapshot vouches for
+      // the size.
+      const enumeration = await checkGraphEnumerable(kv);
+      if (!enumeration.enumerable) {
+        logger.warn("Graph query enumeration refused, using snapshot", {
+          totalNodes: enumeration.totalNodes,
+          ceiling: enumeration.ceiling,
+        });
+        return degradeToSnapshot(
+          `Live graph enumeration refused: ${describeCorpusSize(enumeration)} ` +
+            `against a ${enumeration.ceiling}-node safe-enumeration ceiling. ` +
+            "Query / startNodeId paths degrade to the top-degree snapshot " +
+            "until a per-node edge index lands. Result does not reflect the " +
+            "requested walk.",
+        );
+      }
+
       // Query / startNodeId paths still need broader access. Race the
       // live enumeration against a wall-clock budget so a long
       // kv.list doesn't block the worker indefinitely. On timeout the
@@ -841,29 +928,12 @@ export function registerGraphFunction(
         logger.warn("Graph query enumeration timed out, using snapshot", {
           error: msg,
         });
-        const snap = await readSnapshot(kv);
-        if (snap) {
-          return {
-            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
-            warning:
-              "Live graph enumeration exceeded budget. Query / " +
-              "startNodeId paths degrade on >25K-node corpora until a " +
-              "per-node edge index lands. Result reflects top-degree " +
-              "snapshot, not the requested walk.",
-          };
-        }
-        return {
-          nodes: [],
-          edges: [],
-          depth: 0,
-          totalNodes: 0,
-          totalEdges: 0,
-          truncated: false,
-          limit,
-          offset,
-          warning:
-            "Graph enumeration exceeded budget and no snapshot is available.",
-        };
+        return degradeToSnapshot(
+          "Live graph enumeration exceeded budget. Query / " +
+            "startNodeId paths degrade on >25K-node corpora until a " +
+            "per-node edge index lands. Result reflects top-degree " +
+            "snapshot, not the requested walk.",
+        );
       }
 
       if (data.query) {
@@ -988,18 +1058,27 @@ export function registerGraphFunction(
       // can't accidentally bypass the legacy-corpus safeguard.
       const forceRebuild = data?.force === true;
       try {
-        const existing = await readSnapshot(kv);
-        if (!existing && !forceRebuild) {
-          logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
-            hint: "legacy corpus or empty store",
+        const enumeration = await checkGraphEnumerable(kv);
+        if (!enumeration.enumerable && !forceRebuild) {
+          logger.warn("Graph snapshot rebuild refused", {
+            totalNodes: enumeration.totalNodes,
+            ceiling: enumeration.ceiling,
           });
           return {
             success: false,
-            legacyCorpus: true,
+            legacyCorpus:
+              enumeration.totalNodes === null || enumeration.totalNodes === 0,
+            tooLarge:
+              enumeration.totalNodes !== null &&
+              enumeration.totalNodes > enumeration.ceiling,
+            totalNodes: enumeration.totalNodes ?? undefined,
+            ceiling: enumeration.ceiling,
             error:
-              "No prior snapshot found. Rebuild would call kv.list on " +
-              "KV.graphNodes/Edges, which heartbeat-crashes the worker " +
-              "on corpora past the iii state response budget (~25K nodes). " +
+              `Rebuild refused: ${describeCorpusSize(enumeration)} against a ` +
+              `${enumeration.ceiling}-node safe-enumeration ceiling. Rebuild ` +
+              "would call kv.list on KV.graphNodes/Edges, whose response " +
+              "frame is rejected at its length header once the scope is " +
+              "large enough — the worker dies before any budget can fire. " +
               "Either (a) call POST /agentmemory/graph/reset to drop into " +
               "incremental-only mode and rebuild from new extracts, or " +
               "(b) re-send with `force: true` if you're certain the " +
@@ -1023,19 +1102,19 @@ export function registerGraphFunction(
           "graph-snapshot-rebuild enumeration",
         );
 
-      if (nodes.length > REBUILD_SAFE_NODE_CEILING) {
+      if (nodes.length > SAFE_ENUMERATION_NODE_CEILING) {
         logger.warn("Graph snapshot rebuild aborted: corpus too large", {
           totalNodes: nodes.length,
-          ceiling: REBUILD_SAFE_NODE_CEILING,
+          ceiling: SAFE_ENUMERATION_NODE_CEILING,
         });
         return {
           success: false,
           tooLarge: true,
           totalNodes: nodes.length,
-          ceiling: REBUILD_SAFE_NODE_CEILING,
+          ceiling: SAFE_ENUMERATION_NODE_CEILING,
           error:
             `Corpus has ${nodes.length} graph nodes; safe-rebuild ceiling ` +
-            `is ${REBUILD_SAFE_NODE_CEILING}. Run POST /agentmemory/graph/reset ` +
+            `is ${SAFE_ENUMERATION_NODE_CEILING}. Run POST /agentmemory/graph/reset ` +
             `to wipe and let future extracts rebuild incrementally.`,
         };
       }

@@ -609,8 +609,29 @@ describe("Graph Functions", () => {
       };
     }
 
+    // The enumeration guard refuses outright unless a snapshot vouches
+    // for the corpus size, so the budget / rejection paths below are
+    // only reachable once one exists.
+    function vouchingSnapshot() {
+      return {
+        version: 1 as const,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: {
+          totalNodes: 1,
+          totalEdges: 0,
+          nodesByType: {},
+          edgesByType: {},
+        },
+        updatedAt: "2026-08-27T00:00:00Z",
+        dirty: false,
+      };
+    }
+
     it("graph-query startNodeId returns warning envelope when enumeration exceeds budget", async () => {
       const slow = slowKV(7000); // > LIVE_ENUMERATION_BUDGET_MS (6000ms)
+      await slow.set("mem:graph:snapshot", "current", vouchingSnapshot());
       const localSdk = mockSdk();
       registerGraphFunction(localSdk as never, slow as never, mockProvider as never);
 
@@ -640,6 +661,7 @@ describe("Graph Functions", () => {
 
     it("graph-query rejects-from-engine path returns warning envelope (worker-death simulation)", async () => {
       const rejector = rejectingKV();
+      await rejector.set("mem:graph:snapshot", "current", vouchingSnapshot());
       const localSdk = mockSdk();
       registerGraphFunction(
         localSdk as never,
@@ -655,7 +677,7 @@ describe("Graph Functions", () => {
       expect(result.nodes).toEqual([]);
     });
 
-    it("graph-snapshot-rebuild refuses corpora past REBUILD_SAFE_NODE_CEILING", async () => {
+    it("graph-snapshot-rebuild refuses corpora past SAFE_ENUMERATION_NODE_CEILING", async () => {
       // Direct-poke the mock store with > 25K node values so kv.list
       // returns them without paying the per-set cost. Each node only
       // needs id/type/name/stale=false for the rebuild path.
