@@ -871,6 +871,14 @@ describe("IndexPersistence vector bucketing", () => {
     await persistence.save();
 
     expect(kv.bucketWrites).toBeLessThanOrEqual(2);
+    // Bounding the write count alone does not discriminate: skipping writes
+    // that were needed also lowers it. Read the result back.
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(61);
+    expect(
+      loaded.vector!.search(new Float32Array([9, 9, 9]), 61)
+        .some((r) => r.obsId === "obs_new"),
+    ).toBe(true);
   });
 
   // Covers the same-instance case too: saveVectorBuckets holds no state between
@@ -911,13 +919,22 @@ describe("IndexPersistence vector bucketing", () => {
     });
     await persistence.save();
 
-    vector.remove("obs_7");
+    // obs_9 shares a bucket with obs_30, so removing it forces that bucket to be
+    // REWRITTEN with its surviving member. Removing a bucket's only occupant
+    // instead would just reclaim it and never exercise a write at all, which is
+    // what this test is supposed to be about.
+    vector.remove("obs_9");
     kv.resetCount();
     await persistence.save();
 
     expect(kv.bucketWrites).toBeLessThanOrEqual(1);
     const loaded = await persistence.load();
     expect(loaded.vector!.size).toBe(59);
+    // The bucket-mate must survive the rewrite.
+    expect(
+      loaded.vector!.search(new Float32Array([30, 31, 32]), 59)
+        .some((r) => r.obsId === "obs_30"),
+    ).toBe(true);
   });
 
   it("round-trips every vector through the bucketed format", async () => {
@@ -1437,5 +1454,63 @@ describe("IndexPersistence vector save/load hazards", () => {
     // The blip must not be converted into a permanent delete.
     await persistence.save();
     expect(await loadedSize()).toBe(60);
+  });
+});
+
+// Every other test in this file writes and reads through the same build, so the
+// suite is self-consistent under ANY addressing change and cannot see one. This
+// is the only cross-version fixture: it stands in for "a store written by an
+// older layout" and pins the guard that forces a rewrite instead of a skip.
+describe("IndexPersistence vector layout version", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function seeded(count: number): VectorIndex {
+    const vector = new VectorIndex();
+    for (let i = 0; i < count; i++) {
+      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+    }
+    return vector;
+  }
+
+  it("rewrites everything when the stored layout version differs", async () => {
+    const vector = seeded(20);
+    await new IndexPersistence(kv as never, new SearchIndex(), vector, {
+      shardChars: 400,
+    }).save();
+
+    // Rewrite the manifest as an older layout while KEEPING every content hash,
+    // then drop the payload keys. Same content, different addressing — exactly
+    // the shape a content hash cannot detect on its own. A build that trusts the
+    // hash alone skips every write and then cannot find its own data.
+    const current = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, {
+      ...current!,
+      layout: current!.layout - 1,
+    });
+    for (const [bucketKey, entry] of Object.entries(current!.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        await kv.delete(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i));
+      }
+    }
+
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(20);
   });
 });

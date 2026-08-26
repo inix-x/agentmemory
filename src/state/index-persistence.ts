@@ -21,6 +21,7 @@ const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
 // are deterministic and overwritten in place, so nothing can be stranded.
 const VECTOR_BUCKET_SCOPE = `${KV.bm25Index}:vectors:v2`;
 const DEFAULT_VECTOR_BUCKETS = 256;
+const MAX_BUCKET_CHUNKS = 10_000;
 
 type IndexShardManifest = {
   v: 1;
@@ -59,7 +60,10 @@ type VectorBucketEntry = { hash: string; chunks: number };
  * well enough to reclaim the keys it named. Bumping `v` instead would make the
  * old manifest unreadable and strand every key in it.
  */
-const VECTOR_LAYOUT = 1;
+// 2: chunk keys carry the bucket's content hash. 1 addressed them by index
+// alone. Anything written under layout 1 is unreadable under 2, which is
+// precisely why the mismatch has to force a full rewrite instead of a skip.
+const VECTOR_LAYOUT = 2;
 
 type VectorBucketManifest = {
   v: 2;
@@ -93,13 +97,17 @@ function isVectorBucketManifest(value: unknown): value is VectorBucketManifest {
 function isValidBucketEntry(value: unknown): value is VectorBucketEntry {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<VectorBucketEntry>;
-  // The chunks bound matters beyond shape: it is the loop bound for both the
-  // reclaim walks below, so a poisoned value would spin a garbage-length loop.
+  // chunks is the loop bound for both reclaim walks, so it needs a ceiling and
+  // not just an integer check. Number.isInteger(1e9) is true, and a single
+  // poisoned manifest field would otherwise queue a billion deletes. The cap is
+  // deliberately far above any real bucket: at the default 2M chunkChars this
+  // still allows a 20 GB bucket.
   return (
     typeof candidate.hash === "string" &&
     candidate.hash.length > 0 &&
     Number.isInteger(candidate.chunks) &&
-    (candidate.chunks as number) >= 1
+    (candidate.chunks as number) >= 1 &&
+    (candidate.chunks as number) <= MAX_BUCKET_CHUNKS
   );
 }
 
