@@ -121,6 +121,26 @@ Focus test effort on system boundaries where trust transitions occur.
 </insight>
 </insights>`;
 
+// mem::reflect only enumerates the graph scopes when the snapshot vouches
+// for the corpus size, so a fixture that seeds graph rows must seed the
+// snapshot persistGraphDelta would have written alongside them.
+function vouchingSnapshot(totalNodes: number) {
+  return {
+    version: 1 as const,
+    topNodes: [],
+    topEdges: [],
+    topDegrees: {},
+    stats: {
+      totalNodes,
+      totalEdges: 0,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: "2026-08-27T00:00:00Z",
+    dirty: false,
+  };
+}
+
 describe("Reflect", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
@@ -151,6 +171,7 @@ describe("Reflect", () => {
     });
 
     it("synthesizes insights from graph concept clusters", async () => {
+      await kv.set("mem:graph:snapshot", "current", vouchingSnapshot(3));
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
       await kv.set("mem:graph:nodes", "node_testing", makeConceptNode("testing"));
@@ -178,6 +199,7 @@ describe("Reflect", () => {
     });
 
     it("skips clusters with fewer than 3 supporting items", async () => {
+      await kv.set("mem:graph:snapshot", "current", vouchingSnapshot(2));
       await kv.set("mem:graph:nodes", "node_sparse", makeConceptNode("sparse"));
       await kv.set("mem:graph:nodes", "node_topic", makeConceptNode("topic"));
       await kv.set("mem:graph:edges", "edge_1", makeEdge("sparse", "topic"));
@@ -194,6 +216,7 @@ describe("Reflect", () => {
     });
 
     it("deduplicates insights by fingerprint", async () => {
+      await kv.set("mem:graph:snapshot", "current", vouchingSnapshot(2));
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
       await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));

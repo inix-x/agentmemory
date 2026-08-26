@@ -10,6 +10,7 @@ import type {
   Crystal,
   MemoryProvider,
 } from "../types.js";
+import { listGraphScopes } from "./graph.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 
@@ -171,14 +172,12 @@ export function registerReflectFunctions(
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
 
-      const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
-        await Promise.all([
-          kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-          kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
-          kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-          kv.list<Lesson>(KV.lessons).catch(() => []),
-          kv.list<Crystal>(KV.crystals).catch(() => []),
-        ]);
+      const [graph, semanticMemories, lessons, crystals] = await Promise.all([
+        listGraphScopes(kv),
+        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
+        kv.list<Lesson>(KV.lessons).catch(() => []),
+        kv.list<Crystal>(KV.crystals).catch(() => []),
+      ]);
 
       let activeLessons = lessons.filter((l) => !l.deleted);
       if (data?.project) {
@@ -186,8 +185,8 @@ export function registerReflectFunctions(
       }
 
       let conceptClusters = buildGraphClusters(
-        graphNodes,
-        graphEdges,
+        graph.nodes,
+        graph.edges,
         maxClusters,
       );
 

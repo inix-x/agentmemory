@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerGraphFunction } from "../src/functions/graph.js";
+import { registerReflectFunctions } from "../src/functions/reflect.js";
 import type {
   GraphEdge,
   GraphNode,
@@ -255,6 +256,51 @@ describe("graph scope enumeration guard", () => {
       expect(result.success).toBe(true);
       expect(result.totalNodes).toBe(3);
       expect(result.totalEdges).toBe(2);
+    });
+  });
+
+  describe("mem::reflect", () => {
+    it("does not enumerate graph scopes when the snapshot reports a corpus past the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedGraph(kv, ["alpha", "beta"]);
+      registerReflectFunctions(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        success: boolean;
+        usedFallback: boolean;
+      };
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.success).toBe(true);
+      expect(result.usedFallback).toBe(true);
+    });
+
+    it("degrades to the Jaccard fallback on a legacy corpus with no snapshot", async () => {
+      await seedGraph(kv, ["alpha", "beta"]);
+      registerReflectFunctions(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        success: boolean;
+        usedFallback: boolean;
+      };
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.success).toBe(true);
+      expect(result.usedFallback).toBe(true);
+    });
+
+    it("still clusters from the live graph under the ceiling", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      registerReflectFunctions(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        success: boolean;
+        usedFallback: boolean;
+      };
+
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(result.usedFallback).toBe(false);
     });
   });
 });
