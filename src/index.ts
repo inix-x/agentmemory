@@ -1,4 +1,5 @@
 import { registerWorker, TriggerAction } from "iii-sdk";
+import { boundEnginePrimitives } from "./sdk-timeouts.js";
 import {
   hydrateProcessEnvFromFile,
   loadConfig,
@@ -199,7 +200,7 @@ async function main() {
   );
   bootLog(`Streams: ws://localhost:${config.streamsPort}`);
 
-  const sdk = registerWorker(config.engineUrl, {
+  const sdk = boundEnginePrimitives(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -219,7 +220,7 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  });
+  }));
 
   writeWorkerPidfile();
 
