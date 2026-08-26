@@ -1587,6 +1587,65 @@ describe("IndexPersistence vector hash-format change", () => {
     });
   }
 
+  it("migrates a store off the previous bucket hash without re-embedding", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
+      shardChars: 400,
+    }).save();
+
+    // Stands in for a store this branch's earlier builds wrote: sha1 bucket
+    // hashes, under the layout that published them.
+    await rehashStoreUnder(kv, "sha1");
+    const current = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+    await kv.set(BM25_SCOPE, VECTOR_MANIFEST_KEY, {
+      ...current,
+      layout: current.layout - 1,
+    });
+    const stale = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+
+    const live = new VectorIndex();
+    const persistence = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      live,
+      { shardChars: 400 },
+    );
+    const loaded = await persistence.load();
+    expect(loaded.vector!.size).toBe(20);
+    live.restoreFrom(loaded.vector!);
+
+    await persistence.save();
+
+    const migrated = (await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    ))!;
+    expect(migrated.layout).toBe(stale.layout + 1);
+    for (const entry of Object.values(migrated.shards)) {
+      // sha256 hex. sha1 would be 40.
+      expect(entry.hash).toHaveLength(64);
+    }
+    for (const [bucketKey, entry] of Object.entries(stale.shards)) {
+      for (let i = 0; i < entry.chunks; i++) {
+        expect(
+          await kv.get(VECTOR_BUCKET_SCOPE, chunkKey(bucketKey, entry.hash, i)),
+        ).toBeNull();
+      }
+    }
+
+    const reopened = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reopened.vector!.size).toBe(20);
+  });
+
   it("recovers when a hash change makes every bucket unverifiable", async () => {
     await new IndexPersistence(kv as never, new SearchIndex(), seeded(20), {
       shardChars: 400,

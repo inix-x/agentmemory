@@ -60,10 +60,11 @@ type VectorBucketEntry = { hash: string; chunks: number };
  * well enough to reclaim the keys it named. Bumping `v` instead would make the
  * old manifest unreadable and strand every key in it.
  */
-// 2: chunk keys carry the bucket's content hash. 1 addressed them by index
-// alone. Anything written under layout 1 is unreadable under 2, which is
-// precisely why the mismatch has to force a full rewrite instead of a skip.
-const VECTOR_LAYOUT = 2;
+// 3: bucket hashes are sha256. 2: chunk keys carry the bucket's content hash.
+// 1 addressed them by index alone. A bucket written under an earlier layout is
+// unreachable under a later one, which is precisely why the mismatch has to
+// force a full rewrite instead of a skip.
+const VECTOR_LAYOUT = 3;
 
 type VectorBucketManifest = {
   v: 2;
@@ -128,6 +129,9 @@ function vectorBucketKey(bucket: number): string {
  *
  * Addressing by content instead means the old bucket stays readable until the
  * new manifest names the new one, so a save that dies partway loses nothing.
+ *
+ * The 12 characters must be raw hex. A prefixed identifier would spend some of
+ * them on a constant and leave fewer distinguishing bits than the key needs.
  */
 function vectorChunkKey(
   bucketKey: string,
@@ -161,7 +165,7 @@ function bucketChunkKeys(bucketKey: string, entry: VectorBucketEntry): string[] 
 // The hash of a bucket body. This one IS a content check — a collision means a
 // changed bucket is silently never persisted — so it must not be the 32-bit
 // hash used for bucket assignment.
-const PUBLISHED_BUCKET_HASH = "sha1";
+const PUBLISHED_BUCKET_HASH = "sha256";
 
 /**
  * Every hash a stored bucket may legitimately carry, published one first.
@@ -174,7 +178,7 @@ const PUBLISHED_BUCKET_HASH = "sha1";
  * turns a change of published hash into an ordinary rewrite, and it is also
  * what lets a rollback read a store the newer build wrote.
  */
-const ACCEPTED_BUCKET_HASHES = [PUBLISHED_BUCKET_HASH, "sha256"];
+const ACCEPTED_BUCKET_HASHES = [PUBLISHED_BUCKET_HASH, "sha1"];
 
 function contentHash(value: string): string {
   return createHash(PUBLISHED_BUCKET_HASH).update(value).digest("hex");
