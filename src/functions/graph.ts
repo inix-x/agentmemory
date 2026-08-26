@@ -240,7 +240,8 @@ function warnEnumerationThrottled(
 ): void {
   const now = Date.now();
   const state = enumerationWarnState.get(key) ?? { lastAt: 0, suppressed: 0 };
-  if (state.lastAt > 0 && now - state.lastAt < ENUMERATION_WARN_INTERVAL_MS) {
+  const elapsed = now - state.lastAt;
+  if (state.lastAt > 0 && elapsed >= 0 && elapsed < ENUMERATION_WARN_INTERVAL_MS) {
     state.suppressed += 1;
     enumerationWarnState.set(key, state);
     return;
@@ -293,7 +294,8 @@ export async function listGraphScopes(
     kv.list<GraphNode>(KV.graphNodes).catch(onListFailure(KV.graphNodes)),
     kv.list<GraphEdge>(KV.graphEdges).catch(onListFailure(KV.graphEdges)),
   ]);
-  return { nodes, edges, enumerated: !failed };
+  if (failed) return { nodes: [], edges: [], enumerated: false };
+  return { nodes, edges, enumerated: true };
 }
 
 function nameIndexKey(type: string, name: string): string {

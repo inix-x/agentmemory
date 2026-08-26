@@ -423,6 +423,32 @@ describe("graph scope enumeration guard", () => {
       ]);
       expect(result.graphEdges).toHaveLength(2);
     });
+
+    it("omits both graph collections when only one graph scope fails to enumerate", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(3));
+      await seedGraph(kv, ["alpha", "beta", "gamma"]);
+      const passthrough = kv.list;
+      kv.list = (async <T>(scope: string): Promise<T[]> => {
+        if (scope === EDGES) {
+          throw new Error("Invocation timeout after 180000ms: state::list");
+        }
+        return passthrough<T>(scope);
+      }) as typeof kv.list;
+      registerExportImportFunction(sdk as never, kv as never);
+
+      const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+      expect(result.graphEdges).toBeUndefined();
+      expect(result.graphNodes).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Graph scope enumeration failed",
+        expect.objectContaining({ caller: "mem::export", scope: EDGES }),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Export omitted graph collections",
+        expect.anything(),
+      );
+    });
   });
 
   describe("GraphRetrieval (mem::search / mem::smart-search graph stream)", () => {
@@ -527,6 +553,20 @@ describe("graph scope enumeration guard", () => {
       const calls = warnCallsFor("Graph scope enumeration refused");
       expect(calls).toHaveLength(2);
       expect(calls[1]![1]).toMatchObject({ suppressedSinceLastWarning: 4 });
+    });
+
+    it("warns again after the clock steps backwards rather than suppressing until it catches up", async () => {
+      await kv.set(SNAPSHOT, "current", snapshot(30000));
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+      const retrieval = new GraphRetrieval(kv as never);
+
+      await retrieval.searchByEntities(["alpha"]);
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(1);
+
+      vi.setSystemTime(clock - 60 * 60_000);
+      await retrieval.searchByEntities(["alpha"]);
+
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(2);
     });
 
     it("still answers an entity search from the live graph under the ceiling", async () => {
