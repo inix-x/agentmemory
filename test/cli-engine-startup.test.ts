@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { ENGINE_LOG_MAX_BYTES_PER_SECOND } from "../src/cli/engine-log.js";
 
 describe("engine spawn stdio and death detection", () => {
   const source = readFileSync("src/cli.ts", "utf8");
@@ -45,6 +46,16 @@ describe("engine spawn stdio and death detection", () => {
     expect(gateBlock).not.toContain("stderrChunks");
     expect(gateBlock).not.toContain("process.exit(1)");
     expect(spawnBody.indexOf('child.on("exit"')).toBeGreaterThan(gateEnd);
+  });
+
+  // The forwarder and the death report share process.stderr, and process.exit(1)
+  // discards pending async writes on a pipe, so the rate cap is what bounds how
+  // much forwarder output can ever sit ahead of the death report inside one
+  // second. Measured non-displacing at 64 KiB against a no-forwarder control;
+  // raising this cap voids that measurement, so it is pinned here rather than
+  // left to the structural assertions above, which would all still pass.
+  it("keeps the rate cap low enough not to crowd out the death report", () => {
+    expect(ENGINE_LOG_MAX_BYTES_PER_SECOND).toBeLessThanOrEqual(64 * 1024);
   });
 
   it("still captures the dying engine's stderr for the death report", () => {
