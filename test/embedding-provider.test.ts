@@ -18,10 +18,13 @@ describe("createEmbeddingProvider", () => {
     delete process.env["COHERE_API_KEY"];
     delete process.env["OPENROUTER_API_KEY"];
     delete process.env["EMBEDDING_PROVIDER"];
+    delete process.env["OPENAI_EMBEDDING_API_KEY"];
+    delete process.env["OPENAI_EMBEDDING_DIMENSIONS"];
   });
 
   afterEach(() => {
     process.env = originalEnv;
+    vi.restoreAllMocks();
   });
 
   it("returns null when no API keys are set", () => {
@@ -49,6 +52,43 @@ describe("createEmbeddingProvider", () => {
     process.env["EMBEDDING_PROVIDER"] = "openai";
     const provider = createEmbeddingProvider();
     expect(provider).toBeInstanceOf(OpenAIEmbeddingProvider);
+  });
+
+  // The tests below pin OPENAI_EMBEDDING_DIMENSIONS to this vector's length so
+  // withDimensionGuard cannot mask the header assertion.
+  const mockEmbedFetch = () =>
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+        status: 200,
+      }),
+    );
+
+  const authHeaderOf = (spy: ReturnType<typeof mockEmbedFetch>): string => {
+    const init = spy.mock.calls[0][1] as RequestInit;
+    return (init.headers as Record<string, string>)["Authorization"];
+  };
+
+  it("sends OPENAI_EMBEDDING_API_KEY when it differs from OPENAI_API_KEY", async () => {
+    process.env["OPENAI_API_KEY"] = "chat-key";
+    process.env["OPENAI_EMBEDDING_API_KEY"] = "embedding-key";
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "3";
+
+    const provider = createEmbeddingProvider();
+    const fetchSpy = mockEmbedFetch();
+    await provider!.embed("hello");
+
+    expect(authHeaderOf(fetchSpy)).toBe("Bearer embedding-key");
+  });
+
+  it("falls back to OPENAI_API_KEY when no embedding-specific key is set", async () => {
+    process.env["OPENAI_API_KEY"] = "chat-key";
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "3";
+
+    const provider = createEmbeddingProvider();
+    const fetchSpy = mockEmbedFetch();
+    await provider!.embed("hello");
+
+    expect(authHeaderOf(fetchSpy)).toBe("Bearer chat-key");
   });
 });
 
