@@ -11,6 +11,12 @@ const VECTOR_LEGACY_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
 const VECTOR_BUCKET_SCOPE = "mem:index:bm25:vectors:v2";
 
+// Mirrors the production key builder. Chunk keys carry the bucket's content
+// hash so a bucket is never overwritten in place.
+function chunkKey(bucketKey: string, hash: string, chunk = 0): string {
+  return `${bucketKey}:${hash.slice(0, 12)}:${String(chunk).padStart(5, "0")}`;
+}
+
 type TestVectorBucketManifest = {
   v: 2;
   layout: number;
@@ -279,7 +285,10 @@ describe("IndexPersistence", () => {
     await expect(kv.get(BM25_SCOPE, VECTOR_LEGACY_KEY)).resolves.toBeNull();
     // Vector payloads live outside the BM25 scope.
     await expect(
-      kv.get(VECTOR_BUCKET_SCOPE, `${bucketKeys[0]}:00000`),
+      kv.get(
+        VECTOR_BUCKET_SCOPE,
+        chunkKey(bucketKeys[0], manifest!.shards[bucketKeys[0]].hash),
+      ),
     ).resolves.toEqual(expect.any(String));
 
     const loaded = await persistence.load();
@@ -872,12 +881,24 @@ describe("IndexPersistence vector bucketing", () => {
       shardChars: 400,
     }).save();
 
-    // Fresh instance: hashes come from the manifest, not process memory. This
-    // is what stops a restart-heavy service rewriting the whole index.
+    // Go through the real restart path. Seeding a fresh identical index would
+    // skip load() entirely, leaving the thing that actually keeps hashes stable
+    // across a restart — deserialize -> mergeSerialized row order -> identical
+    // serialised bytes — completely unpinned.
+    const reloaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(reloaded.vector!.size).toBe(40);
+
     kv.resetCount();
-    const restarted = new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
-      shardChars: 400,
-    });
+    const restarted = new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      reloaded.vector,
+      { shardChars: 400 },
+    );
     await restarted.save();
 
     expect(kv.bucketWrites).toBe(0);
@@ -1043,6 +1064,7 @@ describe("IndexPersistence vector bucketing", () => {
       VECTOR_MANIFEST_KEY,
     );
     const [tornKey] = Object.keys(manifest!.shards);
+    const tornHash = manifest!.shards[tornKey].hash;
 
     // Critically, this stand-in is VALID JSON in the right row shape. An
     // invalid body would be dropped by mergeSerialized regardless, so the test
@@ -1059,7 +1081,7 @@ describe("IndexPersistence vector bucketing", () => {
         },
       ],
     ]);
-    await kv.set(VECTOR_BUCKET_SCOPE, `${tornKey}:00000`, ghost);
+    await kv.set(VECTOR_BUCKET_SCOPE, chunkKey(tornKey, tornHash), ghost);
 
     const loaded = await new IndexPersistence(
       kv as never,
@@ -1120,7 +1142,10 @@ describe("IndexPersistence vector layout changes", () => {
     // Every key the old layout owned and the new one cannot name must be gone.
     for (const bucketKey of beyondNarrow) {
       await expect(
-        kv.get(VECTOR_BUCKET_SCOPE, `${bucketKey}:00000`),
+        kv.get(
+          VECTOR_BUCKET_SCOPE,
+          chunkKey(bucketKey, wide!.shards[bucketKey].hash),
+        ),
       ).resolves.toBeNull();
     }
     const narrow = await kv.get<TestVectorBucketManifest>(
@@ -1164,9 +1189,15 @@ describe("IndexPersistence vector layout changes", () => {
 
     // The bucket now needs fewer keys, so its old tail must be reclaimed
     // rather than left addressable-by-nobody.
+    // Chunk 0 keeps its key: same bucket, same content hash, same index. Only
+    // the tail is no longer addressed, and reclaiming it must not take chunk 0
+    // with it.
+    await expect(
+      kv.get(VECTOR_BUCKET_SCOPE, chunkKey(shrinkingKey, wideEntry.hash, 0)),
+    ).resolves.toEqual(expect.any(String));
     for (let i = 1; i < wideEntry.chunks; i++) {
       await expect(
-        kv.get(VECTOR_BUCKET_SCOPE, `${shrinkingKey}:${String(i).padStart(5, "0")}`),
+        kv.get(VECTOR_BUCKET_SCOPE, chunkKey(shrinkingKey, wideEntry.hash, i)),
       ).resolves.toBeNull();
     }
 
@@ -1179,5 +1210,116 @@ describe("IndexPersistence vector layout changes", () => {
     expect(
       loaded.vector!.search(new Float32Array([7, 8, 9]))[0]?.obsId,
     ).toBe("obs_7");
+  });
+});
+
+describe("IndexPersistence torn vector save", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function seeded(count: number): VectorIndex {
+    const vector = new VectorIndex();
+    for (let i = 0; i < count; i++) {
+      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+    }
+    return vector;
+  }
+
+  it("loses nothing when a save dies partway through writing buckets", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const before = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(before.vector!.size).toBe(40);
+
+    // A second save with changed content that dies after some bucket writes and
+    // before the manifest publish. With in-place keys this would corrupt the
+    // buckets the live manifest still names, load would drop them, and — since
+    // rebuild is gated on BM25 being empty, never on the vector index — the
+    // next save would serialise the absence and lose them for good.
+    const changed = seeded(40);
+    for (let i = 0; i < 40; i++) {
+      changed.add(`obs_${i}`, "ses_1", new Float32Array([i + 99, i, i]));
+    }
+    let writes = 0;
+    const dying = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === VECTOR_BUCKET_SCOPE && ++writes > 3) {
+          throw new Error("engine died mid-save");
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+    await new IndexPersistence(dying as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // The old generation is still fully intact and loadable.
+    const after = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(after.vector!.size).toBe(40);
+    expect(
+      after.vector!.search(new Float32Array([7, 8, 9]), 50)[0]?.obsId,
+    ).toBe("obs_7");
+  });
+
+  it("resumes a reclaim that was published but never finished", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    // Save again with different content, failing every delete so the reclaim
+    // list is published but never drained.
+    const changed = seeded(40);
+    changed.add("obs_extra", "ses_1", new Float32Array([5, 5, 5]));
+    const undeletable = {
+      ...kv,
+      delete: async (): Promise<void> => {
+        throw new Error("delete unavailable");
+      },
+    };
+    await new IndexPersistence(undeletable as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const stalled = await kv.get<TestVectorBucketManifest & {
+      reclaim?: Array<{ scope: string; key: string }>;
+    }>(BM25_SCOPE, VECTOR_MANIFEST_KEY);
+    expect(stalled!.reclaim!.length).toBeGreaterThan(0);
+    const stranded = stalled!.reclaim!.map((t) => t.key);
+
+    // A later healthy save must finish the job rather than orphan those keys.
+    await new IndexPersistence(kv as never, new SearchIndex(), changed, {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    for (const key of stranded) {
+      await expect(kv.get(VECTOR_BUCKET_SCOPE, key)).resolves.toBeNull();
+    }
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(41);
   });
 });

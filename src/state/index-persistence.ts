@@ -67,6 +67,11 @@ type VectorBucketManifest = {
   buckets: number;
   chunkChars: number;
   shards: Record<string, VectorBucketEntry>;
+  // Keys superseded by this manifest but not yet deleted. Published *with* the
+  // manifest so the work survives a crash: deletes run after the publish, and
+  // dying partway would otherwise strand the remainder with nothing able to
+  // name them. The next save drains whatever is left.
+  reclaim?: Array<{ scope: string; key: string }>;
 };
 
 // `layout` and `chunkChars` are not required here on purpose. A manifest
@@ -102,8 +107,47 @@ function vectorBucketKey(bucket: number): string {
   return `b${String(bucket).padStart(4, "0")}`;
 }
 
-function vectorChunkKey(bucketKey: string, chunk: number): string {
-  return `${bucketKey}:${String(chunk).padStart(5, "0")}`;
+/**
+ * Chunk keys carry the bucket's content hash, so a bucket's bytes are never
+ * overwritten in place.
+ *
+ * This is what makes a torn write survivable. Writing in place looks safe
+ * because the manifest is published last, but it is not: the half-written
+ * bucket no longer matches the hash the *old* manifest recorded, load drops it,
+ * and nothing restores it — rebuild is gated on the BM25 index being empty
+ * (src/index.ts, src/functions/search.ts), never on the vector index. The next
+ * save then serialises the index without those vectors and persists the loss.
+ *
+ * Addressing by content instead means the old bucket stays readable until the
+ * new manifest names the new one, so a save that dies partway loses nothing.
+ */
+function vectorChunkKey(
+  bucketKey: string,
+  hash: string,
+  chunk: number,
+): string {
+  return `${bucketKey}:${hash.slice(0, 12)}:${String(chunk).padStart(5, "0")}`;
+}
+
+function isReclaimTarget(
+  value: unknown,
+): value is { scope: string; key: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { scope?: unknown; key?: unknown };
+  return (
+    typeof candidate.scope === "string" &&
+    candidate.scope.length > 0 &&
+    typeof candidate.key === "string" &&
+    candidate.key.length > 0
+  );
+}
+
+function bucketChunkKeys(bucketKey: string, entry: VectorBucketEntry): string[] {
+  const keys: string[] = [];
+  for (let i = 0; i < entry.chunks; i++) {
+    keys.push(vectorChunkKey(bucketKey, entry.hash, i));
+  }
+  return keys;
 }
 
 // sha1 over the bucket body. This one IS a content check — a collision means a
@@ -191,11 +235,25 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    // Vectors first. This is the save that has been failing in production — it
+    // is the larger of the two and it runs second, so a BM25 save that consumes
+    // the engine's budget starves it. Going first also makes a vector delete
+    // durable before anything else can get in the way, which is what
+    // flushIndexSave is awaited for on the delete paths.
+    //
+    // Each index gets its own try. One try around both would let a failure in
+    // whichever runs first stop the other from persisting at all — harmless
+    // when BM25 led and vectors trailed, but reversing the order without this
+    // would make a vector failure silently block BM25 too.
+    if (this.vector) {
+      try {
+        await this.saveVectorBuckets(this.vector);
+      } catch (err) {
+        this.logFailure(err);
+      }
+    }
     try {
       await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorBuckets(this.vector);
-      }
     } catch (err) {
       this.logFailure(err);
     }
@@ -277,9 +335,16 @@ export class IndexPersistence {
    * correct rather than stale.
    */
   private async saveVectorBuckets(vector: VectorIndex): Promise<void> {
-    const previous = await this.kv
-      .get<unknown>(KV.bm25Index, VECTOR_MANIFEST_KEY)
-      .catch(() => null);
+    // Deliberately unguarded. Swallowing a read failure here would report "no
+    // previous manifest", which is indistinguishable from a genuinely absent
+    // one — and that mistake strands the entire previous generation, because
+    // the manifest is the only thing that can name it. One transient engine
+    // timeout would be enough. Let it throw; runSave logs and the debounce
+    // retries in seconds.
+    const previous = await this.kv.get<unknown>(
+      KV.bm25Index,
+      VECTOR_MANIFEST_KEY,
+    );
     const buckets = vectorBucketCount(this.options);
     const chunkChars = shardChars(this.options);
 
@@ -305,7 +370,13 @@ export class IndexPersistence {
     // Deleting first is how a failed publish destroys data the still-current
     // manifest points at — the old manifest survives the failure, so anything
     // it names has to survive with it.
-    const pendingDeletes: string[] = [];
+    const pendingDeletes: Array<{ scope: string; key: string }> = [];
+
+    // Deletes a previous save published but died before finishing. Carrying
+    // them forward is the whole reason the list is in the manifest.
+    for (const target of previousV2?.reclaim ?? []) {
+      if (isReclaimTarget(target)) pendingDeletes.push(target);
+    }
     let written = 0;
 
     for (const [bucket, body] of vector.serializeBuckets(buckets)) {
@@ -321,14 +392,17 @@ export class IndexPersistence {
       for (let i = 0; i < chunks; i++) {
         await this.kv.set(
           VECTOR_BUCKET_SCOPE,
-          vectorChunkKey(bucketKey, i),
+          vectorChunkKey(bucketKey, hash, i),
           body.slice(i * chunkChars, (i + 1) * chunkChars),
         );
       }
       written++;
-      // This bucket shrank: its old tail chunks are no longer addressed.
-      for (let i = chunks; i < (priorEntry?.chunks ?? 0); i++) {
-        pendingDeletes.push(vectorChunkKey(bucketKey, i));
+      // The bucket's old content lives under different keys entirely, so it is
+      // still intact right now and is reclaimed only after the publish.
+      if (priorEntry) {
+        for (const key of bucketChunkKeys(bucketKey, priorEntry)) {
+          pendingDeletes.push({ scope: VECTOR_BUCKET_SCOPE, key });
+        }
       }
     }
 
@@ -338,10 +412,40 @@ export class IndexPersistence {
     for (const [bucketKey, priorEntry] of Object.entries(prior)) {
       if (bucketKey in nextShards) continue;
       if (!isValidBucketEntry(priorEntry)) continue;
-      for (let i = 0; i < priorEntry.chunks; i++) {
-        pendingDeletes.push(vectorChunkKey(bucketKey, i));
+      for (const key of bucketChunkKeys(bucketKey, priorEntry)) {
+        pendingDeletes.push({ scope: VECTOR_BUCKET_SCOPE, key });
       }
     }
+
+    // One-time migration off the offset-chunked format. A v1 manifest names its
+    // own shards, so this needs no enumeration — which matters, because
+    // StateKV.list returns values, not keys, and cannot be used here.
+    const legacy = previous as IndexShardManifest | null;
+    if (legacy?.v === 1 && Array.isArray(legacy.shards)) {
+      for (const shard of legacy.shards) {
+        if (isValidShardDescriptor(shard)) {
+          pendingDeletes.push({ scope: shard.scope, key: shard.key });
+        }
+      }
+    }
+
+    // Never delete a key the new manifest still names. Old and new keys can
+    // collide legitimately: identical content re-chunked keeps the same bucket
+    // and hash, so chunk 0's key is unchanged even though the old entry listed
+    // more chunks. Reclaiming that entry blind would delete a bucket the
+    // manifest is actively pointing at.
+    const liveKeys = new Set<string>();
+    for (const [bucketKey, entry] of Object.entries(nextShards)) {
+      for (const key of bucketChunkKeys(bucketKey, entry)) liveKeys.add(key);
+    }
+    const reclaimTargets = pendingDeletes.filter(
+      (target) =>
+        !(target.scope === VECTOR_BUCKET_SCOPE && liveKeys.has(target.key)),
+    );
+
+    // Genuinely nothing to do. Republishing an identical manifest every
+    // debounce costs a write and two audit rows for no change.
+    if (written === 0 && reclaimTargets.length === 0 && previousV2) return;
 
     const nextManifest: VectorBucketManifest = {
       v: 2,
@@ -349,6 +453,7 @@ export class IndexPersistence {
       buckets,
       chunkChars,
       shards: nextShards,
+      ...(reclaimTargets.length > 0 ? { reclaim: reclaimTargets } : {}),
     };
     await this.kv.set<VectorBucketManifest>(
       KV.bm25Index,
@@ -357,8 +462,24 @@ export class IndexPersistence {
     );
 
     // Safe from here: the new manifest is live and names none of these.
-    for (const key of pendingDeletes) {
-      await this.deleteKey(VECTOR_BUCKET_SCOPE, key, "vector_bucket_reclaim");
+    const undeleted: Array<{ scope: string; key: string }> = [];
+    for (const target of reclaimTargets) {
+      const gone = await this.deleteKey(
+        target.scope,
+        target.key,
+        "vector_bucket_reclaim",
+      );
+      if (!gone) undeleted.push(target);
+    }
+    if (reclaimTargets.length > 0) {
+      // Record the drain, keeping anything that did not actually go. Clearing
+      // the list on a failed delete would strand those keys permanently, and
+      // not clearing it at all would let the list grow without bound.
+      const { reclaim: _drained, ...rest } = nextManifest;
+      await this.kv.set<VectorBucketManifest>(KV.bm25Index, VECTOR_MANIFEST_KEY, {
+        ...rest,
+        ...(undeleted.length > 0 ? { reclaim: undeleted } : {}),
+      });
     }
 
     await this.auditIndexPersistence(
@@ -369,17 +490,10 @@ export class IndexPersistence {
         buckets,
         written,
         unchanged: Object.keys(nextShards).length - written,
-        reclaimed: pendingDeletes.length,
+        reclaimed: reclaimTargets.length,
       },
     );
 
-    // One-time migration off the offset-chunked format. A v1 manifest names
-    // its own shards, so this needs no enumeration — which matters, because
-    // StateKV.list returns values, not keys, and cannot be used here.
-    const legacy = previous as IndexShardManifest | null;
-    if (legacy?.v === 1 && Array.isArray(legacy.shards)) {
-      await this.deleteShards(legacy.shards, "vector_v1_migration");
-    }
     await this.deleteKey(KV.bm25Index, VECTOR_KEY, "legacy_cleanup");
   }
 
@@ -497,11 +611,13 @@ export class IndexPersistence {
     );
   }
 
+  /** Returns whether the key is actually gone. Callers that track reclaim work
+   * must keep a failed delete queued rather than reporting it done. */
   private async deleteKey(
     scope: string,
     key: string,
     reason: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let result = "deleted";
     let error: string | undefined;
     try {
@@ -517,6 +633,7 @@ export class IndexPersistence {
       result,
       error,
     });
+    return result === "deleted";
   }
 
   private async deleteShards(
@@ -592,7 +709,10 @@ export class IndexPersistence {
       let complete = true;
       for (let i = 0; i < entry.chunks; i++) {
         const chunk = await this.kv
-          .get<string>(VECTOR_BUCKET_SCOPE, vectorChunkKey(bucketKey, i))
+          .get<string>(
+            VECTOR_BUCKET_SCOPE,
+            vectorChunkKey(bucketKey, entry.hash, i),
+          )
           .catch(() => null);
         if (typeof chunk !== "string") {
           complete = false;
