@@ -32,15 +32,10 @@ function fnv1a32(str: string): number {
   return hash >>> 0;
 }
 
-/**
- * Which bucket an observation's vector belongs to.
- *
- * Deterministic and stable, which is the whole point: bucket keys are reused
- * in place on every save, so there is no generation to strand and orphaned
- * shards are structurally impossible (unlike the offset-chunked format, where
- * one insert shifts every downstream chunk boundary and rewrites everything).
- */
-export function vectorBucketOf(obsId: string, bucketCount: number): number {
+// Deterministic and stable across processes: bucket keys are reused in place,
+// so nothing can be stranded. Changing this is an addressing change — bump
+// VECTOR_LAYOUT in index-persistence.ts if you do.
+function vectorBucketOf(obsId: string, bucketCount: number): number {
   return fnv1a32(obsId) % bucketCount;
 }
 
@@ -228,31 +223,7 @@ export class VectorIndex {
 
   static deserialize(json: string): VectorIndex {
     const idx = new VectorIndex();
-    let data: unknown;
-    try {
-      data = JSON.parse(json);
-    } catch {
-      return idx;
-    }
-    if (!Array.isArray(data)) return idx;
-    for (const row of data) {
-      try {
-        if (!Array.isArray(row) || row.length < 2) continue;
-        const [obsId, entry] = row;
-        if (
-          typeof obsId !== "string" ||
-          typeof entry?.embedding !== "string" ||
-          typeof entry?.sessionId !== "string"
-        )
-          continue;
-        idx.vectors.set(obsId, {
-          embedding: base64ToFloat32(entry.embedding),
-          sessionId: entry.sessionId,
-        });
-      } catch {
-        continue;
-      }
-    }
+    idx.mergeSerialized(json);
     return idx;
   }
 }

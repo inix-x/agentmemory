@@ -32,28 +32,47 @@ type IndexShardManifest = {
 /**
  * Bucketed vector manifest.
  *
- * `shards` maps bucket key -> that bucket's content hash, chunk count, and
- * length, and holds only non-empty buckets.
+ * `shards` maps bucket key -> content hash and chunk count, non-empty buckets
+ * only.
  *
- * Keeping the hashes *in the manifest* rather than in process memory is what
- * makes this work in production: the service restarts often, and an in-memory
- * cache would force a full rewrite of every bucket after each restart, which
- * is the cost this change exists to remove.
- *
- * A bucket is still chunked to `shardChars`, because bucket size is unbounded
- * — it grows with the corpus — and the engine rejects an oversized
- * `state::set` payload. Chunking is what bounds the payload; bucketing is what
- * bounds how much gets rewritten. They solve different problems and both are
- * needed.
+ * Hashes live in the manifest, not process memory: restarts must not force a
+ * full rewrite. Buckets bound how much is rewritten; chunks bound the payload
+ * size, since a bucket grows with the corpus and the engine rejects an
+ * oversized `state::set`.
  */
-type VectorBucketEntry = { hash: string; chunks: number; chars: number };
+// No `chars`: the sha1 already proves both content and length. v1 needed a
+// length check only because it had no hash to check against.
+type VectorBucketEntry = { hash: string; chunks: number };
+
+/**
+ * Version of the *addressing scheme* — which bucket an obsId lands in and which
+ * keys that bucket occupies. Bump it whenever that mapping changes, including a
+ * change to the bucket hash function or the key format.
+ *
+ * This exists because a content hash cannot see an addressing change: the bytes
+ * are identical, they just belong somewhere else now. Without this, such a
+ * change silently skips every write while the manifest claims new locations,
+ * and the vectors are lost on the next load.
+ *
+ * It is deliberately separate from `v`. `v` describes the manifest's shape, and
+ * keeping it stable is what lets a newer build still parse an older manifest
+ * well enough to reclaim the keys it named. Bumping `v` instead would make the
+ * old manifest unreadable and strand every key in it.
+ */
+const VECTOR_LAYOUT = 1;
 
 type VectorBucketManifest = {
   v: 2;
+  layout: number;
   buckets: number;
+  chunkChars: number;
   shards: Record<string, VectorBucketEntry>;
 };
 
+// `layout` and `chunkChars` are not required here on purpose. A manifest
+// missing them simply fails the layout comparison, which triggers a full
+// rewrite and a full reclaim — the correct, self-healing response — whereas
+// rejecting the manifest outright would strand the keys it names.
 function isVectorBucketManifest(value: unknown): value is VectorBucketManifest {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<VectorBucketManifest>;
@@ -69,13 +88,13 @@ function isVectorBucketManifest(value: unknown): value is VectorBucketManifest {
 function isValidBucketEntry(value: unknown): value is VectorBucketEntry {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<VectorBucketEntry>;
+  // The chunks bound matters beyond shape: it is the loop bound for both the
+  // reclaim walks below, so a poisoned value would spin a garbage-length loop.
   return (
     typeof candidate.hash === "string" &&
     candidate.hash.length > 0 &&
     Number.isInteger(candidate.chunks) &&
-    (candidate.chunks as number) >= 1 &&
-    Number.isInteger(candidate.chars) &&
-    (candidate.chars as number) >= 0
+    (candidate.chunks as number) >= 1
   );
 }
 
@@ -247,11 +266,8 @@ export class IndexPersistence {
    * Persist the vector index as fixed, independently-addressed buckets,
    * writing only the buckets whose contents actually changed.
    *
-   * The offset-chunked format this replaces was O(entire corpus) per change:
-   * shard boundaries are character offsets into one serialised blob, so a
-   * single inserted vector shifts every downstream byte and rewrites every
-   * shard. In production that was 431 MB per save against a corpus of 35 MB of
-   * observations, and no save had completed in over four hours.
+   * Replaces an offset-chunked format that was O(entire corpus) per change;
+   * see the commit message for the production measurements.
    *
    * Cross-bucket atomicity is deliberately given up here. It buys nothing
    * today, because the atomic save never completes. Recovery is convergent
@@ -267,11 +283,22 @@ export class IndexPersistence {
     const buckets = vectorBucketCount(this.options);
     const chunkChars = shardChars(this.options);
 
-    // Only trust previous hashes when the bucket count matches. A different
-    // count remaps every obsId, so every stored bucket is meaningless.
     const previousV2 = isVectorBucketManifest(previous) ? previous : null;
-    const previousShards =
-      previousV2 && previousV2.buckets === buckets ? previousV2.shards : {};
+
+    // Every input that decides *where* a vector's bytes live. If any of them
+    // moved, a matching content hash proves nothing — the bytes are the same
+    // but their home is not — so nothing on disk may be skipped.
+    const layoutMatches =
+      !!previousV2 &&
+      previousV2.layout === VECTOR_LAYOUT &&
+      previousV2.buckets === buckets &&
+      previousV2.chunkChars === chunkChars;
+
+    // One map, used for two things: comparison (only when the layout matches)
+    // and reclaim (always). Reclaim must see the previous manifest even on a
+    // layout change, because those keys are exactly the ones about to become
+    // unreachable, and nothing can enumerate them afterwards.
+    const prior = previousV2?.shards ?? {};
 
     const nextShards: Record<string, VectorBucketEntry> = {};
     // Nothing is deleted until the manifest naming its replacement is live.
@@ -285,11 +312,11 @@ export class IndexPersistence {
       const bucketKey = vectorBucketKey(bucket);
       const hash = contentHash(body);
       const chunks = Math.max(1, Math.ceil(body.length / chunkChars));
-      const prior = isValidBucketEntry(previousShards[bucketKey])
-        ? previousShards[bucketKey]
+      const priorEntry = isValidBucketEntry(prior[bucketKey])
+        ? prior[bucketKey]
         : undefined;
-      nextShards[bucketKey] = { hash, chunks, chars: body.length };
-      if (prior?.hash === hash) continue;
+      nextShards[bucketKey] = { hash, chunks };
+      if (layoutMatches && priorEntry?.hash === hash) continue;
 
       for (let i = 0; i < chunks; i++) {
         await this.kv.set(
@@ -300,21 +327,29 @@ export class IndexPersistence {
       }
       written++;
       // This bucket shrank: its old tail chunks are no longer addressed.
-      for (let i = chunks; i < (prior?.chunks ?? 0); i++) {
+      for (let i = chunks; i < (priorEntry?.chunks ?? 0); i++) {
         pendingDeletes.push(vectorChunkKey(bucketKey, i));
       }
     }
 
-    // Buckets that emptied entirely since the last save.
-    for (const [bucketKey, prior] of Object.entries(previousShards)) {
+    // Buckets the new manifest does not name: emptied since the last save, or
+    // left behind by a layout change that remapped them elsewhere. Either way
+    // this is the last moment anything can still name them.
+    for (const [bucketKey, priorEntry] of Object.entries(prior)) {
       if (bucketKey in nextShards) continue;
-      if (!isValidBucketEntry(prior)) continue;
-      for (let i = 0; i < prior.chunks; i++) {
+      if (!isValidBucketEntry(priorEntry)) continue;
+      for (let i = 0; i < priorEntry.chunks; i++) {
         pendingDeletes.push(vectorChunkKey(bucketKey, i));
       }
     }
 
-    const nextManifest: VectorBucketManifest = { v: 2, buckets, shards: nextShards };
+    const nextManifest: VectorBucketManifest = {
+      v: 2,
+      layout: VECTOR_LAYOUT,
+      buckets,
+      chunkChars,
+      shards: nextShards,
+    };
     await this.kv.set<VectorBucketManifest>(
       KV.bm25Index,
       VECTOR_MANIFEST_KEY,
@@ -545,8 +580,6 @@ export class IndexPersistence {
     if (!isVectorBucketManifest(manifest)) return null;
 
     const entries = Object.entries(manifest.shards);
-    if (entries.length === 0) return new VectorIndex();
-
     const index = new VectorIndex();
     let missing = 0;
     let corrupt = 0;
@@ -611,6 +644,12 @@ export class IndexPersistence {
     // `manifest.v` with TypeError. Treat both null and undefined as
     // "no manifest" and fall through to the legacy path. The shape
     // check stays so a malformed-but-present row still fails closed.
+    // A bucketed manifest is handled by loadVectorBuckets, not here. Without
+    // this, a transient manifest-read failure that sends the vector load down
+    // the v1 path would report a perfectly valid manifest as invalid — the
+    // wrong signal to hand an operator during exactly the incident this format
+    // exists to fix.
+    if (isVectorBucketManifest(manifest.value)) return null;
     if (
       manifest.value != null &&
       typeof manifest.value === "object"

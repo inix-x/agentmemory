@@ -13,8 +13,10 @@ const VECTOR_BUCKET_SCOPE = "mem:index:bm25:vectors:v2";
 
 type TestVectorBucketManifest = {
   v: 2;
+  layout: number;
   buckets: number;
-  shards: Record<string, { hash: string; chunks: number; chars: number }>;
+  chunkChars: number;
+  shards: Record<string, { hash: string; chunks: number }>;
 };
 
 type TestIndexShardManifest = {
@@ -814,24 +816,16 @@ describe("IndexPersistence", () => {
 function countingKV() {
   const inner = mockKV();
   let bucketWrites = 0;
-  const writtenKeys: string[] = [];
   return {
     ...inner,
     resetCount: () => {
       bucketWrites = 0;
-      writtenKeys.length = 0;
     },
     get bucketWrites() {
       return bucketWrites;
     },
-    get writtenKeys() {
-      return writtenKeys;
-    },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
-      if (scope === VECTOR_BUCKET_SCOPE) {
-        bucketWrites++;
-        writtenKeys.push(key);
-      }
+      if (scope === VECTOR_BUCKET_SCOPE) bucketWrites++;
       return inner.set(scope, key, data);
     },
   };
@@ -870,19 +864,8 @@ describe("IndexPersistence vector bucketing", () => {
     expect(kv.bucketWrites).toBeLessThanOrEqual(2);
   });
 
-  it("rewrites nothing when the index has not changed", async () => {
-    const vector = seeded(40);
-    const persistence = new IndexPersistence(kv as never, new SearchIndex(), vector, {
-      shardChars: 400,
-    });
-    await persistence.save();
-
-    kv.resetCount();
-    await persistence.save();
-
-    expect(kv.bucketWrites).toBe(0);
-  });
-
+  // Covers the same-instance case too: saveVectorBuckets holds no state between
+  // saves, so a fresh instance and a reused one run the identical path.
   it("rewrites nothing after a restart when nothing changed", async () => {
     const vector = seeded(40);
     await new IndexPersistence(kv as never, new SearchIndex(), vector, {
@@ -1091,5 +1074,110 @@ describe("IndexPersistence vector bucketing", () => {
     // Every other bucket still loads.
     expect(loaded.vector!.size).toBeGreaterThan(0);
     expect(loaded.vector!.size).toBeLessThan(30);
+  });
+});
+
+// A content hash cannot see an addressing change: same bytes, different home.
+// These two cover that whole family — the bucket count and the chunk size are
+// the two inputs that decide where a vector's bytes live.
+describe("IndexPersistence vector layout changes", () => {
+  let kv: ReturnType<typeof countingKV>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    kv = countingKV();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function seeded(count: number): VectorIndex {
+    const vector = new VectorIndex();
+    for (let i = 0; i < count; i++) {
+      vector.add(`obs_${i}`, "ses_1", new Float32Array([i, i + 1, i + 2]));
+    }
+    return vector;
+  }
+
+  it("reclaims buckets stranded by a smaller bucket count", async () => {
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 8,
+    }).save();
+
+    const wide = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const widened = Object.keys(wide!.shards);
+    // Needs keys that only the 8-bucket layout can produce.
+    const beyondNarrow = widened.filter((key) => Number(key.slice(1)) >= 4);
+    expect(beyondNarrow.length).toBeGreaterThan(0);
+
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(40), {
+      shardChars: 400,
+      vectorBuckets: 4,
+    }).save();
+
+    // Every key the old layout owned and the new one cannot name must be gone.
+    for (const bucketKey of beyondNarrow) {
+      await expect(
+        kv.get(VECTOR_BUCKET_SCOPE, `${bucketKey}:00000`),
+      ).resolves.toBeNull();
+    }
+    const narrow = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    expect(narrow!.buckets).toBe(4);
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(40);
+  });
+
+  it("survives a chunk-size change that leaves content identical", async () => {
+    // Small chunks first, so buckets span several keys.
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(30), {
+      shardChars: 60,
+      vectorBuckets: 4,
+    }).save();
+
+    const wide = await kv.get<TestVectorBucketManifest>(
+      BM25_SCOPE,
+      VECTOR_MANIFEST_KEY,
+    );
+    const multiChunk = Object.entries(wide!.shards).find(
+      ([, entry]) => entry.chunks > 1,
+    );
+    expect(multiChunk).toBeDefined();
+    const [shrinkingKey, wideEntry] = multiChunk!;
+
+    // Same vectors, larger chunks. The bucket bodies are byte-identical, so the
+    // content hash matches and a hash-only skip would write nothing at all —
+    // while the manifest records the new, smaller chunk count. Load would then
+    // read too few keys and drop every bucket.
+    await new IndexPersistence(kv as never, new SearchIndex(), seeded(30), {
+      shardChars: 100_000,
+      vectorBuckets: 4,
+    }).save();
+
+    // The bucket now needs fewer keys, so its old tail must be reclaimed
+    // rather than left addressable-by-nobody.
+    for (let i = 1; i < wideEntry.chunks; i++) {
+      await expect(
+        kv.get(VECTOR_BUCKET_SCOPE, `${shrinkingKey}:${String(i).padStart(5, "0")}`),
+      ).resolves.toBeNull();
+    }
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.vector!.size).toBe(30);
+    expect(
+      loaded.vector!.search(new Float32Array([7, 8, 9]))[0]?.obsId,
+    ).toBe("obs_7");
   });
 });
