@@ -1,6 +1,6 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
 import type { CompressedObservation, HookPayload, Session } from "../types.js";
-import { KV, STREAM } from "../state/schema.js";
+import { KV, STREAM, fingerprintId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
@@ -14,18 +14,14 @@ import { logger } from "../logger.js";
 // the per-turn session-stop fan-out.
 const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
 
-// Order-independent fingerprint of an observation set, used to tell whether
-// the already-extracted half of a session still looks the way it did at the
-// last graph extract. Counting is not enough: evict's per-project cap
+// Order-independent fingerprint of an observation set: tells whether the
+// already-extracted half of a session still looks the way it did at the last
+// graph extract. Over ids, not counts or timestamps — evict's per-project cap
 // (evict.ts, age- and status-independent) can delete an observation from the
-// live session in the same window a late compression lands another, and the
-// two cancel out. Seeded with the set size so a pure size change always shows,
-// and kept under 2^32 so every intermediate stays an exact integer no matter
-// how large the session gets. An unparseable timestamp yields NaN, which never
-// compares equal, so the session falls back to a full extract.
-const OBS_DIGEST_MOD = 0x1_0000_0000;
-const observationDigest = (obs: CompressedObservation[]): number =>
-  obs.reduce((sum, o) => (sum + Date.parse(o.timestamp)) % OBS_DIGEST_MOD, obs.length);
+// live session in the same window a late compression lands another, and if the
+// two share a millisecond only the ids tell the sets apart.
+const observationFingerprint = (obs: CompressedObservation[]): string =>
+  fingerprintId("gx", obs.map((o) => o.id).sort().join(","));
 
 async function consolidationDueUnserialized(kv: StateKV): Promise<boolean> {
   const cooldownMs = getConsolidationCooldownMs();
@@ -152,9 +148,9 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         const at = session?.graphExtractedAt;
         const mark = session?.graphExtractedDigest;
         let batch = compressed;
-        if (typeof at === "string" && typeof mark === "number") {
+        if (typeof at === "string" && typeof mark === "string") {
           const seen = compressed.filter((o) => o.timestamp <= at);
-          if (observationDigest(seen) === mark) {
+          if (observationFingerprint(seen) === mark) {
             batch = compressed.filter((o) => o.timestamp > at);
           }
         }
@@ -183,7 +179,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
               {
                 type: "set",
                 path: "graphExtractedDigest",
-                value: observationDigest(compressed),
+                value: observationFingerprint(compressed),
               },
             ]);
           }
