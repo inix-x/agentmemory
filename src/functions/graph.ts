@@ -180,15 +180,43 @@ function paginateFromSnapshot(
 // future extracts rebuild incrementally.
 const SAFE_ENUMERATION_NODE_CEILING = 25000;
 
+const GRAPH_LIST_FRAME_CAP_BYTES = 104_857_600;
+const SAFE_ENUMERATION_FRAME_FRACTION = 0.5;
+const SAFE_ENUMERATION_BYTE_BUDGET =
+  GRAPH_LIST_FRAME_CAP_BYTES * SAFE_ENUMERATION_FRAME_FRACTION;
+const CALIBRATED_BYTES_PER_NODE = 4481;
+const CALIBRATED_BYTES_PER_EDGE = 3036;
+
 type GraphEnumerationCheck = {
   enumerable: boolean;
   totalNodes: number | null;
+  totalEdges: number | null;
   orphaned: boolean;
   ceiling: number;
+  nodeBytes: number | null;
+  edgeBytes: number | null;
+  byteBudget: number;
+  blockedScope: string | null;
 };
 
 function hasOrphanRows(snap: GraphSnapshot): boolean {
   return typeof snap.resetAt === "string" && Date.parse(snap.resetAt) > 0;
+}
+
+function estimateScopeBytes(
+  total: number | null,
+  sample: unknown[],
+  calibratedFloor: number,
+): number | null {
+  if (total === null || !Number.isFinite(total) || total < 0) return null;
+  const perRow =
+    sample.length > 0
+      ? Math.max(
+          Buffer.byteLength(JSON.stringify(sample)) / sample.length,
+          calibratedFloor,
+        )
+      : calibratedFloor;
+  return total * perRow;
 }
 
 // The snapshot's count only covers rows it knows about, so it bounds the
@@ -202,17 +230,48 @@ async function checkGraphEnumerable(
 ): Promise<GraphEnumerationCheck> {
   const snap = await readSnapshot(kv);
   const totalNodes = snap ? snap.stats.totalNodes : null;
+  const totalEdges = snap ? snap.stats.totalEdges ?? null : null;
   const orphaned = snap ? hasOrphanRows(snap) : false;
+  const nodeBytes = estimateScopeBytes(
+    totalNodes,
+    snap?.topNodes ?? [],
+    CALIBRATED_BYTES_PER_NODE,
+  );
+  const edgeBytes = estimateScopeBytes(
+    totalEdges,
+    snap?.topEdges ?? [],
+    CALIBRATED_BYTES_PER_EDGE,
+  );
+  const nodesFit =
+    nodeBytes !== null && nodeBytes <= SAFE_ENUMERATION_BYTE_BUDGET;
+  const edgesFit =
+    edgeBytes !== null && edgeBytes <= SAFE_ENUMERATION_BYTE_BUDGET;
+  let blockedScope: string | null = null;
+  if (snap && totalNodes !== null && totalNodes > 0 && !orphaned) {
+    if (!nodesFit) blockedScope = KV.graphNodes;
+    else if (!edgesFit) blockedScope = KV.graphEdges;
+  }
   return {
     enumerable:
       !orphaned &&
       totalNodes !== null &&
       totalNodes > 0 &&
-      totalNodes <= SAFE_ENUMERATION_NODE_CEILING,
+      totalNodes <= SAFE_ENUMERATION_NODE_CEILING &&
+      nodesFit &&
+      edgesFit,
     totalNodes,
+    totalEdges,
     orphaned,
     ceiling: SAFE_ENUMERATION_NODE_CEILING,
+    nodeBytes,
+    edgeBytes,
+    byteBudget: SAFE_ENUMERATION_BYTE_BUDGET,
+    blockedScope,
   };
+}
+
+function mib(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1);
 }
 
 function describeCorpusSize(check: GraphEnumerationCheck): string {
@@ -224,7 +283,20 @@ function describeCorpusSize(check: GraphEnumerationCheck): string {
     );
   }
   if (check.totalNodes === 0) return "the snapshot counts zero nodes";
-  return `the snapshot counts ${check.totalNodes} nodes`;
+  if (check.blockedScope !== null) {
+    const isNodes = check.blockedScope === KV.graphNodes;
+    const bytes = isNodes ? check.nodeBytes : check.edgeBytes;
+    const rows = isNodes ? check.totalNodes : check.totalEdges;
+    if (bytes === null) {
+      return `the snapshot does not count the rows in ${check.blockedScope}`;
+    }
+    return (
+      `${check.blockedScope} holds ${rows} rows, an estimated ` +
+      `${mib(bytes)} MiB against a ${mib(check.byteBudget)} MiB ` +
+      "per-scope enumeration budget"
+    );
+  }
+  return `the snapshot does not count the rows in ${KV.graphNodes}`;
 }
 
 const ENUMERATION_WARN_INTERVAL_MS = 60_000;
@@ -263,7 +335,12 @@ export async function listGraphScopes(
         caller,
         scopes: `${KV.graphNodes}, ${KV.graphEdges}`,
         totalNodes: check.totalNodes,
+        totalEdges: check.totalEdges,
         ceiling: check.ceiling,
+        blockedScope: check.blockedScope,
+        estimatedNodeBytes: check.nodeBytes,
+        estimatedEdgeBytes: check.edgeBytes,
+        byteBudget: check.byteBudget,
         reason: describeCorpusSize(check),
         remedy:
           'POST /agentmemory/graph/snapshot-rebuild {"force": true} on a ' +
@@ -967,11 +1044,15 @@ export function registerGraphFunction(
       if (!enumeration.enumerable) {
         logger.warn("Graph query enumeration refused, using snapshot", {
           totalNodes: enumeration.totalNodes,
+          totalEdges: enumeration.totalEdges,
           ceiling: enumeration.ceiling,
+          blockedScope: enumeration.blockedScope,
+          estimatedNodeBytes: enumeration.nodeBytes,
+          estimatedEdgeBytes: enumeration.edgeBytes,
+          byteBudget: enumeration.byteBudget,
         });
         return degradeToSnapshot(
-          `Live graph enumeration refused: ${describeCorpusSize(enumeration)} ` +
-            `against a ${enumeration.ceiling}-node safe-enumeration ceiling. ` +
+          `Live graph enumeration refused: ${describeCorpusSize(enumeration)}. ` +
             "Query / startNodeId paths degrade to the top-degree snapshot " +
             "until a per-node edge index lands. Result does not reflect the " +
             "requested walk.",
@@ -1134,20 +1215,25 @@ export function registerGraphFunction(
         if (!enumeration.enumerable && !forceRebuild) {
           logger.warn("Graph snapshot rebuild refused", {
             totalNodes: enumeration.totalNodes,
+            totalEdges: enumeration.totalEdges,
             ceiling: enumeration.ceiling,
+            blockedScope: enumeration.blockedScope,
+            estimatedNodeBytes: enumeration.nodeBytes,
+            estimatedEdgeBytes: enumeration.edgeBytes,
+            byteBudget: enumeration.byteBudget,
           });
           return {
             success: false,
             legacyCorpus:
               enumeration.totalNodes === null || enumeration.totalNodes === 0,
             tooLarge:
-              enumeration.totalNodes !== null &&
-              enumeration.totalNodes > enumeration.ceiling,
+              enumeration.blockedScope !== null ||
+              (enumeration.totalNodes !== null &&
+                enumeration.totalNodes > enumeration.ceiling),
             totalNodes: enumeration.totalNodes ?? undefined,
             ceiling: enumeration.ceiling,
             error:
-              `Rebuild refused: ${describeCorpusSize(enumeration)} against a ` +
-              `${enumeration.ceiling}-node safe-enumeration ceiling. Rebuild ` +
+              `Rebuild refused: ${describeCorpusSize(enumeration)}. Rebuild ` +
               "would call kv.list on KV.graphNodes/Edges, whose response " +
               "frame is rejected at its length header once the scope is " +
               "large enough — the worker dies before any budget can fire. " +
