@@ -39,12 +39,22 @@ function fmt(level: string, msg: string, fields: Fields): string {
   }
 }
 
+// Railway maps a line on stdout to severity "info" and a line on stderr
+// to severity "error", so sending every level to stderr reported healthy
+// operation as an error and left the dashboard permanently red. Route by
+// level instead. The `iii` binary captures both streams (it writes
+// .iii/logs/stdout.log alongside stderr.log), so nothing is lost when the
+// worker runs under iii-exec.
+function streamFor(level: string): NodeJS.WriteStream {
+  return level === "info" ? process.stdout : process.stderr;
+}
+
 function emit(level: string, msg: string, fields: Fields): void {
   try {
-    process.stderr.write(fmt(level, msg, fields) + "\n");
+    streamFor(level).write(fmt(level, msg, fields) + "\n");
   } catch {
-    // stderr is unavailable in some weird test/worker contexts — swallow
-    // so no log line can ever crash a handler.
+    // The stream is unavailable in some weird test/worker contexts —
+    // swallow so no log line can ever crash a handler.
   }
 }
 
@@ -88,9 +98,9 @@ export function isBootVerbose(): boolean {
 export function bootLog(msg: string): void {
   if (bootVerbose) {
     try {
-      process.stderr.write(`[agentmemory] ${msg}\n`);
+      process.stdout.write(`[agentmemory] ${msg}\n`);
     } catch {
-      // stderr unavailable — drop.
+      // stdout unavailable — drop.
     }
     return;
   }
