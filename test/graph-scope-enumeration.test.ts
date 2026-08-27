@@ -635,4 +635,240 @@ describe("graph scope enumeration guard", () => {
       );
     });
   });
+
+  describe("per-scope byte budget", () => {
+    const FRAME_CAP = 104_857_600;
+    const BYTE_BUDGET = FRAME_CAP / 2;
+    const BYTES_PER_NODE = 4481;
+    const BYTES_PER_EDGE = 3036;
+    let clock = Date.parse("2026-09-01T00:00:00Z");
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      clock += 10 * 60_000;
+      vi.setSystemTime(clock);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function sizedSnapshot(opts: {
+      totalNodes: number;
+      totalEdges: number;
+      topNodes?: GraphNode[];
+      topEdges?: GraphEdge[];
+      resetAt?: string;
+    }): GraphSnapshot {
+      return {
+        version: 1,
+        topNodes: opts.topNodes ?? [],
+        topEdges: opts.topEdges ?? [],
+        topDegrees: {},
+        stats: {
+          totalNodes: opts.totalNodes,
+          totalEdges: opts.totalEdges,
+          nodesByType: { concept: opts.totalNodes },
+          edgesByType: { related_to: opts.totalEdges },
+        },
+        updatedAt: "2026-08-27T00:00:00Z",
+        dirty: false,
+        ...(opts.resetAt ? { resetAt: opts.resetAt } : {}),
+      } as GraphSnapshot;
+    }
+
+    function fatNode(i: number): GraphNode {
+      return {
+        ...node(`fat-${i}`),
+        properties: { blob: "x".repeat(20_000) },
+      } as GraphNode;
+    }
+
+    function refusalFields(): Record<string, unknown> {
+      const calls = warnCallsFor("Graph scope enumeration refused");
+      return calls[0]![1] as Record<string, unknown>;
+    }
+
+    it("refuses a node scope over the byte budget whose node count clears the count ceiling", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 20_000, totalEdges: 1 }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({
+        blockedScope: NODES,
+        estimatedNodeBytes: 20_000 * BYTES_PER_NODE,
+        byteBudget: BYTE_BUDGET,
+      });
+      expect(20_000 * BYTES_PER_NODE).toBeGreaterThan(BYTE_BUDGET);
+    });
+
+    it("refuses an edge scope over the byte budget while the node scope fits", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 1_000, totalEdges: 34_420 }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(1_000 * BYTES_PER_NODE).toBeLessThan(BYTE_BUDGET);
+      expect(34_420 * BYTES_PER_EDGE).toBeGreaterThan(BYTE_BUDGET);
+      expect(refusalFields()).toMatchObject({
+        blockedScope: EDGES,
+        totalEdges: 34_420,
+        estimatedEdgeBytes: 34_420 * BYTES_PER_EDGE,
+      });
+    });
+
+    it("refuses an edge scope that clears the raw frame cap but not the halved budget", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 1_000, totalEdges: 20_000 }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(20_000 * BYTES_PER_EDGE).toBeLessThan(FRAME_CAP);
+      expect(20_000 * BYTES_PER_EDGE).toBeGreaterThan(BYTE_BUDGET);
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({ blockedScope: EDGES });
+    });
+
+    it("refuses a corpus whose sampled rows are fat enough to blow the budget under the calibrated floor", async () => {
+      const topNodes = [0, 1, 2, 3, 4].map(fatNode);
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 5_000, totalEdges: 1, topNodes }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(5_000 * BYTES_PER_NODE).toBeLessThan(BYTE_BUDGET);
+      expect(graphScopesListed(kv)).toEqual([]);
+      const fields = refusalFields();
+      expect(fields.blockedScope).toBe(NODES);
+      expect(fields.estimatedNodeBytes as number).toBeGreaterThan(BYTE_BUDGET);
+    });
+
+    it("still enumerates a corpus whose node and edge scopes both fit the budget", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 1_000, totalEdges: 12_000 }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      const results = await new GraphRetrieval(kv as never).searchByEntities([
+        "alpha",
+      ]);
+
+      expect(12_000 * BYTES_PER_EDGE).toBeLessThan(BYTE_BUDGET);
+      expect(graphScopesListed(kv).sort()).toEqual([EDGES, NODES]);
+      expect(results.map((r) => r.obsId).sort()).toEqual([
+        "obs_alpha",
+        "obs_beta",
+      ]);
+      expect(warnCallsFor("Graph scope enumeration refused")).toHaveLength(0);
+    });
+
+    it("reports null byte estimates rather than a fitting scope when no snapshot exists", async () => {
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({
+        totalNodes: null,
+        totalEdges: null,
+        estimatedNodeBytes: null,
+        estimatedEdgeBytes: null,
+        byteBudget: BYTE_BUDGET,
+      });
+    });
+
+    it("refuses a snapshot that counts nodes but does not count edges", async () => {
+      const unsizable = sizedSnapshot({ totalNodes: 1_000, totalEdges: 0 });
+      delete (unsizable.stats as { totalEdges?: number }).totalEdges;
+      await kv.set(SNAPSHOT, "current", unsizable);
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({
+        blockedScope: EDGES,
+        estimatedEdgeBytes: null,
+      });
+    });
+
+    it("blames the reset rather than a scope when the corpus carries orphan rows", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({
+          totalNodes: 3,
+          totalEdges: 2,
+          resetAt: "2026-08-26T00:00:00Z",
+        }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta", "gamma"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({ blockedScope: null });
+    });
+
+    it("refuses production's measured 29,074 nodes / 34,420 edges on both scopes", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 29_074, totalEdges: 34_420 }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      const fields = refusalFields();
+      expect(fields.estimatedNodeBytes as number).toBeGreaterThan(BYTE_BUDGET);
+      expect(fields.estimatedEdgeBytes as number).toBeGreaterThan(BYTE_BUDGET);
+      expect(fields.blockedScope).toBe(NODES);
+    });
+
+    it("marks a rebuild refused on edge bytes alone as tooLarge", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({ totalNodes: 1_000, totalEdges: 34_420 }),
+      );
+      await seedGraph(kv, ["alpha", "beta"]);
+      registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+
+      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", {})) as {
+        success: boolean;
+        tooLarge?: boolean;
+        legacyCorpus?: boolean;
+        error?: string;
+      };
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(result.success).toBe(false);
+      expect(result.tooLarge).toBe(true);
+      expect(result.legacyCorpus).toBe(false);
+      expect(result.error).toContain(EDGES);
+    });
+  });
 });
