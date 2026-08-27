@@ -1,5 +1,8 @@
 import { registerWorker, TriggerAction } from "iii-sdk";
-import { boundEnginePrimitives } from "./sdk-timeouts.js";
+import {
+  armEnginePrimitiveBound,
+  boundEnginePrimitives,
+} from "./sdk-timeouts.js";
 import {
   hydrateProcessEnvFromFile,
   loadConfig,
@@ -470,6 +473,8 @@ async function main() {
       );
     }
   }
+
+  armEnginePrimitiveBound();
 
   const needsRebuild = bm25Index.size === 0;
 

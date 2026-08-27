@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { StateKV } from "../src/state/kv.js";
-import { boundEnginePrimitives } from "../src/sdk-timeouts.js";
+import {
+  armEnginePrimitiveBound,
+  boundEnginePrimitives,
+  resetEnginePrimitiveBoundForTests,
+} from "../src/sdk-timeouts.js";
 
 const WORKER_INVOCATION_TIMEOUT_MS = 180000;
 
@@ -78,6 +82,8 @@ async function settled(promise: Promise<unknown>) {
 
 describe("engine primitive trigger budget", () => {
   beforeEach(() => {
+    resetEnginePrimitiveBoundForTests();
+    armEnginePrimitiveBound();
     vi.useFakeTimers();
   });
 
@@ -113,6 +119,27 @@ describe("engine primitive trigger budget", () => {
     await vi.advanceTimersByTimeAsync(30000);
 
     expect(await settled(write)).toBe("pending");
+  });
+
+  it("leaves boot-path reads on the worker budget until the bound is armed", async () => {
+    resetEnginePrimitiveBoundForTests();
+
+    const sdk = fakeSdk();
+    const kv = new StateKV(boundEnginePrimitives(sdk) as never);
+
+    const read = kv.get("mem:index:bm25", "data:manifest");
+    read.catch(() => {});
+
+    // A cold engine has not accepted the worker yet. Observed in production:
+    // 67 seconds from container start to "Worker registered", during which
+    // every boot read must survive rather than fail fast.
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(await settled(read)).toBe("pending");
+
+    // The engine finally accepts the worker and the queued read completes,
+    // which is the behaviour the 30 s bound was destroying at boot.
+    sdk.settle("state::get", { value: { manifest: "ok" } });
+    expect(await settled(read)).toBe("fulfilled");
   });
 
   it("keeps a slow but healthy llm trigger on the worker budget", async () => {

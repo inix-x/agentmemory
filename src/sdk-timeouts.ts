@@ -11,11 +11,22 @@ const ENGINE_PRIMITIVES = new Set([
   "stream::send",
 ]);
 
+let armed = false;
+
+export function armEnginePrimitiveBound(): void {
+  armed = true;
+}
+
+export function resetEnginePrimitiveBoundForTests(): void {
+  armed = false;
+}
+
 export function boundEnginePrimitives(sdk: ISdk): ISdk {
   const bounded = Object.create(sdk) as ISdk;
   bounded.trigger = <TInput, TOutput>(request: TriggerRequest<TInput>) =>
     sdk.trigger<TInput, TOutput>(
-      request.timeoutMs === undefined &&
+      armed &&
+        request.timeoutMs === undefined &&
         ENGINE_PRIMITIVES.has(request.function_id)
         ? { ...request, timeoutMs: ENGINE_PRIMITIVE_TIMEOUT_MS }
         : request,
