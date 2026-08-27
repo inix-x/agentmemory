@@ -90,7 +90,14 @@ agentmemory worker reg :  2.0 s
 healthcheck passes     : ~9-10 s
 ```
 
-Railway's `healthcheckTimeout` is 60 s (the BM25 startup backfill needs it).
-Every other template's health-check `grace_period` (or compose
-`start_period`) is set to 30 s for a 3x safety margin. Tune lower
-once you've measured your own platform's image-pull characteristics.
+**Those numbers are for a fresh store.** Startup cost scales with what is
+under `/data`: the worker reads the store before `/agentmemory/livez` has a
+route to answer on, so the healthcheck window has to cover that read. On a
+store of 2,363 MB across 2,421 files, the worker took 63 to 67 s to register.
+
+Railway's `healthcheckTimeout` is set to 300 s in
+`deploy/railway/railway.json`, which is Railway's own default, so a cold
+start on a grown store has room. Every other template's health-check
+`grace_period` (or compose `start_period`) is set to 30 s, a 3x margin on
+the fresh-store figure. Tune against your own store rather than against the
+table above.
