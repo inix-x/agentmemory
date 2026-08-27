@@ -296,7 +296,7 @@ function describeCorpusSize(check: GraphEnumerationCheck): string {
       "per-scope enumeration budget"
     );
   }
-  return `the snapshot counts ${check.totalNodes} nodes`;
+  return `the snapshot does not count the rows in ${KV.graphNodes}`;
 }
 
 const ENUMERATION_WARN_INTERVAL_MS = 60_000;

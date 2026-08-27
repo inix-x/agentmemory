@@ -798,6 +798,21 @@ describe("graph scope enumeration guard", () => {
       });
     });
 
+    it("refuses a snapshot that does not count nodes without claiming a count", async () => {
+      const unsizable = sizedSnapshot({ totalNodes: 0, totalEdges: 0 });
+      delete (unsizable.stats as { totalNodes?: number }).totalNodes;
+      await kv.set(SNAPSHOT, "current", unsizable);
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(graphScopesListed(kv)).toEqual([]);
+      expect(refusalFields()).toMatchObject({
+        estimatedNodeBytes: null,
+        reason: `the snapshot does not count the rows in ${NODES}`,
+      });
+    });
+
     it("refuses a snapshot that counts nodes but does not count edges", async () => {
       const unsizable = sizedSnapshot({ totalNodes: 1_000, totalEdges: 0 });
       delete (unsizable.stats as { totalEdges?: number }).totalEdges;
