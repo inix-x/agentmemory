@@ -7,7 +7,7 @@
   "deploy": {
     "numReplicas": 1,
     "healthcheckPath": "/agentmemory/livez",
-    "healthcheckTimeout": 60,
+    "healthcheckTimeout": 300,
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 10,
     "requiredMountPath": "/data"
