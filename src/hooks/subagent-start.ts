@@ -13,11 +13,6 @@ function isSdkChildContext(payload: unknown): boolean {
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 
-// Passive telemetry only — nothing reads the response, so the previous
-// `await` was pure latency. The exit timer below is the cap that keeps a
-// slow or unreachable server from stacking onto every concurrent subagent
-// startup (#221); postWithRetry sizes both attempts to fit inside it.
-
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
   if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
@@ -61,6 +56,10 @@ async function main() {
       },
     }),
   );
+  // Passive telemetry: nothing reads the response, so this cap is what keeps
+  // a slow or unreachable server from stacking onto every concurrent subagent
+  // startup (#221). postWithRetry's attempts and delay must stay under it; the
+  // test in test/hook-post-retry.test.ts pins that.
   setTimeout(() => process.exit(0), 1000).unref();
 }
 

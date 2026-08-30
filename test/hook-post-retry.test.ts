@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { postWithRetry } from "../src/hooks/_post.js";
+import {
+  postWithRetry,
+  DEFAULT_ATTEMPT_MS,
+  RETRY_DELAY_MS,
+} from "../src/hooks/_post.js";
 import { OBSERVE_ATTEMPT_MS } from "../src/hooks/session-end.js";
 
 const ENDPOINT = "http://localhost:3111/agentmemory/observe";
@@ -75,7 +79,6 @@ describe("postWithRetry", () => {
     expect(signals[0]).not.toBe(signals[1]);
   });
 
-
   // A timeout or abort leaves the outcome unknown: the server may have written
   // the observation and simply not answered in time. observe.ts records its
   // dedup hash only AFTER the write completes, so a retry here would create a
@@ -96,7 +99,7 @@ describe("postWithRetry", () => {
   // session-end value is imported, not copied, so lowering it back to a value
   // that loses observations under a slow server fails here.
   it.each([
-    ["the default", undefined, 400],
+    ["the default", undefined, DEFAULT_ATTEMPT_MS],
     ["session-end's", OBSERVE_ATTEMPT_MS, 3000],
   ])("uses %s per-attempt timeout on both attempts", async (_l, arg, want) => {
     const timeouts: number[] = [];
@@ -111,5 +114,12 @@ describe("postWithRetry", () => {
 
     expect(timeouts).toEqual([want, want]);
     vi.restoreAllMocks();
+  });
+
+  // The hooks arm a 1000ms exit timer. If the two attempts plus the delay
+  // exceed it the process dies mid-retry, which is how two earlier revisions
+  // of this file silently stopped retrying at all.
+  it("fits both attempts inside the hooks' exit timer", () => {
+    expect(DEFAULT_ATTEMPT_MS * 2 + RETRY_DELAY_MS).toBeLessThanOrEqual(1000);
   });
 });
