@@ -1,38 +1,29 @@
 import type { FunctionMetrics } from "../types.js";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 
 export class MetricsStore {
   private cache = new Map<string, FunctionMetrics>();
   private qualityCallCounts = new Map<string, number>();
-  // One serialization chain per functionId. record() reads the counters,
-  // mutates them, then writes back, and the read awaits kv.get() whenever
-  // the cache is cold. Concurrent callers used to interleave in that gap,
-  // all start from the same totals, and overwrite each other — so N calls
-  // landed as one and avgLatencyMs was computed against a count that never
-  // saw them. Under 20+ agents that made mem::compress report a mean far
-  // above any latency it had actually observed.
-  private chains = new Map<string, Promise<unknown>>();
 
   constructor(private kv: StateKV) {}
 
-  async record(
+  // record() reads a function's counters, mutates them, then writes back, and
+  // the read awaits kv.get() whenever the cache is cold. Concurrent callers
+  // interleaved in that gap, all started from the same totals, and overwrote
+  // each other — so N calls landed as one and avgLatencyMs was divided by a
+  // count that never saw them. Serializing per functionId keeps the existing
+  // incremental mean correct without changing the persisted shape.
+  record(
     functionId: string,
     latencyMs: number,
     success: boolean,
     qualityScore?: number,
   ): Promise<void> {
-    const prior = this.chains.get(functionId) ?? Promise.resolve();
-    const next = prior.then(() =>
+    return withKeyedLock(`mem:metrics:${functionId}`, () =>
       this.apply(functionId, latencyMs, success, qualityScore),
     );
-    // Park a swallowed copy so one rejection cannot break the chain for
-    // every later caller; `next` still surfaces the error to this caller.
-    this.chains.set(
-      functionId,
-      next.catch(() => {}),
-    );
-    return next;
   }
 
   private async apply(
