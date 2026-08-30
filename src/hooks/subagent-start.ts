@@ -14,9 +14,9 @@ const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 
 // Passive telemetry only — nothing reads the response, so the previous
-// `await` was pure latency. Tightened from 2000ms to a defensive cap so a
-// slow/unreachable server can't stack onto every concurrent subagent
-// startup (#221).
+// `await` was pure latency. The exit timer below is the cap that keeps a
+// slow or unreachable server from stacking onto every concurrent subagent
+// startup (#221); postWithRetry sizes both attempts to fit inside it.
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };

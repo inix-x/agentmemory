@@ -12,7 +12,7 @@ export async function postWithRetry(
   body: string,
   budgetMs = 1000,
 ): Promise<void> {
-  const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
+  const retryDelayMs = Math.floor(budgetMs / 8);
   const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
 
   for (let attempt = 0; attempt < 2; attempt++) {
