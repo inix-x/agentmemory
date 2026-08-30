@@ -34,7 +34,15 @@ export class MetricsStore {
   ): Promise<void> {
     let m = this.cache.get(functionId);
     if (!m) {
-      m = (await this.kv.get<FunctionMetrics>(KV.metrics, functionId)) ?? {
+      // Guarded like the set below and the list in getAll(). Unguarded, a
+      // state::get timeout rejects record(), and compress.ts records again
+      // from its own catch block — that second call rejects too, so the
+      // handler escapes before it can log or return {success:false}.
+      // summarize.ts has the same shape but is invoked result-expecting, so
+      // the escape rejects event::session::stopped.
+      m = (await this.kv
+        .get<FunctionMetrics>(KV.metrics, functionId)
+        .catch(() => null)) ?? {
         functionId,
         totalCalls: 0,
         successCount: 0,
