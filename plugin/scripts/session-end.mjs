@@ -33,11 +33,10 @@ function hookCwd(data) {
 }
 //#endregion
 //#region src/hooks/_post.ts
-async function postWithRetry(url, headers, body, budgetMs = 1e3) {
-	const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
-	const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
+const RETRY_DELAY_MS = 100;
+async function postWithRetry(url, headers, body, attemptMs = 400) {
 	for (let attempt = 0; attempt < 2; attempt++) {
-		if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
+		if (attempt) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
 		try {
 			if ((await fetch(url, {
 				method: "POST",
@@ -53,6 +52,7 @@ async function postWithRetry(url, headers, body, budgetMs = 1e3) {
 }
 //#endregion
 //#region src/hooks/session-end.ts
+const OBSERVE_ATTEMPT_MS = 3e3;
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
 	if (!payload || typeof payload !== "object") return false;
@@ -118,7 +118,7 @@ async function main() {
 			cwd,
 			timestamp,
 			data: { prompt }
-		}), 6250)));
+		}), OBSERVE_ATTEMPT_MS)));
 	}
 	fetch(`${REST_URL}/agentmemory/session/end`, {
 		method: "POST",
@@ -135,6 +135,6 @@ async function main() {
 }
 main().catch(() => process.exit(0));
 //#endregion
-export {};
+export { OBSERVE_ATTEMPT_MS };
 
 //# sourceMappingURL=session-end.mjs.map

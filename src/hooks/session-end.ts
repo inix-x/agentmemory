@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { resolveProject, hookCwd } from "./_project.js";
 import { postWithRetry } from "./_post.js";
 
+// Exported so the regression test binds to the real value instead of a copy
+// that can silently drift back to a losing one.
+export const OBSERVE_ATTEMPT_MS = 3000;
+
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
@@ -87,12 +91,9 @@ async function main() {
             timestamp,
             data: { prompt },
           }),
-          // A budget, not a per-request timeout: postWithRetry splits it
-          // across two attempts and the delay between them. 6250 preserves
-          // the 3000ms per attempt this call had before the retry existed.
-          // These are awaited, and the exit timer below is armed after the
-          // await, so nothing else caps them.
-          6250,
+          // Awaited, and the exit timer below is armed after the await, so
+          // these keep the generous per-request timeout they had before.
+          OBSERVE_ATTEMPT_MS,
         ),
       ),
     );
