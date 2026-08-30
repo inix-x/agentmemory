@@ -12,7 +12,9 @@ export async function postWithRetry(
   body: string,
   budgetMs = 1000,
 ): Promise<void> {
-  const retryDelayMs = Math.floor(budgetMs / 8);
+  // Capped: on a large budget an eighth is a long idle pause, and it eats the
+  // per-attempt share that a slow server actually needs.
+  const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
   const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
 
   for (let attempt = 0; attempt < 2; attempt++) {
