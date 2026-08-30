@@ -32,6 +32,23 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/hooks/_post.ts
+async function postWithRetry(url, headers, body, opts = {}) {
+	const timeoutMs = opts.timeoutMs ?? 3e3;
+	const retryDelayMs = opts.retryDelayMs ?? 250;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			if ((await fetch(url, {
+				method: "POST",
+				headers,
+				body,
+				signal: AbortSignal.timeout(timeoutMs)
+			})).ok) return;
+		} catch {}
+		if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+	}
+}
+//#endregion
 //#region src/hooks/session-end.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -91,19 +108,14 @@ async function main() {
 		const cwd = hookCwd(data) || process.cwd();
 		const project = resolveProject(cwd);
 		const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-		await Promise.allSettled(transcriptPrompts.map((prompt) => fetch(`${REST_URL}/agentmemory/observe`, {
-			method: "POST",
-			headers: authHeaders(),
-			body: JSON.stringify({
-				hookType: "prompt_submit",
-				sessionId,
-				project,
-				cwd,
-				timestamp,
-				data: { prompt }
-			}),
-			signal: AbortSignal.timeout(3e3)
-		})));
+		await Promise.allSettled(transcriptPrompts.map((prompt) => postWithRetry(`${REST_URL}/agentmemory/observe`, authHeaders(), JSON.stringify({
+			hookType: "prompt_submit",
+			sessionId,
+			project,
+			cwd,
+			timestamp,
+			data: { prompt }
+		}))));
 	}
 	fetch(`${REST_URL}/agentmemory/session/end`, {
 		method: "POST",

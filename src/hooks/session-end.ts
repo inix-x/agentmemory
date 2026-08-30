@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import { resolveProject, hookCwd } from "./_project.js";
+import { postWithRetry } from "./_post.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -75,10 +76,10 @@ async function main() {
     const timestamp = new Date().toISOString();
     await Promise.allSettled(
       transcriptPrompts.map((prompt) =>
-        fetch(`${REST_URL}/agentmemory/observe`, {
-          method: "POST",
-          headers: authHeaders(),
-          body: JSON.stringify({
+        postWithRetry(
+          `${REST_URL}/agentmemory/observe`,
+          authHeaders(),
+          JSON.stringify({
             hookType: "prompt_submit",
             sessionId,
             project,
@@ -86,8 +87,7 @@ async function main() {
             timestamp,
             data: { prompt },
           }),
-          signal: AbortSignal.timeout(3000),
-        }),
+        ),
       ),
     );
   }
