@@ -81,7 +81,11 @@ describe("MetricsStore under concurrency", () => {
       successCount: 100,
       failureCount: 0,
       avgLatencyMs: 20,
-      avgQualityScore: 90,
+      // Zero, not a live-looking score: quality resume is a separate known
+      // defect (qualityCallCounts is in-memory, so the first scored call
+      // after a restart replaces the persisted average). Seeding a real
+      // value here would make this case read as covering that. It does not.
+      avgQualityScore: 0,
     });
 
     // A fresh store stands in for a process restart: the cache is empty and
