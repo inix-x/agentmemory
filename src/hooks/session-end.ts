@@ -87,6 +87,9 @@ async function main() {
             timestamp,
             data: { prompt },
           }),
+          // Awaited rather than raced against an exit timer, so this one can
+          // afford a longer per-request timeout than the other hooks.
+          3000,
         ),
       ),
     );

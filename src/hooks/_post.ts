@@ -2,14 +2,19 @@
 // swallowed the error and the process was gone before anything noticed.
 // Retries once on a bad status or a network error, and never rejects.
 //
-// A caller's exit timer has to outlast retryDelayMs plus both attempts, or it
-// kills the retry before it lands. The hooks use 1000ms against the 250ms here.
+// budgetMs is the caller's own exit deadline. Both attempts and the delay
+// between them are sized to fit inside it, because a per-attempt timeout
+// longer than the budget means a slow first attempt is killed by the exit
+// timer before the retry ever runs, which is the case the retry exists for.
 export async function postWithRetry(
   url: string,
   headers: Record<string, string>,
   body: string,
-  retryDelayMs = 250,
+  budgetMs = 1000,
 ): Promise<void> {
+  const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
+  const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
+
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
     try {
@@ -18,11 +23,17 @@ export async function postWithRetry(
         method: "POST",
         headers,
         body,
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(attemptMs),
       });
       if (res.ok) return;
-    } catch {
-      // Network error or timeout. Same handling as a bad status.
+    } catch (err) {
+      // A timeout or abort means the outcome is UNKNOWN: the server may have
+      // already written the observation and simply not answered in time. The
+      // dedup guard cannot help, because it records only after the write
+      // completes, so a retry here creates a second observation. Refusals,
+      // resets, and bad statuses are certain non-delivery, and retry safely.
+      const name = (err as { name?: string })?.name;
+      if (name === "TimeoutError" || name === "AbortError") return;
     }
   }
 }

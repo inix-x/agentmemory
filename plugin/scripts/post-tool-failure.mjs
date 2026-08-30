@@ -32,7 +32,9 @@ function hookCwd(data) {
 }
 //#endregion
 //#region src/hooks/_post.ts
-async function postWithRetry(url, headers, body, retryDelayMs = 250) {
+async function postWithRetry(url, headers, body, budgetMs = 1e3) {
+	const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
+	const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
 	for (let attempt = 0; attempt < 2; attempt++) {
 		if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
 		try {
@@ -40,9 +42,12 @@ async function postWithRetry(url, headers, body, retryDelayMs = 250) {
 				method: "POST",
 				headers,
 				body,
-				signal: AbortSignal.timeout(3e3)
+				signal: AbortSignal.timeout(attemptMs)
 			})).ok) return;
-		} catch {}
+		} catch (err) {
+			const name = err?.name;
+			if (name === "TimeoutError" || name === "AbortError") return;
+		}
 	}
 }
 //#endregion
