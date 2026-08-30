@@ -31,12 +31,9 @@ function hookCwd(data) {
 	const projectDir = process.env["DEVIN_PROJECT_DIR"] || process.env["CLAUDE_PROJECT_DIR"];
 	if (projectDir && projectDir.trim()) return projectDir;
 }
-//#endregion
-//#region src/hooks/_post.ts
-const RETRY_DELAY_MS = 100;
 async function postWithRetry(url, headers, body, attemptMs = 400) {
 	for (let attempt = 0; attempt < 2; attempt++) {
-		if (attempt) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+		if (attempt) await new Promise((r) => setTimeout(r, 100));
 		try {
 			if ((await fetch(url, {
 				method: "POST",
