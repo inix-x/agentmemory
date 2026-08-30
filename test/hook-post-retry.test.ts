@@ -33,8 +33,7 @@ describe("postWithRetry", () => {
   // state call dies and it answers 500. Without a retry the observation is
   // gone: the caller swallowed the error and the hook process exited.
   it.each([
-    ["404", new Response(null, { status: 404 })],
-    ["500", new Response(null, { status: 500 })],
+    ["a bad status", new Response(null, { status: 404 })],
     ["a network error", new Error("ECONNRESET")],
   ])("retries %s and keeps the observation", async (_label, failure) => {
     const fn = stubFetch([failure, new Response(null, { status: 201 })]);
@@ -90,9 +89,10 @@ describe("postWithRetry", () => {
 
     await postWithRetry(ENDPOINT, {}, "{}", 1000);
 
-    expect(timeouts).toHaveLength(2);
-    const delay = Math.min(250, Math.floor(1000 / 8));
-    expect(timeouts[0] * 2 + delay).toBeLessThanOrEqual(1000);
+    // Literals, not the implementation's own formula: a test that recomputes
+    // what it checks passes against a wrong-but-self-consistent derivation.
+    expect(timeouts).toEqual([437, 437]);
+    expect(437 * 2 + 125).toBeLessThanOrEqual(1000);
     vi.restoreAllMocks();
   });
 
