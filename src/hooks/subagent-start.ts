@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { postWithRetry } from "./_post.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
 // .mjs (matches the pattern used by every other hook entry in tsdown.config).
@@ -16,7 +17,6 @@ const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 // `await` was pure latency. Tightened from 2000ms to a defensive cap so a
 // slow/unreachable server can't stack onto every concurrent subagent
 // startup (#221).
-const TIMEOUT_MS = 800;
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -46,10 +46,10 @@ async function main() {
 
   const cwd = hookCwd(data) || process.cwd();
 
-  fetch(`${REST_URL}/agentmemory/observe`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
+  postWithRetry(
+    `${REST_URL}/agentmemory/observe`,
+    authHeaders(),
+    JSON.stringify({
       hookType: "subagent_start",
       sessionId,
       project: resolveProject(cwd),
@@ -60,9 +60,8 @@ async function main() {
         agent_type: agentType,
       },
     }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
+  );
+  setTimeout(() => process.exit(0), 1000).unref();
 }
 
 main().catch(() => process.exit(0));

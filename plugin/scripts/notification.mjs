@@ -32,19 +32,17 @@ function hookCwd(data) {
 }
 //#endregion
 //#region src/hooks/_post.ts
-async function postWithRetry(url, headers, body, opts = {}) {
-	const timeoutMs = opts.timeoutMs ?? 3e3;
-	const retryDelayMs = opts.retryDelayMs ?? 250;
+async function postWithRetry(url, headers, body, retryDelayMs = 250) {
 	for (let attempt = 0; attempt < 2; attempt++) {
+		if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
 		try {
 			if ((await fetch(url, {
 				method: "POST",
 				headers,
 				body,
-				signal: AbortSignal.timeout(timeoutMs)
+				signal: AbortSignal.timeout(3e3)
 			})).ok) return;
 		} catch {}
-		if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 	}
 }
 //#endregion
@@ -92,7 +90,7 @@ async function main() {
 			title: data.title,
 			message: data.message
 		}
-	}), { timeoutMs: 2e3 });
+	}));
 	setTimeout(() => process.exit(0), 1e3).unref();
 }
 main().catch(() => process.exit(0));

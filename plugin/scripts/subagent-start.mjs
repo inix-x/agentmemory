@@ -31,6 +31,21 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/hooks/_post.ts
+async function postWithRetry(url, headers, body, retryDelayMs = 250) {
+	for (let attempt = 0; attempt < 2; attempt++) {
+		if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
+		try {
+			if ((await fetch(url, {
+				method: "POST",
+				headers,
+				body,
+				signal: AbortSignal.timeout(3e3)
+			})).ok) return;
+		} catch {}
+	}
+}
+//#endregion
 //#region src/hooks/subagent-start.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -39,7 +54,6 @@ function isSdkChildContext(payload) {
 }
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-const TIMEOUT_MS = 800;
 function authHeaders() {
 	const h = { "Content-Type": "application/json" };
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
@@ -60,23 +74,18 @@ async function main() {
 	const agentId = data.agent_id || data.agentName;
 	const agentType = data.agent_type || data.agentDisplayName || data.agentName;
 	const cwd = hookCwd(data) || process.cwd();
-	fetch(`${REST_URL}/agentmemory/observe`, {
-		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({
-			hookType: "subagent_start",
-			sessionId,
-			project: resolveProject(cwd),
-			cwd,
-			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-			data: {
-				agent_id: agentId,
-				agent_type: agentType
-			}
-		}),
-		signal: AbortSignal.timeout(TIMEOUT_MS)
-	}).catch(() => {});
-	setTimeout(() => process.exit(0), 500).unref();
+	postWithRetry(`${REST_URL}/agentmemory/observe`, authHeaders(), JSON.stringify({
+		hookType: "subagent_start",
+		sessionId,
+		project: resolveProject(cwd),
+		cwd,
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		data: {
+			agent_id: agentId,
+			agent_type: agentType
+		}
+	}));
+	setTimeout(() => process.exit(0), 1e3).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

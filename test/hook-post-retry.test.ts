@@ -1,86 +1,59 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { postWithRetry } from "../src/hooks/_post.js";
 
-const URL = "http://localhost:3111/agentmemory/observe";
+const ENDPOINT = "http://localhost:3111/agentmemory/observe";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 function stubFetch(responses: Array<Response | Error>) {
-  const calls: string[] = [];
   let i = 0;
-  const fn = vi.fn(async (url: string) => {
-    calls.push(url);
+  const fn = vi.fn(async () => {
     const next = responses[Math.min(i, responses.length - 1)];
     i += 1;
     if (next instanceof Error) throw next;
     return next;
   });
   vi.stubGlobal("fetch", fn);
-  return { fn, calls };
+  return fn;
 }
 
 describe("postWithRetry", () => {
   it("sends once when the server accepts it", async () => {
-    const { fn } = stubFetch([new Response(null, { status: 201 })]);
+    const fn = stubFetch([new Response(null, { status: 201 })]);
 
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
+    await postWithRetry(ENDPOINT, {}, "{}", 1);
 
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
   // The engine drops the worker socket periodically. During that window the
-  // route is briefly unregistered and POST /agentmemory/observe answers 404.
-  // Without a retry the observation is gone: the caller swallowed the error
-  // and the hook process exited.
-  it("retries a 404 and keeps the observation", async () => {
-    const { fn } = stubFetch([
-      new Response(null, { status: 404 }),
-      new Response(null, { status: 201 }),
-    ]);
+  // route is briefly unregistered and the POST answers 404, or an in-flight
+  // state call dies and it answers 500. Without a retry the observation is
+  // gone: the caller swallowed the error and the hook process exited.
+  it.each([
+    ["404", new Response(null, { status: 404 })],
+    ["500", new Response(null, { status: 500 })],
+    ["a network error", new Error("ECONNRESET")],
+  ])("retries %s and keeps the observation", async (_label, failure) => {
+    const fn = stubFetch([failure, new Response(null, { status: 201 })]);
 
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
-
-    expect(fn).toHaveBeenCalledTimes(2);
-  });
-
-  it("retries a 500", async () => {
-    const { fn } = stubFetch([
-      new Response(null, { status: 500 }),
-      new Response(null, { status: 201 }),
-    ]);
-
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
+    await postWithRetry(ENDPOINT, {}, "{}", 1);
 
     expect(fn).toHaveBeenCalledTimes(2);
   });
 
-  it("retries a network error", async () => {
-    const { fn } = stubFetch([
-      new Error("ECONNRESET"),
-      new Response(null, { status: 201 }),
-    ]);
+  // Both inputs are load-bearing. A throw-only case leaves an unbounded loop
+  // on a persistently bad status undetected, and vice versa.
+  it.each([
+    ["a bad status", new Response(null, { status: 500 })],
+    ["a network error", new Error("ECONNREFUSED")],
+  ])("stops after one retry and never rejects on %s", async (_l, failure) => {
+    const fn = stubFetch([failure]);
 
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
-
+    await expect(postWithRetry(ENDPOINT, {}, "{}", 1)).resolves.toBeUndefined();
     expect(fn).toHaveBeenCalledTimes(2);
-  });
-
-  it("gives up after one retry rather than looping", async () => {
-    const { fn } = stubFetch([new Response(null, { status: 500 })]);
-
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
-
-    expect(fn).toHaveBeenCalledTimes(2);
-  });
-
-  it("never rejects, so a caller cannot crash the hook", async () => {
-    stubFetch([new Error("ECONNREFUSED")]);
-
-    await expect(
-      postWithRetry(URL, {}, "{}", { retryDelayMs: 1 }),
-    ).resolves.toBeUndefined();
   });
 
   it("gives each attempt its own timeout signal", async () => {
@@ -93,7 +66,7 @@ describe("postWithRetry", () => {
       }),
     );
 
-    await postWithRetry(URL, {}, "{}", { retryDelayMs: 1 });
+    await postWithRetry(ENDPOINT, {}, "{}", 1);
 
     expect(signals).toHaveLength(2);
     expect(signals[0]).toBeDefined();

@@ -57,7 +57,6 @@ async function main() {
         message: data.message,
       },
     }),
-    { timeoutMs: 2000 },
   );
   setTimeout(() => process.exit(0), 1000).unref();
 }
