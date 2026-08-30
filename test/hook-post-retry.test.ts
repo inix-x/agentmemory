@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { postWithRetry } from "../src/hooks/_post.js";
+import { OBSERVE_ATTEMPT_MS } from "../src/hooks/session-end.js";
 
 const ENDPOINT = "http://localhost:3111/agentmemory/observe";
 
@@ -74,27 +75,6 @@ describe("postWithRetry", () => {
     expect(signals[0]).not.toBe(signals[1]);
   });
 
-  // Both attempts and the delay between them have to fit inside the caller's
-  // exit budget. A per-attempt timeout longer than the budget means a slow
-  // first attempt is killed by the exit timer before the retry can run, which
-  // is exactly the case the retry exists for.
-  it("fits both attempts inside the caller's budget", async () => {
-    const timeouts: number[] = [];
-    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
-    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
-      timeouts.push(ms);
-      return realTimeout(ms);
-    });
-    stubFetch([new Response(null, { status: 500 })]);
-
-    await postWithRetry(ENDPOINT, {}, "{}", 1000);
-
-    // Literals, not the implementation's own formula: a test that recomputes
-    // what it checks passes against a wrong-but-self-consistent derivation.
-    expect(timeouts).toEqual([437, 437]);
-    expect(437 * 2 + 125).toBeLessThanOrEqual(1000);
-    vi.restoreAllMocks();
-  });
 
   // A timeout or abort leaves the outcome unknown: the server may have written
   // the observation and simply not answered in time. observe.ts records its
@@ -112,21 +92,24 @@ describe("postWithRetry", () => {
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
-  // budgetMs is a budget for BOTH attempts, not a per-request timeout. Passing
-  // a value that was previously a per-request timeout silently halves it, which
-  // is how session-end briefly dropped every observation under a slow server.
-  it("gives session-end's budget the per-request timeout it needs", async () => {
+  // Each attempt gets the full per-attempt timeout; the caller picks it. The
+  // session-end value is imported, not copied, so lowering it back to a value
+  // that loses observations under a slow server fails here.
+  it.each([
+    ["the default", undefined, 400],
+    ["session-end's", OBSERVE_ATTEMPT_MS, 3000],
+  ])("uses %s per-attempt timeout on both attempts", async (_l, arg, want) => {
     const timeouts: number[] = [];
-    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const real = AbortSignal.timeout.bind(AbortSignal);
     vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
       timeouts.push(ms);
-      return realTimeout(ms);
+      return real(ms);
     });
     stubFetch([new Response(null, { status: 500 })]);
 
-    await postWithRetry(ENDPOINT, {}, "{}", 6250);
+    await postWithRetry(ENDPOINT, {}, "{}", arg);
 
-    expect(timeouts[0]).toBeGreaterThanOrEqual(3000);
+    expect(timeouts).toEqual([want, want]);
     vi.restoreAllMocks();
   });
 });
