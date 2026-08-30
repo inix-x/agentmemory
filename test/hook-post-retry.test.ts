@@ -111,4 +111,22 @@ describe("postWithRetry", () => {
     await expect(postWithRetry(ENDPOINT, {}, "{}", 8)).resolves.toBeUndefined();
     expect(fn).toHaveBeenCalledTimes(1);
   });
+
+  // budgetMs is a budget for BOTH attempts, not a per-request timeout. Passing
+  // a value that was previously a per-request timeout silently halves it, which
+  // is how session-end briefly dropped every observation under a slow server.
+  it("gives session-end's budget the per-request timeout it needs", async () => {
+    const timeouts: number[] = [];
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      timeouts.push(ms);
+      return realTimeout(ms);
+    });
+    stubFetch([new Response(null, { status: 500 })]);
+
+    await postWithRetry(ENDPOINT, {}, "{}", 6250);
+
+    expect(timeouts[0]).toBeGreaterThanOrEqual(3000);
+    vi.restoreAllMocks();
+  });
 });

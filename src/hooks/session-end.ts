@@ -87,9 +87,12 @@ async function main() {
             timestamp,
             data: { prompt },
           }),
-          // Awaited rather than raced against an exit timer, so this one can
-          // afford a longer per-request timeout than the other hooks.
-          3000,
+          // A budget, not a per-request timeout: postWithRetry splits it
+          // across two attempts and the delay between them. 6250 preserves
+          // the 3000ms per attempt this call had before the retry existed.
+          // These are awaited, and the exit timer below is armed after the
+          // await, so nothing else caps them.
+          6250,
         ),
       ),
     );

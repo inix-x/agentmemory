@@ -33,7 +33,7 @@ function hookCwd(data) {
 //#endregion
 //#region src/hooks/_post.ts
 async function postWithRetry(url, headers, body, budgetMs = 1e3) {
-	const retryDelayMs = Math.floor(budgetMs / 8);
+	const retryDelayMs = Math.min(250, Math.floor(budgetMs / 8));
 	const attemptMs = Math.floor((budgetMs - retryDelayMs) / 2);
 	for (let attempt = 0; attempt < 2; attempt++) {
 		if (attempt) await new Promise((r) => setTimeout(r, retryDelayMs));
