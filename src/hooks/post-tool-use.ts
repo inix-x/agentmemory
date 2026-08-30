@@ -57,10 +57,6 @@ async function main() {
       },
     }),
   );
-  // The timer is unref'd, so it does not hold the process open and costs
-  // nothing when the POST succeeds. It only caps a request still in flight,
-  // and a retry needs room to land: a fast 404 plus the retry delay plus the
-  // second attempt runs past 500ms.
   setTimeout(() => process.exit(0), 1000).unref();
 }
 
