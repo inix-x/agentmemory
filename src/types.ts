@@ -630,6 +630,7 @@ export interface AuditEntry {
     | "reflect"
     | "insight_search"
     | "skill_extract"
+    | "session_sweep"
     | "core_add"
     | "core_remove"
     | "auto_page"

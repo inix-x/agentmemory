@@ -211,22 +211,52 @@ describe("mem::session-sweep", () => {
     expect(result.swept).toBe(25);
   });
 
-  it("reads idleMinutes and maxPerRun overrides from stored config", async () => {
-    const store = storeWith([
-      makeSession("ses_a", { updatedAt: minutesAgo(30) }),
-      makeSession("ses_b", { updatedAt: minutesAgo(30) }),
-    ]);
-    store.set(
-      KV.config,
-      new Map<string, unknown>([
-        ["sessionSweep", { idleMinutes: 10, maxPerRun: 1 }],
-      ]),
-    );
+  it.each([
+    ["NaN", NaN],
+    ["zero", 0],
+    ["negative", -120],
+    ["non-numeric", "10" as unknown as number],
+  ])(
+    "falls back to the default threshold when idleMinutes is %s",
+    async (_label, bad) => {
+      // A bad override must not widen the net. At the 60m default a session
+      // idle 30m is not a candidate; a negative or zero threshold would sweep
+      // every active session.
+      const store = storeWith([
+        makeSession("ses_recent", { updatedAt: minutesAgo(30) }),
+      ]);
 
-    const { result } = await runSweep(store);
+      const { result } = await runSweep(store, { idleMinutes: bad });
 
-    expect(result.candidates).toBe(2);
-    expect(result.swept).toBe(1);
+      expect(result.candidates).toBe(0);
+      expect((store.get(KV.sessions)!.get("ses_recent") as Session).status).toBe(
+        "active",
+      );
+    },
+  );
+
+  it("writes an audit entry for each swept session", async () => {
+    const store = storeWith([makeSession("ses_idle")]);
+
+    await runSweep(store);
+
+    const audit = Array.from(store.get(KV.audit)?.values() ?? []) as Array<{
+      operation: string;
+      functionId: string;
+      targetIds: string[];
+    }>;
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.operation).toBe("session_sweep");
+    expect(audit[0]!.functionId).toBe("mem::session-sweep");
+    expect(audit[0]!.targetIds).toEqual(["ses_idle"]);
+  });
+
+  it("does not audit on a dry run", async () => {
+    const store = storeWith([makeSession("ses_idle")]);
+
+    await runSweep(store, { dryRun: true });
+
+    expect(store.get(KV.audit)?.size ?? 0).toBe(0);
   });
 
   it("fans out a summary with consolidation suppressed", async () => {
