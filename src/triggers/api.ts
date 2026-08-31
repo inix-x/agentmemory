@@ -3,6 +3,7 @@ import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSu
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
+import { listBounded, isOversized } from "../state/scope-size.js";
 import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
@@ -1922,7 +1923,18 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const memories = await kv.list<import("../types.js").Memory>(KV.memories);
+      // #544 added ?count / ?limit / ?offset here, but they slice AFTER
+      // this read, so the 38.5 MB inbound frame was unchanged and the
+      // endpoint still died at a 26.8% rate. Bound the read itself.
+      const memoriesResult = await listBounded<import("../types.js").Memory>(
+        kv,
+        KV.memories,
+        "use ?limit and ?offset, or ?count=true, on a smaller corpus; the memories scope is too large to enumerate",
+      );
+      if (isOversized(memoriesResult)) {
+        return { status_code: 413, body: memoriesResult };
+      }
+      const memories = memoriesResult;
       const latest = req.query_params?.["latest"] === "true";
       // agentId filter. Request param wins, env AGENT_ID (when
       // scope=isolated) is the fallback. Shared mode keeps the tag but
@@ -2027,7 +2039,12 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
+      const semantic = await listBounded<import("../types.js").SemanticMemory>(
+        kv,
+        KV.semantic,
+        "the semantic scope is too large to enumerate; trim it or use /agentmemory/mesh/export?since=",
+      );
+      if (isOversized(semantic)) return { status_code: 413, body: semantic };
       return { status_code: 200, body: { semantic } };
     },
   );
@@ -2041,7 +2058,12 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
+      const procedural = await listBounded<import("../types.js").ProceduralMemory>(
+        kv,
+        KV.procedural,
+        "the procedural scope is too large to enumerate; trim it or use /agentmemory/mesh/export?since=",
+      );
+      if (isOversized(procedural)) return { status_code: 413, body: procedural };
       return { status_code: 200, body: { procedural } };
     },
   );
@@ -2055,7 +2077,12 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
+      const relations = await listBounded<import("../types.js").MemoryRelation>(
+        kv,
+        KV.relations,
+        "the relations scope is too large to enumerate; trim it or use /agentmemory/mesh/export?since=",
+      );
+      if (isOversized(relations)) return { status_code: 413, body: relations };
       return { status_code: 200, body: { relations } };
     },
   );
