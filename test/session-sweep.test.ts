@@ -340,6 +340,110 @@ describe("mem::session-sweep", () => {
     expect(endCalls).toHaveLength(25);
   });
 
+  it("skips a run while another is still in flight", async () => {
+    // setInterval does not await its callback, and engine calls do time out
+    // under load. Two overlapping runs would each fan out a summarize for the
+    // same session, paying for the LLM pass twice.
+    const store = storeWith([makeSession("ses_idle")]);
+    const { sdk } = mockSdk(store);
+    registerSessionSweepFunction(sdk as never, mockKV(store) as never);
+
+    let releaseFirst: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const original = sdk.trigger;
+    let held = false;
+    sdk.trigger = (async (input: {
+      function_id: string;
+      payload: unknown;
+    }) => {
+      if (input.function_id === "event::session::ended" && !held) {
+        held = true;
+        await gate;
+      }
+      return original(input);
+    }) as typeof sdk.trigger;
+
+    const first = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    }) as Promise<{ swept: number }>;
+    // Let the first run reach the held trigger before starting the second.
+    await new Promise((r) => setTimeout(r, 0));
+    const second = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: number; skipped?: true };
+
+    expect(second.skipped).toBe(true);
+    expect(second.swept).toBe(0);
+
+    releaseFirst();
+    expect((await first).swept).toBe(1);
+  });
+
+  it("releases the in-flight guard so the next run proceeds", async () => {
+    // A guard that is never released turns the sweep into a one-shot: it would
+    // run once at boot and never again.
+    const store = storeWith([
+      makeSession("ses_a"),
+      makeSession("ses_b", { status: "completed" }),
+    ]);
+    const { sdk } = mockSdk(store);
+    registerSessionSweepFunction(sdk as never, mockKV(store) as never);
+
+    const first = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: number; skipped?: true };
+    expect(first.swept).toBe(1);
+
+    // Re-open ses_b so the second run has something to do.
+    (store.get(KV.sessions)!.get("ses_b") as Session).status = "active";
+    const second = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: number; skipped?: true };
+
+    expect(second.skipped).toBeUndefined();
+    expect(second.swept).toBe(1);
+  });
+
+  it("releases the guard even when the run throws", async () => {
+    const store = storeWith([makeSession("ses_a")]);
+    const { sdk } = mockSdk(store);
+    registerSessionSweepFunction(sdk as never, mockKV(store) as never);
+
+    const kvThatThrows = {
+      ...mockKV(store),
+      list: async () => {
+        throw new Error("boom");
+      },
+    };
+    const { sdk: sdk2 } = mockSdk(store);
+    registerSessionSweepFunction(sdk2 as never, kvThatThrows as never);
+
+    // kv.list has its own .catch, so the run completes; the point is that a
+    // second run is not locked out afterwards.
+    await sdk2.trigger({ function_id: "mem::session-sweep", payload: {} });
+    const second = (await sdk2.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { skipped?: true };
+
+    expect(second.skipped).toBeUndefined();
+  });
+
+  it("lets a dry run proceed alongside a real one", async () => {
+    const store = storeWith([makeSession("ses_idle")]);
+
+    const { result } = await runSweep(store, { dryRun: true });
+
+    expect(result.skipped).toBeUndefined();
+    expect(result.candidates).toBe(1);
+  });
+
   it("keeps sweeping after one session fails to end", async () => {
     const store = storeWith([makeSession("ses_a"), makeSession("ses_b")]);
 
