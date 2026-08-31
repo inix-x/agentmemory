@@ -4,6 +4,9 @@ export interface Session {
   cwd: string;
   startedAt: string;
   endedAt?: string;
+  // Stamped on every observation (src/functions/observe.ts); the inactivity
+  // signal mem::session-sweep ages sessions by.
+  updatedAt?: string;
   status: "active" | "completed" | "abandoned";
   observationCount: number;
   model?: string;
