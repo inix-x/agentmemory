@@ -19,8 +19,9 @@ function makeSession(id: string, overrides: Partial<Session> = {}): Session {
     id,
     project: "agentmemory",
     cwd: "/repo/agentmemory",
-    startedAt: minutesAgo(600),
-    updatedAt: minutesAgo(600),
+    // Comfortably past the 1440-minute (one day) default threshold.
+    startedAt: minutesAgo(3000),
+    updatedAt: minutesAgo(3000),
     status: "active",
     observationCount: 1,
     ...overrides,
@@ -51,21 +52,31 @@ function mockKV(store: Store) {
  * `event::session::ended` mutates the stored session the way the real handler
  * does, so assertions can read terminal state out of the store.
  */
-function mockSdk(store: Store, opts: { endFails?: boolean } = {}) {
+function mockSdk(
+  store: Store,
+  opts: { endFails?: boolean; stoppedFails?: boolean } = {},
+) {
   const handlers = new Map<string, Handler>();
   const calls: Array<{ function_id: string; payload: unknown }> = [];
 
   handlers.set("event::session::ended", async (payload) => {
     if (opts.endFails) throw new Error("ended trigger failed");
-    const { sessionId } = payload as { sessionId: string };
+    const { sessionId, endedAt } = payload as {
+      sessionId: string;
+      endedAt?: string;
+    };
     const session = store.get(KV.sessions)?.get(sessionId) as Session;
     if (session) {
       session.status = "completed";
-      session.endedAt = new Date().toISOString();
+      // Mirrors src/triggers/events.ts: caller-supplied endedAt wins.
+      session.endedAt = endedAt ?? new Date().toISOString();
     }
     return { success: true };
   });
-  handlers.set("event::session::stopped", async () => ({ success: true }));
+  handlers.set("event::session::stopped", async () => {
+    if (opts.stoppedFails) throw new Error("stopped trigger failed");
+    return { success: true };
+  });
 
   return {
     calls,
@@ -94,7 +105,7 @@ function storeWith(sessions: Session[]): Store {
 async function runSweep(
   store: Store,
   payload: Record<string, unknown> = {},
-  opts: { endFails?: boolean } = {},
+  opts: { endFails?: boolean; stoppedFails?: boolean } = {},
 ) {
   const { sdk, calls } = mockSdk(store, opts);
   registerSessionSweepFunction(sdk as never, mockKV(store) as never);
@@ -272,6 +283,61 @@ describe("mem::session-sweep", () => {
       sessionId: "ses_idle",
       skipConsolidation: true,
     });
+  });
+
+  it("leaves a session sitting exactly on the threshold alone", async () => {
+    // The comparison is `<=`, so equality must NOT sweep. Without this the
+    // boundary is untested and `<=` vs `<` is a silent change.
+    const store = storeWith([makeSession("ses_edge")]);
+    const session = store.get(KV.sessions)!.get("ses_edge") as Session;
+    const idleMinutes = 90;
+    session.updatedAt = new Date(
+      Date.now() - idleMinutes * 60 * 1000,
+    ).toISOString();
+
+    const { result } = await runSweep(store, { idleMinutes });
+
+    expect(result.candidates).toBe(0);
+    expect(session.status).toBe("active");
+  });
+
+  it("records the last activity as endedAt, not the sweep time", async () => {
+    const store = storeWith([makeSession("ses_idle")]);
+    const before = store.get(KV.sessions)!.get("ses_idle") as Session;
+    const lastSeen = before.updatedAt;
+
+    await runSweep(store);
+
+    const session = store.get(KV.sessions)!.get("ses_idle") as Session;
+    expect(session.endedAt).toBe(lastSeen);
+  });
+
+  it("survives a rejected summary fan-out", async () => {
+    // The fan-out is deliberately not awaited, so its rejection must be caught
+    // or it surfaces as an unhandled rejection.
+    const store = storeWith([makeSession("ses_idle")]);
+
+    const { result } = await runSweep(store, {}, { stoppedFails: true });
+
+    expect(result.swept).toBe(1);
+    expect((store.get(KV.sessions)!.get("ses_idle") as Session).status).toBe(
+      "completed",
+    );
+  });
+
+  it("caps attempts, not successes, when every end fails", async () => {
+    const sessions = Array.from({ length: 30 }, (_, i) =>
+      makeSession(`ses_${i}`),
+    );
+    const store = storeWith(sessions);
+
+    const { calls } = await runSweep(store, {}, { endFails: true });
+
+    // Without an attempt-based cap a failing backlog retries the whole list.
+    const endCalls = calls.filter(
+      (c) => c.function_id === "event::session::ended",
+    );
+    expect(endCalls).toHaveLength(25);
   });
 
   it("keeps sweeping after one session fails to end", async () => {
