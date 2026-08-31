@@ -474,8 +474,6 @@ export function getSessionSweepIntervalMs(): number {
     getMergedEnv()["SESSION_SWEEP_INTERVAL_MS"],
     SESSION_SWEEP_INTERVAL_DEFAULT_MS,
   );
-  // safeParseInt already falls back on NaN, and parseInt never yields Infinity,
-  // so raw is finite here and only needs bounding.
   return Math.min(Math.max(raw, SESSION_SWEEP_INTERVAL_MIN_MS), TIMER_MAX_MS);
 }
 

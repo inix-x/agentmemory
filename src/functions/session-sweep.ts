@@ -13,7 +13,7 @@ import { logger } from "../logger.js";
 const MS_PER_MINUTE = 60 * 1000;
 // A day, not an hour. The sessions this exists for run and finish, so a tight
 // threshold buys nothing there, while a client that merely idles overnight
-// would be ended mid-use. mem::evict's comparable call is 30 days.
+// would be ended mid-use.
 const DEFAULT_IDLE_MINUTES = 1440;
 // ponytail: fixed cap per run, not a work queue. Each swept session fans out a
 // summarize, so an unbounded first pass over a backlog is an LLM storm.
@@ -50,7 +50,6 @@ async function sweep(
   const now = Date.now();
   const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
   let candidates = 0;
-  let attempted = 0;
   let swept = 0;
 
   for (const session of sessions) {
@@ -62,16 +61,24 @@ async function sweep(
     if (now - last <= idleMs) continue;
 
     candidates++;
-    if (dryRun) continue;
-    // Cap attempts, not successes: if every end fails, a large backlog would
-    // otherwise retry the whole list on every run.
-    if (attempted >= MAX_PER_RUN) continue;
-    attempted++;
+    // Capped on candidates, not on successes: if every end fails, a large
+    // backlog would otherwise retry the whole list on every run. candidates
+    // keeps counting past the cap so the return value reports backlog depth.
+    if (dryRun || candidates > MAX_PER_RUN) continue;
+
+    // Re-read immediately before writing. The list snapshot can be stale by the
+    // time we reach a given row, and a client may have ended the session in
+    // between, which would otherwise cost a duplicate audit row and a duplicate
+    // summarize. This narrows the window, it does not close it: StateKV has no
+    // compare-and-set, so an atomic active-to-completed claim is not available.
+    const current = await kv
+      .get<Session>(KV.sessions, session.id)
+      .catch(() => null);
+    if (current && current.status !== "active") continue;
 
     try {
-      // event::session::ended owns the terminal-state write. Pass the last
-      // activity as endedAt so a session idle for a day is not recorded as
-      // having run for a day (the viewer derives duration from it).
+      // endedAt is the last activity, not now, so a session idle for a day is
+      // not recorded as having run for a day (the viewer derives duration).
       await sdk.trigger({
         function_id: "event::session::ended",
         payload: {
@@ -126,11 +133,8 @@ async function sweep(
 }
 
 export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
-  // setInterval does not await its callback, and the endpoint can fire during a
-  // timer run. A sweep normally takes seconds, but engine state::set calls do
-  // time out at 30s under load, and 25 of those would outlast the interval. Two
-  // overlapping runs would snapshot the same still-active session and each fan
-  // out a summarize, paying for the LLM pass twice.
+  // setInterval does not await its callback, so two runs can overlap and each
+  // fan out a summarize for the same session, paying for the LLM pass twice.
   let inFlight = false;
 
   sdk.registerFunction(
@@ -139,17 +143,15 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
       dryRun?: boolean;
       idleMinutes?: number;
     }): Promise<SweepResult> => {
-      const dryRun = data?.dryRun ?? false;
-      // A dry run only reads, so it never needs to wait on a real one.
-      if (inFlight && !dryRun) {
+      if (inFlight) {
         logger.info("Session sweep already running, skipping this run");
         return { success: true, candidates: 0, swept: 0, skipped: true };
       }
-      if (!dryRun) inFlight = true;
+      inFlight = true;
       try {
-        return await sweep(sdk, kv, dryRun, data?.idleMinutes);
+        return await sweep(sdk, kv, data?.dryRun ?? false, data?.idleMinutes);
       } finally {
-        if (!dryRun) inFlight = false;
+        inFlight = false;
       }
     },
   );

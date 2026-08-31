@@ -68,6 +68,31 @@ describe("event::session::ended", () => {
     });
   });
 
+  it.each([
+    ["garbage", "not-a-date"],
+    ["empty", ""],
+    ["a number", 1756600000000],
+    ["null", null],
+    ["an object", { when: "yesterday" }],
+  ])("ignores an unusable endedAt (%s)", async (_label, bad) => {
+    // This handler is also a durable subscriber, so the payload is untrusted.
+    // The viewer derives duration from endedAt; a bogus value renders as a
+    // bogus duration.
+    const { handlers, update } = harness();
+    const before = Date.now();
+
+    await handlers.get("event::session::ended")!({
+      sessionId: "ses_bad",
+      endedAt: bad,
+    });
+
+    const stamp = updatesFrom(update).find((u) => u.path === "endedAt")!
+      .value as string;
+    const parsed = new Date(stamp).getTime();
+    expect(Number.isFinite(parsed)).toBe(true);
+    expect(parsed).toBeGreaterThanOrEqual(before);
+  });
+
   it("falls back to now when no endedAt is supplied", async () => {
     const { handlers, update } = harness();
     const before = Date.now();
