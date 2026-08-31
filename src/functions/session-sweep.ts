@@ -11,7 +11,11 @@ import { logger } from "../logger.js";
 // dropped it. Separate from mem::evict on purpose: that pass deletes rows, which
 // is a different decision from marking a session finished.
 const MS_PER_MINUTE = 60 * 1000;
-const DEFAULT_IDLE_MINUTES = 60;
+// A day, not an hour. The sessions this exists for (SDK children, subagents)
+// run and finish, so a tight threshold buys nothing there, while a client that
+// merely idles overnight would be ended mid-use. mem::evict's comparable
+// "this is dead" call is 30 days.
+const DEFAULT_IDLE_MINUTES = 1440;
 // ponytail: fixed cap per run, not a work queue. Each swept session fans out a
 // summarize, so an unbounded first pass over a backlog is an LLM storm.
 const MAX_PER_RUN = 25;
@@ -45,6 +49,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
       const now = Date.now();
       const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
       let candidates = 0;
+      let attempted = 0;
       let swept = 0;
 
       for (const session of sessions) {
@@ -57,13 +62,21 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
 
         candidates++;
         if (dryRun) continue;
-        if (swept >= MAX_PER_RUN) continue;
+        // Cap attempts, not successes: if every end fails, a large backlog
+        // would otherwise retry the whole list on every run.
+        if (attempted >= MAX_PER_RUN) continue;
+        attempted++;
 
         try {
-          // event::session::ended owns the terminal-state write.
+          // event::session::ended owns the terminal-state write. Pass the last
+          // activity as endedAt so a session idle for a day is not recorded as
+          // having run for a day (the viewer derives duration from it).
           await sdk.trigger({
             function_id: "event::session::ended",
-            payload: { sessionId: session.id },
+            payload: {
+              sessionId: session.id,
+              endedAt: new Date(last).toISOString(),
+            },
           });
         } catch (err) {
           logger.warn("Session sweep failed to end session", {
@@ -82,8 +95,10 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
           idleMinutes,
         });
 
-        // Mirrors the /session/end fan-out. skipConsolidation keeps N swept
-        // sessions from launching N full-corpus consolidations.
+        // Same summary fan-out /session/end performs, except for
+        // skipConsolidation, which that path does not pass: it ends one session
+        // at a time, whereas this can end MAX_PER_RUN of them and would
+        // otherwise launch that many full-corpus consolidations.
         sdk
           .trigger({
             function_id: "event::session::stopped",

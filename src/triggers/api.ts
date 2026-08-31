@@ -1177,6 +1177,37 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/evict", http_method: "POST" },
   });
 
+  sdk.registerFunction("api::session-sweep",
+    async (
+      req: ApiRequest<{ dryRun?: boolean; idleMinutes?: number }>,
+    ): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const dryRun =
+        req.query_params?.["dryRun"] === "true" || req.body?.dryRun === true;
+      // Whitelisted, never the raw body. mem::session-sweep re-validates and
+      // falls back to its default for anything non-finite or non-positive.
+      const rawIdle =
+        req.query_params?.["idleMinutes"] ?? req.body?.idleMinutes;
+      const idleMinutes = Number(rawIdle);
+      const result = await sdk.trigger({
+        function_id: "mem::session-sweep",
+        payload: {
+          dryRun,
+          ...(Number.isFinite(idleMinutes) && idleMinutes > 0
+            ? { idleMinutes }
+            : {}),
+        },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::session-sweep",
+    config: { api_path: "/agentmemory/session-sweep", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::smart-search",
     async (
       req: ApiRequest<{
