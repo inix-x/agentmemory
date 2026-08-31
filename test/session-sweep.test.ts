@@ -333,7 +333,7 @@ describe("mem::session-sweep", () => {
     );
   });
 
-  it("caps attempts, not successes, when every end fails", async () => {
+  it("bounds a run by candidates, so a failing backlog is not retried whole", async () => {
     const sessions = Array.from({ length: 30 }, (_, i) =>
       makeSession(`ses_${i}`),
     );
@@ -341,7 +341,8 @@ describe("mem::session-sweep", () => {
 
     const { calls } = await runSweep(store, {}, { endFails: true });
 
-    // Without an attempt-based cap a failing backlog retries the whole list.
+    // The cap is on candidates, not successes, so a backlog where every end
+    // fails is still bounded rather than retried in full every run.
     const endCalls = calls.filter(
       (c) => c.function_id === "event::session::ended",
     );
