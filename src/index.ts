@@ -17,6 +17,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getSessionSweepIntervalMs,
 } from "./config.js";
 import {
   createProvider,
@@ -578,12 +579,7 @@ async function main() {
     bootLog(`Auto-forget: enabled (every ${autoForgetIntervalMs / 60000}m)`);
   }
 
-  // Clamped: setInterval treats NaN or 0 as ~1ms, which would run the sweep in
-  // a hot loop. A floor of one minute keeps a bad env var from doing that.
-  const parsedSweepInterval = parseInt(process.env.SESSION_SWEEP_INTERVAL_MS || "900000", 10);
-  const sessionSweepIntervalMs = Number.isFinite(parsedSweepInterval)
-    ? Math.max(parsedSweepInterval, 60000)
-    : 900000;
+  const sessionSweepIntervalMs = getSessionSweepIntervalMs();
 
   if (process.env.SESSION_SWEEP_ENABLED !== "false") {
     const sessionSweepTimer = setInterval(async () => {

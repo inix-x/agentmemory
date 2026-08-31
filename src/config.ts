@@ -463,6 +463,22 @@ export function getConsolidationCooldownMs(): number {
   return raw >= 0 ? raw : CONSOLIDATION_COOLDOWN_DEFAULT_MS;
 }
 
+const SESSION_SWEEP_INTERVAL_DEFAULT_MS = 900_000;
+const SESSION_SWEEP_INTERVAL_MIN_MS = 60_000;
+// setInterval coerces a delay above 2^31-1 to 1ms, exactly as it does NaN or 0,
+// so an interval that is merely too large fails the same way garbage does.
+const TIMER_MAX_MS = 2_147_483_647;
+
+export function getSessionSweepIntervalMs(): number {
+  const raw = safeParseInt(
+    getMergedEnv()["SESSION_SWEEP_INTERVAL_MS"],
+    SESSION_SWEEP_INTERVAL_DEFAULT_MS,
+  );
+  // safeParseInt already falls back on NaN, and parseInt never yields Infinity,
+  // so raw is finite here and only needs bounding.
+  return Math.min(Math.max(raw, SESSION_SWEEP_INTERVAL_MIN_MS), TIMER_MAX_MS);
+}
+
 export function isStandaloneMcp(): boolean {
   return getMergedEnv()["STANDALONE_MCP"] === "true";
 }
