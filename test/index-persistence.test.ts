@@ -629,6 +629,47 @@ describe("IndexPersistence", () => {
     await expect(kv.get(oldShardScope, "data")).resolves.toBeNull();
   });
 
+  // A boot with no embedding provider constructs IndexPersistence with a null
+  // vector index (src/index.ts sets it from the provider), and runSave gates
+  // the vector save on it. The vector manifest and ledger still exist on disk,
+  // but nothing revisits them, so the generation that was live at that moment
+  // strands forever: StateKV cannot enumerate scopes to find it later.
+  // Production carried exactly this — 9 vector shards, 17 MB, orphaned by a
+  // redeploy that came up without a provider.
+  it("reclaims the previous vector generation when no vector index is loaded (#1115)", async () => {
+    await new IndexPersistence(kv as never, makeBm25("obs_old", "alpha"), makeVector("obs_old"), {
+      shardChars: 80,
+      createGeneration: () => "gen_old",
+    }).save();
+    const oldVectorScope = "mem:index:bm25:vectors:gen_old:00000";
+    await expect(kv.get(oldVectorScope, "data")).resolves.not.toBeNull();
+
+    // A boot WITH a provider publishes gen_mid over it, but its deletes fail,
+    // so gen_old survives on disk and stays in the ledger as superseded. That
+    // is the state a brownout leaves behind, and reclaim is built to finish it
+    // on a later pass.
+    const deleteFailsKv = {
+      ...kv,
+      delete: vi.fn(async () => {
+        throw new Error("delete failed");
+      }),
+    };
+    await new IndexPersistence(deleteFailsKv as never, makeBm25("obs_mid", "charlie"), makeVector("obs_mid"), {
+      shardChars: 80,
+      createGeneration: () => "gen_mid",
+    }).save();
+    await expect(kv.get(oldVectorScope, "data")).resolves.not.toBeNull();
+
+    // Next boot has no embedding provider. Without the fix nothing revisits
+    // the vector manifest, so gen_old stays on disk forever.
+    await new IndexPersistence(kv as never, makeBm25("obs_new", "bravo"), null, {
+      shardChars: 80,
+      createGeneration: () => "gen_new",
+    }).save();
+
+    await expect(kv.get(oldVectorScope, "data")).resolves.toBeNull();
+  });
+
   it("reclaims the previous vector generation when the vector manifest read fails (#1115)", async () => {
     await new IndexPersistence(
       kv as never,

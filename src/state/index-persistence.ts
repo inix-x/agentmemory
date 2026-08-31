@@ -168,6 +168,18 @@ export class IndexPersistence {
       } catch (err) {
         this.logFailure("vector", err);
       }
+    } else {
+      // No embedding provider this boot, so there is no vector index to save
+      // (src/index.ts builds one only when a provider exists). The vector
+      // manifest and its ledger still sit on disk from a boot that had one,
+      // and nothing else will ever revisit them: reclaim runs inside the save
+      // this branch skips, and StateKV cannot enumerate scopes to find the
+      // shards later. Reclaim on its own so that generation is not stranded.
+      try {
+        await this.reclaimVectorGenerations();
+      } catch (err) {
+        this.logFailure("vector", err);
+      }
     }
   }
 
@@ -227,6 +239,21 @@ export class IndexPersistence {
       BM25_KEY,
       BM25_SHARD_SCOPE_PREFIX,
     );
+  }
+
+  /**
+   * Reclaim superseded vector generations without saving a vector index.
+   *
+   * Reads the manifest only to learn which generation is live; the ledger
+   * holds everything else. A manifest that is missing or nameless reclaims
+   * nothing, which is the fail-safe direction.
+   */
+  private async reclaimVectorGenerations(): Promise<void> {
+    const manifest = await this.kv
+      .get<IndexShardManifest>(KV.bm25Index, VECTOR_MANIFEST_KEY)
+      .catch(() => null);
+    if (manifest?.v !== 1 || !manifest.generation) return;
+    await this.reclaimGenerations(VECTOR_MANIFEST_KEY, manifest.generation);
   }
 
   private async saveVectorIndex(serialized: string): Promise<void> {
