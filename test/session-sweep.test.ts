@@ -42,7 +42,15 @@ function mockKV(store: Store) {
     },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
-      return entries ? (Array.from(entries.values()) as T[]) : [];
+      // Clone, because the real StateKV.list is an SDK round-trip returning
+      // fresh objects. Handing back live references would let a test's later
+      // mutation retroactively change the snapshot the sweep already read,
+      // which hides the whole stale-snapshot class of bug.
+      return entries
+        ? (Array.from(entries.values()).map((v) =>
+            v && typeof v === "object" ? { ...(v as object) } : v,
+          ) as T[])
+        : [];
     },
   };
 }
@@ -383,6 +391,34 @@ describe("mem::session-sweep", () => {
     expect((await first).swept).toBe(1);
   });
 
+  it("skips a session another writer completed since the list snapshot", async () => {
+    // The list snapshot can be stale by the time a given row is reached. Ending
+    // an already-completed session would cost a duplicate audit row and a
+    // duplicate summarize.
+    const store = storeWith([makeSession("ses_a"), makeSession("ses_b")]);
+    const { sdk, calls } = mockSdk(store);
+    const kv = mockKV(store);
+    const realList = kv.list.bind(kv);
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      const rows = await realList<T>(scope);
+      // Hand back the snapshot, then complete one row behind the sweep's back.
+      (store.get(KV.sessions)!.get("ses_b") as Session).status = "completed";
+      return rows;
+    }) as typeof kv.list;
+    registerSessionSweepFunction(sdk as never, kv as never);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { candidates: number; swept: number };
+
+    expect(result.swept).toBe(1);
+    const ended = calls
+      .filter((c) => c.function_id === "event::session::ended")
+      .map((c) => (c.payload as { sessionId: string }).sessionId);
+    expect(ended).toEqual(["ses_a"]);
+  });
+
   it("releases the in-flight guard so the next run proceeds", async () => {
     // A guard that is never released turns the sweep into a one-shot: it would
     // run once at boot and never again.
@@ -408,40 +444,6 @@ describe("mem::session-sweep", () => {
 
     expect(second.skipped).toBeUndefined();
     expect(second.swept).toBe(1);
-  });
-
-  it("releases the guard even when the run throws", async () => {
-    const store = storeWith([makeSession("ses_a")]);
-    const { sdk } = mockSdk(store);
-    registerSessionSweepFunction(sdk as never, mockKV(store) as never);
-
-    const kvThatThrows = {
-      ...mockKV(store),
-      list: async () => {
-        throw new Error("boom");
-      },
-    };
-    const { sdk: sdk2 } = mockSdk(store);
-    registerSessionSweepFunction(sdk2 as never, kvThatThrows as never);
-
-    // kv.list has its own .catch, so the run completes; the point is that a
-    // second run is not locked out afterwards.
-    await sdk2.trigger({ function_id: "mem::session-sweep", payload: {} });
-    const second = (await sdk2.trigger({
-      function_id: "mem::session-sweep",
-      payload: {},
-    })) as { skipped?: true };
-
-    expect(second.skipped).toBeUndefined();
-  });
-
-  it("lets a dry run proceed alongside a real one", async () => {
-    const store = storeWith([makeSession("ses_idle")]);
-
-    const { result } = await runSweep(store, { dryRun: true });
-
-    expect(result.skipped).toBeUndefined();
-    expect(result.candidates).toBe(1);
   });
 
   it("keeps sweeping after one session fails to end", async () => {

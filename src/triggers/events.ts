@@ -156,9 +156,16 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     "event::session::ended",
     async (data: { sessionId: string; endedAt?: string }) => {
       // endedAt is overridable so a sweep can record when the session actually
-      // went quiet rather than when it was noticed.
+      // went quiet rather than when it was noticed. Validated because this is
+      // also a durable subscriber: the viewer derives session duration from
+      // this field, so an unparseable value would render as a bogus duration.
+      const supplied =
+        typeof data.endedAt === "string" &&
+        Number.isFinite(new Date(data.endedAt).getTime())
+          ? data.endedAt
+          : undefined;
       await kv.update(KV.sessions, data.sessionId, [
-        { type: "set", path: "endedAt", value: data.endedAt ?? new Date().toISOString() },
+        { type: "set", path: "endedAt", value: supplied ?? new Date().toISOString() },
         { type: "set", path: "status", value: "completed" },
       ]);
       return { success: true };

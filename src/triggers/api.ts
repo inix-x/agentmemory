@@ -1176,6 +1176,20 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/evict", http_method: "POST" },
   });
 
+  // Exported shape is deliberately narrow: only a real number, or a numeric
+  // string (query params arrive as strings). Booleans, arrays, objects, and
+  // blank strings return undefined so the sweep uses its own default.
+  const coerceIdleMinutes = (raw: unknown): number | undefined => {
+    if (typeof raw === "number") {
+      return Number.isFinite(raw) && raw > 0 ? raw : undefined;
+    }
+    if (typeof raw === "string" && raw.trim() !== "") {
+      const parsed = Number(raw);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+    }
+    return undefined;
+  };
+
   sdk.registerFunction("api::session-sweep",
     async (
       req: ApiRequest<{ dryRun?: boolean; idleMinutes?: number }>,
@@ -1184,18 +1198,18 @@ export function registerApiTriggers(
       if (authErr) return authErr;
       const dryRun =
         req.query_params?.["dryRun"] === "true" || req.body?.dryRun === true;
-      // Whitelisted, never the raw body. mem::session-sweep re-validates and
-      // falls back to its default for anything non-finite or non-positive.
-      const rawIdle =
-        req.query_params?.["idleMinutes"] ?? req.body?.idleMinutes;
-      const idleMinutes = Number(rawIdle);
+      // Whitelisted, never the raw body. Numbers from the body and numeric
+      // strings from the query only: Number(true) is 1 and Number(["5"]) is 5,
+      // so a bare Number() would turn {"idleMinutes": true} into a one-minute
+      // threshold and sweep nearly every active session.
+      const idleMinutes = coerceIdleMinutes(
+        req.body?.idleMinutes ?? req.query_params?.["idleMinutes"],
+      );
       const result = await sdk.trigger({
         function_id: "mem::session-sweep",
         payload: {
           dryRun,
-          ...(Number.isFinite(idleMinutes) && idleMinutes > 0
-            ? { idleMinutes }
-            : {}),
+          ...(idleMinutes !== undefined ? { idleMinutes } : {}),
         },
       });
       return { status_code: 200, body: result };
