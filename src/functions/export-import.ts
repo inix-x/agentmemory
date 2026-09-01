@@ -25,6 +25,7 @@ import type {
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
+import { listBoundedOrSkip } from "../state/scope-size.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { listGraphScopes } from "./graph.js";
 import { StateKV } from "../state/kv.js";
@@ -116,20 +117,20 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         accessLogs,
       ] = await Promise.all([
         listGraphScopes(kv, "mem::export"),
-        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-        kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
-        kv.list<Action>(KV.actions).catch(() => []),
-        kv.list<ActionEdge>(KV.actionEdges).catch(() => []),
-        kv.list<Sentinel>(KV.sentinels).catch(() => []),
-        kv.list<Sketch>(KV.sketches).catch(() => []),
-        kv.list<Crystal>(KV.crystals).catch(() => []),
-        kv.list<Facet>(KV.facets).catch(() => []),
-        kv.list<Lesson>(KV.lessons).catch(() => []),
-        kv.list<Insight>(KV.insights).catch(() => []),
-        kv.list<Routine>(KV.routines).catch(() => []),
-        kv.list<Signal>(KV.signals).catch(() => []),
-        kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
-        kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
+        listBoundedOrSkip<SemanticMemory>(kv, KV.semantic, "mem::export"),
+        listBoundedOrSkip<ProceduralMemory>(kv, KV.procedural, "mem::export"),
+        listBoundedOrSkip<Action>(kv, KV.actions, "mem::export"),
+        listBoundedOrSkip<ActionEdge>(kv, KV.actionEdges, "mem::export"),
+        listBoundedOrSkip<Sentinel>(kv, KV.sentinels, "mem::export"),
+        listBoundedOrSkip<Sketch>(kv, KV.sketches, "mem::export"),
+        listBoundedOrSkip<Crystal>(kv, KV.crystals, "mem::export"),
+        listBoundedOrSkip<Facet>(kv, KV.facets, "mem::export"),
+        listBoundedOrSkip<Lesson>(kv, KV.lessons, "mem::export"),
+        listBoundedOrSkip<Insight>(kv, KV.insights, "mem::export"),
+        listBoundedOrSkip<Routine>(kv, KV.routines, "mem::export"),
+        listBoundedOrSkip<Signal>(kv, KV.signals, "mem::export"),
+        listBoundedOrSkip<Checkpoint>(kv, KV.checkpoints, "mem::export"),
+        listBoundedOrSkip<AccessLogExport>(kv, KV.accessLog, "mem::export"),
       ]);
 
       if (!graph.enumerated) {
@@ -333,48 +334,48 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           await kv.list<SessionSummary>(KV.summaries),
           (s) => kv.delete(KV.summaries, s.sessionId),
         );
-        await runChunked(await kv.list<Action>(KV.actions).catch(() => []), (a) =>
+        await runChunked(await listBoundedOrSkip<Action>(kv, KV.actions, "mem::export"), (a) =>
           kv.delete(KV.actions, a.id),
         );
         await runChunked(
-          await kv.list<ActionEdge>(KV.actionEdges).catch(() => []),
+          await listBoundedOrSkip<ActionEdge>(kv, KV.actionEdges, "mem::export"),
           (e) => kv.delete(KV.actionEdges, e.id),
         );
         await runChunked(
-          await kv.list<Routine>(KV.routines).catch(() => []),
+          await listBoundedOrSkip<Routine>(kv, KV.routines, "mem::export"),
           (r) => kv.delete(KV.routines, r.id),
         );
         await runChunked(
-          await kv.list<Signal>(KV.signals).catch(() => []),
+          await listBoundedOrSkip<Signal>(kv, KV.signals, "mem::export"),
           (s) => kv.delete(KV.signals, s.id),
         );
         await runChunked(
-          await kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
+          await listBoundedOrSkip<Checkpoint>(kv, KV.checkpoints, "mem::export"),
           (c) => kv.delete(KV.checkpoints, c.id),
         );
         await runChunked(
-          await kv.list<Sentinel>(KV.sentinels).catch(() => []),
+          await listBoundedOrSkip<Sentinel>(kv, KV.sentinels, "mem::export"),
           (s) => kv.delete(KV.sentinels, s.id),
         );
         await runChunked(
-          await kv.list<Sketch>(KV.sketches).catch(() => []),
+          await listBoundedOrSkip<Sketch>(kv, KV.sketches, "mem::export"),
           (s) => kv.delete(KV.sketches, s.id),
         );
         await runChunked(
-          await kv.list<Crystal>(KV.crystals).catch(() => []),
+          await listBoundedOrSkip<Crystal>(kv, KV.crystals, "mem::export"),
           (c) => kv.delete(KV.crystals, c.id),
         );
         await runChunked(
-          await kv.list<Facet>(KV.facets).catch(() => []),
+          await listBoundedOrSkip<Facet>(kv, KV.facets, "mem::export"),
           (f) => kv.delete(KV.facets, f.id),
         );
         await runChunked(
-          await kv.list<Lesson>(KV.lessons).catch(() => []),
+          await listBoundedOrSkip<Lesson>(kv, KV.lessons, "mem::export"),
           (l) => kv.delete(KV.lessons, l.id),
         );
         resetLessonIndex();
         await runChunked(
-          await kv.list<Insight>(KV.insights).catch(() => []),
+          await listBoundedOrSkip<Insight>(kv, KV.insights, "mem::export"),
           (i) => kv.delete(KV.insights, i.id),
         );
         await runChunked(
@@ -394,11 +395,11 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           (p) => kv.delete(KV.procedural, p.id),
         );
         await runChunked(
-          await kv.list<ProjectProfile>(KV.profiles).catch(() => []),
+          await listBoundedOrSkip<ProjectProfile>(kv, KV.profiles, "mem::export"),
           (profile) => kv.delete(KV.profiles, profile.project),
         );
         await runChunked(
-          await kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
+          await listBoundedOrSkip<AccessLogExport>(kv, KV.accessLog, "mem::export"),
           (a) => kv.delete(KV.accessLog, a.memoryId),
         );
       }
