@@ -1835,10 +1835,9 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const parsedLimit = parseOptionalInt(req.query_params?.["limit"]);
-      // Payload stays loosely typed: query_params values are
-      // `string | string[]`, and narrowing them here is a separate concern
-      // from this fix. Only the RESULT type matters, so isOversized can
-      // discriminate it.
+      // Payload stays loose because query_params values are
+      // `string | string[]`; only the result type has to be bound, so
+      // isOversized can discriminate it.
       const entries = await sdk.trigger<
         Record<string, unknown>,
         import("../types.js").AuditEntry[] | OversizedPayload

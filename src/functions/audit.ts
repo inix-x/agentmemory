@@ -98,10 +98,11 @@ export async function queryAudit(
     "narrow with ?operation, or trim the audit scope; it is too large to enumerate",
   );
   if (isOversized(listed)) {
-    // Hand the refusal back rather than throwing it. Throwing made this
-    // the single largest 5xx source in production — 125 of 136 5xx per
-    // hour, all of them a correct refusal reported as a server fault.
-    // Every caller must branch on isOversized(); see the contract on
+    // Hand the refusal back rather than throwing it. The comment above
+    // dates from when this was the second-worst 5xx source; once the
+    // other sources were fixed it became the largest by far, 125 of 136
+    // 5xx per hour, every one a correct refusal reported as a server
+    // fault. Callers must branch on isOversized(); see the contract on
     // listBounded in state/scope-size.ts.
     return listed;
   }
