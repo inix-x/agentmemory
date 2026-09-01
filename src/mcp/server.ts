@@ -578,34 +578,23 @@ export function registerMcpEndpoints(
 
           case "memory_audit": {
             try {
-              const result = await sdk.trigger({ function_id: "mem::audit-query", payload: {
+              const result = await sdk.trigger<
+                Record<string, unknown>,
+                import("../types.js").AuditEntry[] | OversizedPayload
+              >({ function_id: "mem::audit-query", payload: {
                 operation: args.operation as string,
                 limit: typeof args.limit === "number" ? args.limit : 50,
               } });
-              // mem::audit-query returns the refusal instead of throwing
-              // when the audit scope is over the enumeration ceiling, so
-              // the catch below no longer covers it. Without this branch a
-              // refusal would render as an ordinary successful result.
-              if (isOversized(result as never)) {
-                return {
-                  status_code: 200,
-                  body: {
-                    content: [
-                      {
-                        type: "text",
-                        text: (result as unknown as OversizedPayload).error,
-                      },
-                    ],
-                    isError: true,
-                  },
-                };
-              }
+              // mem::audit-query returns the refusal instead of throwing, so
+              // the catch below no longer covers it; flag it explicitly or a
+              // refusal renders as an ordinary successful result.
               return {
                 status_code: 200,
                 body: {
                   content: [
                     { type: "text", text: JSON.stringify(result, null, 2) },
                   ],
+                  ...(isOversized(result) ? { isError: true } : {}),
                 },
               };
             } catch {
