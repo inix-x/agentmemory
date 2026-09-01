@@ -144,25 +144,45 @@ export function registerObserveFunction(
       const pendingImageData = extractedImage;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          const existing = await kv.list(KV.observations(payload.sessionId));
-          if (existing.length >= maxObservationsPerSession) {
-            return {
-              success: false,
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
-          }
-        }
-
         // Existing session is the source of truth for agentId (even
         // undefined). Env AGENT_ID only fires when no session row
         // exists yet — otherwise an unscoped session would get
         // retroactively scoped by a later AGENT_ID export.
+        // Read before the cap check so the cap can be answered from
+        // observationCount instead of enumerating the whole scope.
         const existingSession = await kv.get<{
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
         }>(KV.sessions, payload.sessionId);
+
+        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
+          // observationCount, maintained below on every write, is only
+          // ever an UPPER bound: evict.ts and remember.ts delete
+          // observations without decrementing it. Below the cap it is
+          // therefore safe to trust, and skipping the read takes an
+          // unbounded enumeration off the hottest path in the service
+          // (/observe is ~82% of requests, and this runs inside the
+          // per-session lock). At or above the cap the counter cannot be
+          // trusted, so enumerate for the real number — otherwise an
+          // evicted session would be locked out of writes forever. A
+          // session record with no counter predates the field and takes
+          // the same path.
+          const counted = existingSession?.observationCount;
+          if (
+            typeof counted !== "number" ||
+            counted >= maxObservationsPerSession
+          ) {
+            const existing = await kv.list(KV.observations(payload.sessionId));
+            if (existing.length >= maxObservationsPerSession) {
+              return {
+                success: false,
+                error: `Session observation limit reached (${maxObservationsPerSession})`,
+              };
+            }
+          }
+        }
+
         const inheritedAgentId = existingSession
           ? existingSession.agentId
           : getAgentId();
