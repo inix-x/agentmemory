@@ -747,7 +747,39 @@ export async function persistGraphDelta(
   edges: GraphEdge[],
   obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
-  const snap = (await readSnapshot(kv)) ?? emptySnapshot();
+  // readSnapshot() collapses two different situations into null: "no
+  // snapshot yet" and "the read failed" (it catches and logs). Bootstrapping
+  // an unmarked empty snapshot from the SECOND case is what let a 414 MB
+  // graph scope look enumerable in production:
+  //
+  //   worker dies -> readSnapshot fails -> null -> bootstrap empty snapshot
+  //   with no resetAt -> the kv.set below overwrites the real snapshot, so
+  //   rows already on disk are invisible AND unmarked -> checkGraphEnumerable
+  //   sees a tiny totalNodes with no orphan flag -> GraphRetrieval enumerates
+  //   the whole scope -> frame past the ws 100 MiB maxPayload -> RangeError,
+  //   close 1009 -> worker dies -> repeat.
+  //
+  // Read it here directly so the two cases stay distinguishable. A FAILED
+  // read stamps resetAt (what mem::graph-reset does) so hasOrphanRows keeps
+  // enumeration closed until a rebuild re-counts. A genuinely ABSENT
+  // snapshot is a cold start with nothing on disk, so it stays unmarked and
+  // graph-query BFS keeps working.
+  let existingSnap: GraphSnapshot | null = null;
+  let snapshotReadFailed = false;
+  try {
+    const raw = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
+    if (raw && typeof raw === "object" && raw.version === 1) existingSnap = raw;
+  } catch (err) {
+    snapshotReadFailed = true;
+    logger.warn("Graph snapshot read failed, bootstrapping as orphaned", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  const snap =
+    existingSnap ??
+    (snapshotReadFailed
+      ? { ...emptySnapshot(), resetAt: new Date().toISOString() }
+      : emptySnapshot());
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
