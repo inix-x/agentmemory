@@ -1,6 +1,7 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
+import { listBoundedOrSkip } from "../state/scope-size.js";
 import type {
   Insight,
   GraphNode,
@@ -174,9 +175,9 @@ export function registerReflectFunctions(
 
       const [graph, semanticMemories, lessons, crystals] = await Promise.all([
         listGraphScopes(kv, "mem::reflect"),
-        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-        kv.list<Lesson>(KV.lessons).catch(() => []),
-        kv.list<Crystal>(KV.crystals).catch(() => []),
+        listBoundedOrSkip<SemanticMemory>(kv, KV.semantic, "mem::reflect"),
+        listBoundedOrSkip<Lesson>(kv, KV.lessons, "mem::reflect"),
+        listBoundedOrSkip<Crystal>(kv, KV.crystals, "mem::reflect"),
       ]);
 
       let activeLessons = lessons.filter((l) => !l.deleted);

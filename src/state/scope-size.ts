@@ -1,5 +1,6 @@
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
+import { logger } from "../logger.js";
 import {
   SAFE_PAYLOAD_BYTES,
   oversizedPayloadError,
@@ -163,4 +164,47 @@ export function isOversized<T>(
   result: T[] | OversizedPayload,
 ): result is OversizedPayload {
   return !Array.isArray(result) && (result as OversizedPayload).oversized === true;
+}
+
+/**
+ * listBounded for background jobs (reflect, retention, export-import).
+ *
+ * These callers already degrade on failure — most wrap the read in
+ * `.catch(() => [])` — so the drop-in shape is an array, not a union. What
+ * they must NOT do is take the worker down: an hourly job that enumerates
+ * a 38.5 MB scope stalls the event loop, the engine declares the worker
+ * dead, and every in-flight HTTP request dies with it. Seven such events
+ * cost 53 observations in four hours.
+ *
+ * Over the ceiling, skip the scope and warn loudly. Skipping degrades one
+ * job for one cycle; enumerating takes down the whole service.
+ */
+export async function listBoundedOrSkip<T>(
+  kv: StateKV,
+  scope: string,
+  caller: string,
+): Promise<T[]> {
+  const result = await listBounded<T>(
+    kv,
+    scope,
+    `${caller} skipped this scope`,
+  ).catch((error) => {
+    logger.warn("Background scope read failed", {
+      caller,
+      scope,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [] as T[];
+  });
+  if (isOversized(result)) {
+    logger.warn("Background scope enumeration refused", {
+      caller,
+      scope,
+      bytes: result.bytes,
+      limitBytes: result.limitBytes,
+      hint: "trim the scope or narrow the job; skipping it this cycle",
+    });
+    return [] as T[];
+  }
+  return result;
 }
