@@ -1,5 +1,6 @@
 import type { AuditEntry } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
+import { listBounded, isOversized } from "../state/scope-size.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 
@@ -86,7 +87,19 @@ export async function queryAudit(
     limit?: number;
   },
 ): Promise<AuditEntry[]> {
-  const all = await kv.list<AuditEntry>(KV.audit);
+  // The limit below is applied AFTER this read, so it bounds the response
+  // and not the enumeration. On a large audit scope that inbound frame is
+  // what stalls the worker heartbeat, which is why /agentmemory/audit was
+  // the second-worst 5xx source in production. Refuse rather than pay it.
+  const listed = await listBounded<AuditEntry>(
+    kv,
+    KV.audit,
+    "narrow with ?operation, or trim the audit scope; it is too large to enumerate",
+  );
+  if (isOversized(listed)) {
+    throw new Error(listed.error);
+  }
+  const all = listed;
   let entries = [...all].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );

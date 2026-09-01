@@ -38,6 +38,12 @@ export const KV = {
   graphNameIndex: "mem:graph:name-index",
   graphEdgeKey: "mem:graph:edge-key",
   graphNodeDegree: "mem:graph:node-degree",
+  // Byte cost of the last successful kv.list per scope, so a read can be
+  // refused before it is paid for. graph.ts sizes itself from the
+  // snapshot's totalNodes; every other scope has no count, and an
+  // over-large list blocks the worker event loop long enough for the
+  // engine to declare it dead (see scope-size.ts).
+  scopeSize: "mem:scope-size",
   semantic: "mem:semantic",
   procedural: "mem:procedural",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,
