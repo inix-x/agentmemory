@@ -1212,7 +1212,13 @@ export function registerGraphFunction(
       const forceRebuild = data?.force === true;
       try {
         const enumeration = await checkGraphEnumerable(kv);
-        if (!enumeration.enumerable && !forceRebuild) {
+        // force is an operator opt-in for a corpus they believe is small.
+        // It must NOT bypass a scope the snapshot has already sized past
+        // the byte budget: that read is rejected at the ws frame length
+        // header and kills the worker, which no `force` can consent to on
+        // behalf of every other in-flight request.
+        const overByteBudget = enumeration.blockedScope !== null;
+        if (!enumeration.enumerable && (!forceRebuild || overByteBudget)) {
           logger.warn("Graph snapshot rebuild refused", {
             totalNodes: enumeration.totalNodes,
             totalEdges: enumeration.totalEdges,
@@ -1246,8 +1252,21 @@ export function registerGraphFunction(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn("Graph snapshot pre-flight read failed", { error: msg });
-        // Fall through; the user passed force=true or the snapshot
-        // read itself failed (separate problem).
+        // Fail closed. Falling through here reaches the raw kv.list below,
+        // and an unsized graph scope is exactly the read that kills the
+        // worker. A failed pre-flight means we do not know the size, which
+        // is not permission to attempt it.
+        return {
+          success: false,
+          preflightFailed: true,
+          error:
+            `Rebuild refused: graph size pre-flight failed (${msg}). ` +
+            "Rebuild would call kv.list on KV.graphNodes/Edges, whose " +
+            "response frame is rejected at its length header once the " +
+            "scope is large enough, killing the worker. Retry once the " +
+            "snapshot is readable, or call POST /agentmemory/graph/reset " +
+            "to drop into incremental-only mode.",
+        };
       }
 
       try {
