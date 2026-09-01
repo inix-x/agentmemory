@@ -7,6 +7,8 @@ import type {
   Session,
   GraphSnapshot,
 } from "../types.js";
+import { isOversized } from "../state/scope-size.js";
+import type { OversizedPayload } from "../state/frame-guard.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -576,16 +578,23 @@ export function registerMcpEndpoints(
 
           case "memory_audit": {
             try {
-              const result = await sdk.trigger({ function_id: "mem::audit-query", payload: {
+              const result = await sdk.trigger<
+                Record<string, unknown>,
+                import("../types.js").AuditEntry[] | OversizedPayload
+              >({ function_id: "mem::audit-query", payload: {
                 operation: args.operation as string,
                 limit: typeof args.limit === "number" ? args.limit : 50,
               } });
+              // mem::audit-query returns the refusal instead of throwing, so
+              // the catch below no longer covers it; flag it explicitly or a
+              // refusal renders as an ordinary successful result.
               return {
                 status_code: 200,
                 body: {
                   content: [
                     { type: "text", text: JSON.stringify(result, null, 2) },
                   ],
+                  ...(isOversized(result) ? { isError: true } : {}),
                 },
               };
             } catch {

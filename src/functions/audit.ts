@@ -1,6 +1,7 @@
 import type { AuditEntry } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import { listBounded, isOversized } from "../state/scope-size.js";
+import type { OversizedPayload } from "../state/frame-guard.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 
@@ -86,7 +87,7 @@ export async function queryAudit(
     dateTo?: string;
     limit?: number;
   },
-): Promise<AuditEntry[]> {
+): Promise<AuditEntry[] | OversizedPayload> {
   // The limit below is applied AFTER this read, so it bounds the response
   // and not the enumeration. On a large audit scope that inbound frame is
   // what stalls the worker heartbeat, which is why /agentmemory/audit was
@@ -97,7 +98,13 @@ export async function queryAudit(
     "narrow with ?operation, or trim the audit scope; it is too large to enumerate",
   );
   if (isOversized(listed)) {
-    throw new Error(listed.error);
+    // Hand the refusal back rather than throwing it. The comment above
+    // dates from when this was the second-worst 5xx source; once the
+    // other sources were fixed it became the largest by far, 125 of 136
+    // 5xx per hour, every one a correct refusal reported as a server
+    // fault. Callers must branch on isOversized(); see the contract on
+    // listBounded in state/scope-size.ts.
+    return listed;
   }
   const all = listed;
   let entries = [...all].sort(
