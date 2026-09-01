@@ -22,10 +22,17 @@ import { registerMcpEndpoints } from "../src/mcp/server.js";
 // 413 the way api::mesh-export already does."
 //
 // This test drives the real chain — api::audit -> sdk.trigger ->
-// mem::audit-query -> queryAudit -> listBounded — rather than asserting
-// on the source text, because the thing most likely to break is the
-// OversizedPayload surviving the sdk.trigger hop with `oversized: true`
-// intact. A regex test over api.ts cannot fail when that breaks.
+// mem::audit-query -> queryAudit -> listBounded -> the 413 branch —
+// rather than asserting on the source text, so a break anywhere in that
+// wiring fails here. Every other api-level test in this repo greps
+// api.ts as a string, which cannot fail when the wiring breaks.
+//
+// What it does NOT cover: the mock's trigger hands the object straight
+// back by reference, so nothing here exercises serialization across the
+// real engine boundary. That the boundary preserves a plain object is
+// evidenced in production code instead — api::session::start reads
+// contextResult.context off a mem::context result (api.ts) on every
+// session start.
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -43,13 +50,6 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
-    },
-    update: async <T>(scope: string, key: string, fn: (v: T) => T): Promise<T> => {
-      const cur = store.get(scope)?.get(key) as T;
-      const next = fn(cur);
-      if (!store.has(scope)) store.set(scope, new Map());
-      store.get(scope)!.set(key, next);
-      return next;
     },
   };
 }
@@ -100,41 +100,21 @@ describe("/agentmemory/audit answers 413 on an oversized audit scope", () => {
     return (await fn!({ query_params: { limit: "5" } })) as Response;
   }
 
-  it("returns 413, not 500, when the audit scope is over the ceiling", async () => {
+  it("returns 413 carrying the refusal, not 500, when the scope is over the ceiling", async () => {
     // Exactly how production is: the scope size is already recorded over
     // the ceiling, so listBounded refuses before doing any kv.list.
-    await kv.set(KV.scopeSize, KV.audit, {
-      rows: 1,
-      bytes: SAFE_ENUMERATION_BYTES + 1,
-      measuredAt: new Date().toISOString(),
-    });
+    await oversizeAuditScope();
 
     const res = await callAudit();
+    const body = res.body as { bytes?: number; limitBytes?: number };
 
     expect(res.status_code).toBe(413);
-  });
-
-  it("the 413 body carries the refusal, so the caller learns why", async () => {
-    await kv.set(KV.scopeSize, KV.audit, {
-      rows: 1,
-      bytes: SAFE_ENUMERATION_BYTES + 1,
-      measuredAt: new Date().toISOString(),
-    });
-
-    const res = await callAudit();
-    const body = res.body as {
-      oversized?: boolean;
-      error?: string;
-      bytes?: number;
-      limitBytes?: number;
-    };
-
-    // oversized:true surviving the sdk.trigger hop is the load-bearing
-    // part — isOversized() in api.ts keys off exactly this field.
-    expect(body.oversized).toBe(true);
+    // Not asserted: body.oversized and typeof body.error. Neither can
+    // fail while the 413 above passes — api.ts returns the same object it
+    // ran isOversized() on, and isOversized IS `oversized === true`.
+    // bytes/limitBytes are independent, so they are worth asserting.
     expect(body.bytes).toBeGreaterThan(SAFE_ENUMERATION_BYTES);
     expect(body.limitBytes).toBe(SAFE_ENUMERATION_BYTES);
-    expect(typeof body.error).toBe("string");
   });
 
   it("still answers 200 when the scope is within the ceiling", async () => {
