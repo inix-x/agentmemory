@@ -7,6 +7,8 @@ import type {
   Session,
   GraphSnapshot,
 } from "../types.js";
+import { isOversized } from "../state/scope-size.js";
+import type { OversizedPayload } from "../state/frame-guard.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -580,6 +582,24 @@ export function registerMcpEndpoints(
                 operation: args.operation as string,
                 limit: typeof args.limit === "number" ? args.limit : 50,
               } });
+              // mem::audit-query returns the refusal instead of throwing
+              // when the audit scope is over the enumeration ceiling, so
+              // the catch below no longer covers it. Without this branch a
+              // refusal would render as an ordinary successful result.
+              if (isOversized(result as never)) {
+                return {
+                  status_code: 200,
+                  body: {
+                    content: [
+                      {
+                        type: "text",
+                        text: (result as unknown as OversizedPayload).error,
+                      },
+                    ],
+                    isError: true,
+                  },
+                };
+              }
               return {
                 status_code: 200,
                 body: {

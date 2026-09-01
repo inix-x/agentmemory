@@ -2,7 +2,7 @@ import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
-import { checkPayloadFrameSize } from "../state/frame-guard.js";
+import { checkPayloadFrameSize, type OversizedPayload } from "../state/frame-guard.js";
 import { listBounded, isOversized } from "../state/scope-size.js";
 import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
@@ -1835,10 +1835,23 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const parsedLimit = parseOptionalInt(req.query_params?.["limit"]);
-      const entries = await sdk.trigger({ function_id: "mem::audit-query", payload: {
+      // Payload stays loosely typed: query_params values are
+      // `string | string[]`, and narrowing them here is a separate concern
+      // from this fix. Only the RESULT type matters, so isOversized can
+      // discriminate it.
+      const entries = await sdk.trigger<
+        Record<string, unknown>,
+        import("../types.js").AuditEntry[] | OversizedPayload
+      >({ function_id: "mem::audit-query", payload: {
         operation: req.query_params?.["operation"],
         limit: parsedLimit ?? 50,
       } });
+      // The audit scope can be over the enumeration ceiling, in which case
+      // mem::audit-query hands back the refusal rather than rows. Answer
+      // 413 like the other bounded reads do; this used to escape as a 500.
+      if (isOversized(entries)) {
+        return { status_code: 413, body: entries };
+      }
       return { status_code: 200, body: { entries, success: true } };
     },
   );
