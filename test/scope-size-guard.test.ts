@@ -20,6 +20,9 @@ function mockKV() {
       store.get(scope)!.set(key, data);
       return data;
     },
+    delete: async (scope: string, key: string) => {
+      store.get(scope)?.delete(key);
+    },
     list: async <T>(scope: string): Promise<T[]> => {
       listCalls.push(scope);
       const m = store.get(scope);
@@ -119,5 +122,53 @@ describe("scope-size guard (#814 pattern, non-graph scopes)", () => {
     const again = await listBounded(kv as never, KV.audit, HINT);
     expect(isOversized(again)).toBe(true);
     expect(kv.listCalls.length).toBe(before);
+  });
+
+  it("refuses a scope whose reads keep killing the worker before anything is recorded", async () => {
+    // The case the size record alone cannot see. A payload big enough to
+    // stall the heartbeat gets the invocation stopped mid-flight, so
+    // recordScopeSize never runs and the scope stays unmeasured. Simulated
+    // here by a list() that never returns normally.
+    const kv = mockKV();
+    const dead = {
+      ...kv,
+      list: async (scope: string) => {
+        kv.listCalls.push(scope);
+        throw new Error("Invocation stopped");
+      },
+    };
+
+    // Attempt 1: unguarded cold read, dies.
+    await expect(
+      listBounded(dead as never, KV.semantic, HINT),
+    ).rejects.toThrow(/Invocation stopped/);
+    // Attempt 2: one retry is tolerated (could have been a deploy), dies.
+    await expect(
+      listBounded(dead as never, KV.semantic, HINT),
+    ).rejects.toThrow(/Invocation stopped/);
+
+    const readsBefore = kv.listCalls.length;
+
+    // Attempt 3: refuses WITHOUT reading. Without the attempt marker this
+    // would kill the worker again, forever.
+    const result = await listBounded(dead as never, KV.semantic, HINT);
+    expect(isOversized(result)).toBe(true);
+    expect(kv.listCalls.length).toBe(readsBefore);
+    if (isOversized(result)) {
+      expect(result.error).toMatch(/never completed/i);
+    }
+  });
+
+  it("clears the attempt marker after a read that survives", async () => {
+    const kv = mockKV();
+    seedRows(kv, KV.lessons, 2);
+
+    await listBounded(kv as never, KV.lessons, HINT);
+    const marker = await kv.get(KV.scopeSize, `attempt:${KV.lessons}`);
+    expect(marker).toBeNull();
+
+    // A healthy scope stays readable indefinitely.
+    const again = await listBounded(kv as never, KV.lessons, HINT);
+    expect(isOversized(again)).toBe(false);
   });
 });

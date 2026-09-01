@@ -77,6 +77,33 @@ export async function recordScopeSize(
     .catch(() => undefined);
 }
 
+export type ReadAttempt = {
+  attempts: number;
+  startedAt: string;
+};
+
+const attemptKey = (scope: string) => `attempt:${scope}`;
+
+// Tolerate exactly one unfinished read, so a deploy or OOM that happens to
+// land mid-enumeration does not blacklist a healthy scope.
+const MAX_UNFINISHED_ATTEMPTS = 1;
+
+function unfinishedReadError(
+  scope: string,
+  attempts: number,
+  hint: string,
+): OversizedPayload {
+  return {
+    success: false,
+    error:
+      `Refusing to enumerate ${scope}: ${attempts} previous read(s) never completed, ` +
+      `which is what a payload large enough to stall the worker looks like; ${hint}`,
+    oversized: true,
+    bytes: 0,
+    limitBytes: SAFE_ENUMERATION_BYTES,
+  };
+}
+
 /**
  * kv.list, but refuses when the last measured size of the scope is over
  * the ceiling. Returns OversizedPayload instead of throwing so callers can
@@ -93,10 +120,33 @@ export async function listBounded<T>(
     return oversizedPayloadError(known.bytes, hint);
   }
 
+  // The size record alone cannot learn about the reads that matter most.
+  // A payload big enough to stall the heartbeat gets the worker declared
+  // dead mid-invocation, so execution never reaches recordScopeSize below
+  // and the scope stays unmeasured — every later call repeats the kill.
+  // An unfinished attempt is therefore the signal, and it has to be
+  // written BEFORE the read.
+  //
+  // One unfinished attempt is tolerated so an unrelated restart (deploy,
+  // OOM) does not permanently refuse a healthy scope. Two means the read
+  // itself is what does not survive.
+  const attemptK = attemptKey(scope);
+  const prior = await kv.get<ReadAttempt>(KV.scopeSize, attemptK).catch(() => null);
+  const unfinished = typeof prior?.attempts === "number" ? prior.attempts : 0;
+  if (unfinished > MAX_UNFINISHED_ATTEMPTS) {
+    return unfinishedReadError(scope, unfinished, hint);
+  }
+  await kv
+    .set<ReadAttempt>(KV.scopeSize, attemptK, {
+      attempts: unfinished + 1,
+      startedAt: new Date().toISOString(),
+    })
+    .catch(() => undefined);
+
   const rows = await kv.list<T>(scope);
 
-  // Measure what it actually cost so the next call is guarded even when
-  // this one was a cold miss.
+  // Survived, so clear the marker and record what it actually cost.
+  await kv.delete(KV.scopeSize, attemptK).catch(() => undefined);
   const bytes = payloadByteLength(rows);
   await recordScopeSize(kv, scope, rows.length, bytes);
 
