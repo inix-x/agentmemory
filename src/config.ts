@@ -381,6 +381,25 @@ export function getAuditRetentionMonths(): number {
   return n >= 1 ? n : 3;
 }
 
+// Observation retention (U5 of the memory-reduction ladder). The defaults are
+// today's hardcoded values, so a deploy with the env unset changes nothing; the
+// deletion policy is Omar's to set from the dry-run counts, not this code's
+// (R5, OQ1). A cap of 0 stops deletion outright and is the named rollback.
+export function getObsRetentionDays(): number {
+  const n = safeParseInt(getMergedEnv()["OBS_RETENTION_DAYS"], 180);
+  return n >= 1 ? n : 180;
+}
+
+export function getObsRetentionMaxImportance(): number {
+  const n = safeParseInt(getMergedEnv()["OBS_RETENTION_MAX_IMPORTANCE"], 2);
+  return n >= 0 ? n : 2;
+}
+
+export function getObsRetentionMaxPerRun(): number {
+  const n = safeParseInt(getMergedEnv()["OBS_RETENTION_MAX_PER_RUN"], 500);
+  return n >= 0 ? n : 500;
+}
+
 export function isGraphExtractionEnabled(): boolean {
   return getMergedEnv()["GRAPH_EXTRACTION_ENABLED"] === "true";
 }
