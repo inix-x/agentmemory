@@ -6,9 +6,28 @@ import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
+import {
+  getObsRetentionDays,
+  getObsRetentionMaxImportance,
+  getObsRetentionMaxPerRun,
+} from "../config.js";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const CONTRADICTION_THRESHOLD = 0.9;
+
+// Observation retention (U5). A session qualifies by when it was last touched,
+// never by status: `completed` flips on every turn and observations keep
+// appending after it, so status says nothing about whether a session is done.
+// The most recent of updatedAt and endedAt is the last-touched stamp; a session
+// predating both fields falls back to startedAt, the way session-sweep already
+// does, so the oldest sessions are not immune to retention by being old.
+function lastTouched(session: Session): number {
+  const stamps = [session.updatedAt, session.endedAt, session.startedAt]
+    .filter((s): s is string => typeof s === "string")
+    .map((s) => new Date(s).getTime())
+    .filter((t) => Number.isFinite(t));
+  return stamps.length > 0 ? Math.max(...stamps) : 0;
+}
 
 interface AutoForgetResult {
   ttlExpired: string[];
@@ -18,6 +37,8 @@ interface AutoForgetResult {
     similarity: number;
   }>;
   lowValueObs: string[];
+  // Eligible rows the per-run cap did not reach. The next run picks them up.
+  lowValueRemaining: number;
   dryRun: boolean;
 }
 
@@ -32,6 +53,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
         ttlExpired: [],
         contradictions: [],
         lowValueObs: [],
+        lowValueRemaining: 0,
         dryRun,
       };
 
@@ -157,37 +179,59 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
         );
         obsPerSession.push(...results);
       }
+      const retentionMs = getObsRetentionDays() * MS_PER_DAY;
+      const maxImportance = getObsRetentionMaxImportance();
+      const maxPerRun = getObsRetentionMaxPerRun();
+      const cutoff = now - retentionMs;
+      // One audit row per run, per the bulk-deletion shape audit.ts requires.
+      // Per-item rows flooded the log during routine sweeps -- and were the
+      // majority of what pushed mem:audit over the enumeration guard.
+      const deletedObs: string[] = [];
       for (let i = 0; i < sessions.length; i++) {
+        // The whole session has to be idle, not just the row. Deleting from a
+        // session that later gets a turn makes events.ts re-extract the rest
+        // once; the idle threshold makes that rare and the cap bounds it.
+        if (lastTouched(sessions[i]) > cutoff) continue;
         for (const obs of obsPerSession[i]) {
           if (!obs.timestamp) continue;
-          const age = now - new Date(obs.timestamp).getTime();
-          if (age > 180 * MS_PER_DAY && (obs.importance ?? 5) <= 2) {
-            result.lowValueObs.push(obs.id);
-            if (!dryRun) {
-              let deletedOk = false;
-              try {
-                await kv.delete(KV.observations(sessions[i].id), obs.id);
-                deletedOk = true;
-              } catch {
-                deletedOk = false;
+          if (new Date(obs.timestamp).getTime() > cutoff) continue;
+          // A row with no importance never had a score: a synthetic
+          // compression, not a judged-unimportant one. Keep it.
+          if (obs.importance === undefined || obs.importance > maxImportance) continue;
+          if (result.lowValueObs.length >= maxPerRun) {
+            result.lowValueRemaining++;
+            continue;
+          }
+          result.lowValueObs.push(obs.id);
+          if (!dryRun) {
+            let deletedOk = false;
+            try {
+              await kv.delete(KV.observations(sessions[i].id), obs.id);
+              deletedOk = true;
+            } catch {
+              deletedOk = false;
+            }
+            if (deletedOk) {
+              if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+              if (obs.imageRef && obs.imageRef !== obs.imageData) {
+                await decrementImageRef(kv, sdk, obs.imageRef);
               }
-              if (deletedOk) {
-                if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-                if (obs.imageRef && obs.imageRef !== obs.imageData) {
-                  await decrementImageRef(kv, sdk, obs.imageRef);
-                }
-                await recordAudit(kv, "delete", "mem::auto-forget", [obs.id], {
-                  resource: "observation",
-                  reason: "auto-forget low-value observation",
-                  sessionId: sessions[i].id,
-                  timestamp: obs.timestamp,
-                });
-                getSearchIndex().remove(obs.id);
-                vectorIndexRemove(obs.id);
-              }
+              deletedObs.push(obs.id);
+              getSearchIndex().remove(obs.id);
+              vectorIndexRemove(obs.id);
             }
           }
         }
+      }
+      if (deletedObs.length > 0) {
+        await recordAudit(kv, "delete", "mem::auto-forget", deletedObs, {
+          resource: "observation",
+          reason: "auto-forget low-value observation",
+          evicted: deletedObs.length,
+          remaining: result.lowValueRemaining,
+          retentionDays: getObsRetentionDays(),
+          maxImportance,
+        });
       }
 
       if (!dryRun && (result.ttlExpired.length > 0 || result.lowValueObs.length > 0)) {
@@ -198,6 +242,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
         ttlExpired: result.ttlExpired.length,
         contradictions: result.contradictions.length,
         lowValueObs: result.lowValueObs.length,
+        lowValueRemaining: result.lowValueRemaining,
         dryRun,
       });
       return result;
