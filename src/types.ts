@@ -345,6 +345,7 @@ export interface ExportData {
   profiles?: ProjectProfile[];
   graphNodes?: GraphNode[];
   graphEdges?: GraphEdge[];
+  graphBatches?: GraphBatch[];
   semanticMemories?: SemanticMemory[];
   proceduralMemories?: ProceduralMemory[];
   actions?: Action[];
@@ -407,12 +408,25 @@ export type GraphNodeType =
   | "organization"
   | "event";
 
+// Provenance for LLM-extracted graph rows. Every node and edge in a batch used
+// to be stamped with the whole batch's observation ids, and merges unioned those
+// lists forever, so bytes per row grew with every extraction that touched it.
+// One row per batch instead, linear in observations. A graph row then carries
+// the batch id, and readers resolve a row's observation ids as
+// sourceObservationIds plus the union of its batches' -- both shapes, always.
+export interface GraphBatch {
+  id: string;
+  observationIds: string[];
+  createdAt: string;
+}
+
 export interface GraphNode {
   id: string;
   type: GraphNodeType;
   name: string;
   properties: Record<string, unknown>;
   sourceObservationIds: string[];
+  sourceBatchIds?: string[];
   createdAt: string;
   updatedAt?: string;
   aliases?: string[];
@@ -444,6 +458,7 @@ export interface GraphEdge {
   targetNodeId: string;
   weight: number;
   sourceObservationIds: string[];
+  sourceBatchIds?: string[];
   createdAt: string;
   tcommit?: string;
   tvalid?: string;

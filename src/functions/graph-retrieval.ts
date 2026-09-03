@@ -4,6 +4,7 @@ import type {
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { listGraphScopes } from "./graph.js";
+import { resolveGraphObservationIds } from "./graph-provenance.js";
 
 export interface GraphRetrievalResult {
   obsId: string;
@@ -41,14 +42,20 @@ function buildGraphContext(
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
-  private async loadGraph(
-    caller: string,
-  ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
+  // `obsIds` is provenance resolved across both shapes -- inline ids and batch
+  // ids -- keyed by row id. Every read of a node's observations below goes
+  // through it rather than the raw field, so a batch-mode row is indistinguishable
+  // from a legacy one to the traversal.
+  private async loadGraph(caller: string): Promise<{
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    obsIds: Map<string, string[]>;
+  }> {
     const graph = await listGraphScopes(this.kv, caller);
-    return {
-      nodes: graph.nodes.filter((n) => !n.stale),
-      edges: graph.edges.filter((e) => !e.stale),
-    };
+    const nodes = graph.nodes.filter((n) => !n.stale);
+    const edges = graph.edges.filter((e) => !e.stale);
+    const obsIds = await resolveGraphObservationIds(this.kv, nodes);
+    return { nodes, edges, obsIds };
   }
 
   async searchByEntities(
@@ -56,9 +63,8 @@ export class GraphRetrieval {
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
-      "GraphRetrieval.searchByEntities",
-    );
+    const { nodes: allNodes, edges: allEdges, obsIds: obsOf } =
+      await this.loadGraph("GraphRetrieval.searchByEntities");
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -84,7 +90,7 @@ export class GraphRetrieval {
 
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
-        for (const obsId of lastNode.sourceObservationIds) {
+        for (const obsId of obsOf.get(lastNode.id) ?? []) {
           if (visitedObs.has(obsId)) continue;
           visitedObs.add(obsId);
 
@@ -108,7 +114,7 @@ export class GraphRetrieval {
         }
       }
 
-      for (const obsId of startNode.sourceObservationIds) {
+      for (const obsId of obsOf.get(startNode.id) ?? []) {
         if (visitedObs.has(obsId)) continue;
         visitedObs.add(obsId);
         results.push({
@@ -130,12 +136,11 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
-      "GraphRetrieval.expandFromChunks",
-    );
+    const { nodes: allNodes, edges: allEdges, obsIds: obsOf } =
+      await this.loadGraph("GraphRetrieval.expandFromChunks");
 
     const linkedNodes = allNodes.filter((n) =>
-      n.sourceObservationIds.some((id) => obsIds.includes(id)),
+      (obsOf.get(n.id) ?? []).some((id) => obsIds.includes(id)),
     );
 
     const results: GraphRetrievalResult[] = [];
@@ -145,7 +150,7 @@ export class GraphRetrieval {
       const paths = this.dijkstraTraversal(node, allNodes, allEdges, maxDepth);
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
-        for (const obsId of lastNode.sourceObservationIds) {
+        for (const obsId of obsOf.get(lastNode.id) ?? []) {
           if (visitedObs.has(obsId)) continue;
           visitedObs.add(obsId);
 
@@ -178,6 +183,8 @@ export class GraphRetrieval {
     const { nodes: allNodes, edges: allEdges } = await this.loadGraph(
       "GraphRetrieval.temporalQuery",
     );
+    // temporalQuery reads entity names and edge validity only; it never
+    // touches observation ids, so the resolved map goes unused here.
 
     const entity = allNodes.find(
       (n) => n.name.toLowerCase() === entityName.toLowerCase(),

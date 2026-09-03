@@ -38,6 +38,10 @@ export const KV = {
   graphNameIndex: "mem:graph:name-index",
   graphEdgeKey: "mem:graph:edge-key",
   graphNodeDegree: "mem:graph:node-degree",
+  // One row per LLM extraction, mapping a batch id to its observation ids, so
+  // a graph row can carry the batch id instead of the whole list. Linear in
+  // observations where the per-row arrays were N times M.
+  graphBatches: "mem:graph:batches",
   // Byte cost of the last successful kv.list per scope, so a read can be
   // refused before it is paid for. graph.ts sizes itself from the
   // snapshot's totalNodes; every other scope has no count, and an

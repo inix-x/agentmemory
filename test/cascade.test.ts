@@ -12,11 +12,25 @@ describe("Cascade Update Function", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     sdk = mockSdk();
     kv = mockKV();
     vi.clearAllMocks();
     registerCascadeFunction(sdk as never, kv as never);
+    // Cascade now reads the graph through the enumeration guard instead of a
+    // raw kv.list, and the guard refuses a corpus no snapshot vouches for. Seed
+    // the snapshot persistGraphDelta would have written -- the same fixture
+    // graph-retrieval.test.ts carries for the same reason. Counts are
+    // deliberately non-zero: the guard sizes itself from totalNodes.
+    await kv.set("mem:graph:snapshot", "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: { totalNodes: 2, totalEdges: 2, nodesByType: {}, edgesByType: {} },
+      updatedAt: "2026-03-01T00:00:00Z",
+      dirty: false,
+    });
   });
 
   it("returns error when supersededMemoryId is missing", async () => {

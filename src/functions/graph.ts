@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type {
   GraphNode,
   GraphEdge,
+  GraphBatch,
   GraphQueryResult,
   GraphSnapshot,
   CompressedObservation,
@@ -13,7 +14,7 @@ import {
   GRAPH_EXTRACTION_SYSTEM,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
-import { isGraphExtractionEnabled } from "../config.js";
+import { isGraphExtractionEnabled, getGraphProvenanceMode } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 
@@ -24,6 +25,13 @@ import { logger } from "../logger.js";
 // fan out faster than nodes.
 const DEFAULT_GRAPH_QUERY_LIMIT = 500;
 const MAX_GRAPH_QUERY_LIMIT = 5000;
+
+// topNodes has always been capped and evicted; topEdges was appended to
+// without bound, so the snapshot -- read on every viewer tab load -- grew with
+// every edge whose endpoints happened to both be top nodes. Sized like
+// topNodes: a full top-N subgraph rarely carries more edges than nodes times a
+// small constant, and past that the lowest-weight edge is the one to lose.
+const SNAPSHOT_TOP_EDGES = DEFAULT_GRAPH_QUERY_LIMIT * 2;
 
 // #814: the precomputed snapshot covers the top-degree subgraph used by
 // the empty-body / nodeType-only branch — the path the viewer hits on
@@ -459,42 +467,66 @@ function snapshotPushEdgeIfBothInTop(
   const topIds = new Set(snap.topNodes.map((n) => n.id));
   if (topIds.has(edge.sourceNodeId) && topIds.has(edge.targetNodeId)) {
     // Dedupe in case the same edge gets pushed twice.
-    if (!snap.topEdges.find((e) => e.id === edge.id)) {
-      snap.topEdges.push(edge);
+    if (snap.topEdges.find((e) => e.id === edge.id)) return;
+    if (snap.topEdges.length >= SNAPSHOT_TOP_EDGES) {
+      // Evict the lowest-weight edge, but only if the incoming one beats it;
+      // otherwise the cap holds and the new edge simply is not cached.
+      let minIdx = 0;
+      for (let i = 1; i < snap.topEdges.length; i++) {
+        if (snap.topEdges[i]!.weight < snap.topEdges[minIdx]!.weight) minIdx = i;
+      }
+      if (snap.topEdges[minIdx]!.weight >= edge.weight) return;
+      snap.topEdges.splice(minIdx, 1);
     }
+    snap.topEdges.push(edge);
   }
+}
+
+// In legacy mode a merge unions the whole batch's observation ids into the row
+// and the arrays grow forever. In batch mode a merge unions one batch id
+// instead and leaves the inline array as it was, so a row that was written in
+// legacy mode keeps its legacy ids and merely gains a batch id on top -- both
+// shapes stay resolvable and nothing is rewritten.
+function unionIds(...lists: Array<string[] | undefined>): string[] {
+  return [...new Set(lists.flatMap((l) => l ?? []))];
 }
 
 function mergeNode(
   existing: GraphNode,
   incoming: GraphNode,
   obsIds: string[],
+  batchId: string | null,
   capturedAt: string,
 ): GraphNode {
-  return {
+  const merged: GraphNode = {
     ...existing,
-    sourceObservationIds: [
-      ...new Set([
-        ...existing.sourceObservationIds,
-        ...incoming.sourceObservationIds,
-        ...obsIds,
-      ]),
-    ],
     properties: { ...existing.properties, ...incoming.properties },
     updatedAt: capturedAt,
   };
+  if (batchId) {
+    merged.sourceBatchIds = unionIds(existing.sourceBatchIds, [batchId]);
+  } else {
+    merged.sourceObservationIds = unionIds(
+      existing.sourceObservationIds,
+      incoming.sourceObservationIds,
+      obsIds,
+    );
+  }
+  return merged;
 }
 
 function mergeEdge(
   existing: GraphEdge,
   obsIds: string[],
+  batchId: string | null,
 ): GraphEdge {
-  return {
-    ...existing,
-    sourceObservationIds: [
-      ...new Set([...existing.sourceObservationIds, ...obsIds]),
-    ],
-  };
+  const merged: GraphEdge = { ...existing };
+  if (batchId) {
+    merged.sourceBatchIds = unionIds(existing.sourceBatchIds, [batchId]);
+  } else {
+    merged.sourceObservationIds = unionIds(existing.sourceObservationIds, obsIds);
+  }
+  return merged;
 }
 
 function resolvePagination(
@@ -569,9 +601,13 @@ function parseAttrs(raw: string): Record<string, string> {
   return attrs;
 }
 
+// LLM-extracted rows carry the whole batch's provenance because the model
+// answers for the batch as a unit, not per observation. With a batch id that is
+// one small array instead of N ids copied onto every row.
 function parseGraphXml(
   xml: string,
   observationIds: string[],
+  batchId: string | null,
 ): {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -579,6 +615,9 @@ function parseGraphXml(
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const now = new Date().toISOString();
+  const provenance = batchId
+    ? { sourceObservationIds: [] as string[], sourceBatchIds: [batchId] }
+    : { sourceObservationIds: observationIds };
 
   // Two passes because <entity> can be self-closing or have a body
   // (<property> children). The self-closing form needs `[^>]*[^/]` on
@@ -604,7 +643,7 @@ function parseGraphXml(
       type,
       name,
       properties,
-      sourceObservationIds: observationIds,
+      ...provenance,
       createdAt: now,
     });
   };
@@ -636,7 +675,7 @@ function parseGraphXml(
       sourceNodeId: sourceNode.id,
       targetNodeId: targetNode.id,
       weight: Math.max(0, Math.min(1, weight)),
-      sourceObservationIds: observationIds,
+      ...provenance,
       createdAt: now,
     });
   }
@@ -746,6 +785,9 @@ export async function persistGraphDelta(
   nodes: GraphNode[],
   edges: GraphEdge[],
   obsIds: string[],
+  // Null means legacy provenance: merges union observation ids as they always
+  // have. A batch id means merges union that id instead.
+  batchId: string | null = null,
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
   // readSnapshot() collapses two different situations into null: "no
   // snapshot yet" and "the read failed" (it catches and logs). Bootstrapping
@@ -817,7 +859,7 @@ export async function persistGraphDelta(
 
     if (existing) {
       idRemap.set(node.id, existing.id);
-      const merged = mergeNode(existing, node, obsIds, capturedAt);
+      const merged = mergeNode(existing, node, obsIds, batchId, capturedAt);
       await kv.set(KV.graphNodes, existing.id, merged);
       // Update topNodes entry if present so a stale clone isn't
       // returned from the snapshot fast path.
@@ -867,7 +909,7 @@ export async function persistGraphDelta(
     }
 
     if (existing) {
-      const merged = mergeEdge(existing, obsIds);
+      const merged = mergeEdge(existing, obsIds, batchId);
       await kv.set(KV.graphEdges, existing.id, merged);
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
@@ -917,6 +959,8 @@ export function registerGraphFunction(
 
       const obsIds = data.observations.map((o) => o.id);
 
+      // Heuristic rows keep per-observation ids: those are precise and already
+      // linear. Only the LLM path stamps the whole batch, so only it batches.
       let nodes: GraphNode[] = [];
       let edges: GraphEdge[] = [];
       try {
@@ -931,8 +975,22 @@ export function registerGraphFunction(
 
       const llmEnabled =
         isGraphExtractionEnabled() && !provider.name.includes("noop");
+      // Read per call so a flag flip takes effect without a redeploy (KTD6).
+      const batchMode = llmEnabled && getGraphProvenanceMode() === "batch";
+      let batchId: string | null = null;
       let llmError: string | undefined;
       if (llmEnabled) {
+        if (batchMode) {
+          // The batch row lands before any node references it, so a reader
+          // never resolves a batch id that has no row behind it.
+          const batch: GraphBatch = {
+            id: generateId("gb"),
+            observationIds: obsIds,
+            createdAt: new Date().toISOString(),
+          };
+          await kv.set(KV.graphBatches, batch.id, batch);
+          batchId = batch.id;
+        }
         const prompt = buildGraphExtractionPrompt(
           data.observations.map((o) => ({
             title: o.title,
@@ -947,7 +1005,7 @@ export function registerGraphFunction(
             GRAPH_EXTRACTION_SYSTEM,
             prompt,
           );
-          const parsed = parseGraphXml(response, obsIds);
+          const parsed = parseGraphXml(response, obsIds, batchId);
           nodes = nodes.concat(parsed.nodes);
           edges = edges.concat(parsed.edges);
         } catch (err) {
@@ -968,6 +1026,7 @@ export function registerGraphFunction(
           nodes,
           edges,
           obsIds,
+          batchId,
         );
 
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
