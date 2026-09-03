@@ -382,5 +382,14 @@ async function findObservation(
     const found = results.find((r) => r !== null);
     if (found) return found;
   }
+  // An index hit whose row is in no session is a ghost: the observation was
+  // deleted but the index still carries it. Retention (U5) removes rows and
+  // their index entries together, so this firing after a retention run is the
+  // signal that the index removal missed -- which is the gate U5 is judged on.
+  logger.warn("smart-search: index hit has no observation in any session", {
+    obsId,
+    sessionIdHint: sessionIdHint ?? null,
+    sessionsProbed: sessions.length,
+  });
   return null;
 }
