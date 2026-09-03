@@ -60,6 +60,7 @@ import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
 import { registerRecentSearchesSweepFunction } from "./functions/recent-searches-sweep.js";
 import { registerDiagnosticsStoreFunction } from "./functions/diagnostics-store.js";
+import { rotateAuditPartitions } from "./functions/audit.js";
 import { registerProfileFunction } from "./functions/profile.js";
 import { registerAutoForgetFunction } from "./functions/auto-forget.js";
 import { registerExportImportFunction } from "./functions/export-import.js";
@@ -625,6 +626,16 @@ async function main() {
     } catch {}
   }, 60 * 60 * 1000);
   recentSearchesSweepTimer.unref();
+
+  // Audit partitions older than AUDIT_RETENTION_MONTHS are deleted whole.
+  // Same hourly cadence as the sweep above; rotation is cheap when there is
+  // nothing to do, which is every hour but the first of a month.
+  const auditRotationTimer = setInterval(async () => {
+    try {
+      await rotateAuditPartitions(kv);
+    } catch {}
+  }, 60 * 60 * 1000);
+  auditRotationTimer.unref();
 
   if (isConsolidationEnabled()) {
     const consolidationTimer = setInterval(async () => {

@@ -6,6 +6,7 @@ import type {
 } from "../src/types.js";
 import { registerEvictFunction } from "../src/functions/evict.js";
 import { KV } from "../src/state/schema.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -153,12 +154,17 @@ describe("mem::evict stale sessions", () => {
 
     expect(result.staleSessions).toBe(1);
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
+    // recordAudit writes to the current monthly partition now, and evict
+    // emits one row per resource per run rather than one per item.
     const audits = await kv.list<{
-      details: { reason: string };
-    }>(KV.audit);
-    expect(audits[0].details.reason).toBe(
-      "stale_session_recovered_then_evicted",
-    );
+      targetIds: string[];
+      details: { resource: string; byReason: Record<string, number> };
+    }>(auditQueryScopes()[0]!);
+    const sessionRow = audits.find((a) => a.details.resource === "session");
+    expect(sessionRow?.targetIds).toEqual([sessionId]);
+    expect(sessionRow?.details.byReason).toEqual({
+      stale_session_recovered_then_evicted: 1,
+    });
     expect(calls.map((call) => call.function_id)).toContain(
       "event::session::stopped",
     );

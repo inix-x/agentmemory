@@ -50,7 +50,15 @@ export const KV = {
   teamUsers: (teamId: string, userId: string) =>
     `mem:team:${teamId}:users:${userId}`,
   teamProfile: (teamId: string) => `mem:team:${teamId}:profile`,
+  // The legacy audit scope. It is already over the 15 MiB enumeration guard in
+  // production, its keys are random-suffixed, and the engine has no keys-only
+  // list, so no in-process rotation can touch it. New rows go to a monthly
+  // partition below; this constant names the file the entrypoint retires.
   audit: "mem:audit",
+  // Partitioned by UTC month so rotation deletes a whole scope -- the only
+  // delete the engine makes cheap -- instead of walking rows it cannot list.
+  auditMonth: (at: Date) =>
+    `mem:audit:${at.getUTCFullYear()}-${String(at.getUTCMonth() + 1).padStart(2, "0")}`,
   actions: "mem:actions",
   actionEdges: "mem:action-edges",
   leases: "mem:leases",
