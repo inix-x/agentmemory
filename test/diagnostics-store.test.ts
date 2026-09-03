@@ -192,6 +192,19 @@ describe("store byte accounting", () => {
     });
     expect(state.largestFiles.map((f) => f.name)).not.toContain("nested");
     expect(state.unavailable).toBeUndefined();
+    // A subdirectory holds bytes this reader does not walk. Counted, not
+    // dropped: otherwise a nested layout looks like a genuinely empty store,
+    // which the runbook tells the operator to read as absence.
+    expect(state.directoriesSkipped).toBe(1);
+  });
+
+  it("omits both drop counters when nothing was dropped", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+
+    const state = (await readDiagnostics()).stores.state;
+
+    expect(state.directoriesSkipped).toBeUndefined();
+    expect(state.unreadableFiles).toBeUndefined();
   });
 
   it("caps the largest-file list at 50 without capping the totals", async () => {
@@ -529,13 +542,26 @@ describe("process memory", () => {
 
     const result = await readDiagnostics();
 
-    expect(result.process.bootUptimeSeconds).toBeCloseTo(12345.67);
+    expect(result.process.boot.uptimeSeconds).toBeCloseTo(12345.67);
+    expect(result.process.boot.unavailable).toBeUndefined();
+  });
+
+  it("explains a /proc/uptime that reads but is not a number", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    writeFileSync(join(procRoot, "uptime"), "not-a-number\n");
+
+    const boot = (await readDiagnostics()).process.boot;
+
+    expect(boot.uptimeSeconds).toBeNull();
+    expect(boot.unavailable).toContain("not a number");
   });
 
   it("reports null boot uptime when the platform has no /proc/uptime", async () => {
     seedStateStore({ "mem:memories.bin": 10 });
 
-    expect((await readDiagnostics()).process.bootUptimeSeconds).toBeNull();
+    const boot = (await readDiagnostics()).process.boot;
+    expect(boot.uptimeSeconds).toBeNull();
+    expect(boot.unavailable).toBeTruthy();
   });
 });
 
@@ -574,6 +600,54 @@ describe("cgroup current", () => {
     expect(cgroup.currentBytes).toBeNull();
     expect(cgroup.unavailable).toContain("a");
     expect(cgroup.unavailable).toContain("b");
+  });
+});
+
+describe("response shape", () => {
+  // The `StoreDiagnostics` import cannot protect against drift on its own:
+  // tsconfig.json excludes test/, adding this file back hits TS6059 against
+  // rootDir "src", and CI runs no tsc step for src either. So the type is
+  // checked at runtime instead, by the suite CI does run. A renamed, dropped, or
+  // added field fails here rather than silently returning nulls to the first
+  // production read.
+  it("returns exactly the keys the operator runbook reads", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+
+    const result = await readDiagnostics();
+
+    expect(Object.keys(result).sort()).toEqual([
+      "at",
+      "dataDir",
+      "dataDirCandidates",
+      "dataDirSource",
+      "index",
+      "process",
+      "stores",
+      "success",
+    ]);
+    expect(Object.keys(result.process).sort()).toEqual([
+      "boot",
+      "cgroup",
+      "engine",
+      "node",
+    ]);
+    expect(Object.keys(result.process.node).sort()).toEqual([
+      "pid",
+      "rssBytes",
+      "uptimeSeconds",
+    ]);
+    expect(Object.keys(result.stores.state).sort()).toEqual([
+      "byScope",
+      "exists",
+      "fileCount",
+      "largestFiles",
+      "path",
+      "totalBytes",
+    ]);
+    // `at` is what tells a fresh reading from a cached one, and nothing else
+    // asserts it, so freezing it to a constant would otherwise go unnoticed.
+    expect(Date.parse(result.at)).toBeGreaterThan(Date.now() - 60_000);
+    expect(Number.isInteger(result.process.node.uptimeSeconds)).toBe(true);
   });
 });
 

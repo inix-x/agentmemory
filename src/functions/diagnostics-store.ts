@@ -36,6 +36,10 @@ export type StoreReport = {
   byScope: Record<string, { files: number; bytes: number }>;
   largestFiles: Array<{ name: string; bytes: number }>;
   unreadableFiles?: number;
+  // A subdirectory holds bytes this reader does not walk. Counted rather than
+  // dropped, because otherwise a nested layout is indistinguishable from a
+  // genuinely empty store and the runbook says to read that as absence.
+  directoriesSkipped?: number;
   unavailable?: string;
 };
 
@@ -51,7 +55,7 @@ export type EngineProcess = {
   // Raw clock ticks since boot, /proc/<pid>/stat field 22. Emitted unconverted:
   // _SC_CLK_TCK is not reachable from Node without a native addon, and assuming
   // 100 is the unit guess that turns an instrument into a confidently wrong
-  // reading. Pair with bootUptimeSeconds to derive an age.
+  // reading. Pair with process.boot.uptimeSeconds to derive an age.
   startTicks: number | null;
 };
 
@@ -83,7 +87,7 @@ export type StoreDiagnostics = {
       unavailable?: string;
     };
     cgroup: { currentBytes: number | null; unavailable?: string };
-    bootUptimeSeconds: number | null;
+    boot: { uptimeSeconds: number | null; unavailable?: string };
   };
   index: { bm25Entries: number; vectorEntries: number | null };
 };
@@ -111,7 +115,7 @@ async function readStoreDir(path: string): Promise<StoreReport> {
     exists: false,
     fileCount: 0,
     totalBytes: 0,
-    byScope: {},
+    byScope: Object.create(null),
     largestFiles: [],
   };
 
@@ -143,12 +147,16 @@ async function readStoreDir(path: string): Promise<StoreReport> {
 
   const files: Array<{ name: string; bytes: number }> = [];
   let unreadableFiles = 0;
+  let directoriesSkipped = 0;
   for (const entry of sized) {
     if (!entry) {
       unreadableFiles++;
       continue;
     }
-    if (!entry.isFile) continue;
+    if (!entry.isFile) {
+      directoriesSkipped++;
+      continue;
+    }
     files.push({ name: entry.name, bytes: entry.bytes });
   }
 
@@ -165,10 +173,11 @@ async function readStoreDir(path: string): Promise<StoreReport> {
     byScope[prefix] = bucket;
   }
 
-  if (unreadableFiles > 0) {
+  if (unreadableFiles > 0 || directoriesSkipped > 0) {
     logger.warn("diagnostics-store: entries dropped from the store total", {
       path,
       unreadableFiles,
+      directoriesSkipped,
     });
   }
 
@@ -182,6 +191,7 @@ async function readStoreDir(path: string): Promise<StoreReport> {
       .sort((a, b) => b.bytes - a.bytes)
       .slice(0, LARGEST_FILES),
     ...(unreadableFiles > 0 ? { unreadableFiles } : {}),
+    ...(directoriesSkipped > 0 ? { directoriesSkipped } : {}),
   };
 }
 
@@ -384,14 +394,24 @@ async function readCgroupCurrent(
   return { currentBytes: null, unavailable: failures.join("; ") };
 }
 
-async function readBootUptime(procRoot: string): Promise<number | null> {
+// Same `{ value, unavailable? }` shape as cgroup. The runbook pairs this with
+// startTicks to decide whether the engine restarted inside the window, and a
+// reason-free null there reads as "it did not".
+async function readBootUptime(
+  procRoot: string,
+): Promise<{ seconds: number | null; unavailable?: string }> {
+  const path = join(procRoot, "uptime");
+  let raw: string;
   try {
-    const raw = await readFile(join(procRoot, "uptime"), "utf-8");
-    const seconds = Number(raw.trim().split(" ")[0]);
-    return Number.isFinite(seconds) ? seconds : null;
-  } catch {
-    return null;
+    raw = await readFile(path, "utf-8");
+  } catch (err) {
+    return { seconds: null, unavailable: `${path}: ${reason(err)}` };
   }
+  const seconds = Number(raw.trim().split(" ")[0]);
+  if (!Number.isFinite(seconds)) {
+    return { seconds: null, unavailable: `${path}: not a number` };
+  }
+  return { seconds };
 }
 
 // The overrides make the filesystem reads drivable from a temp directory.
@@ -424,7 +444,7 @@ export function registerDiagnosticsStoreFunction(
         deployDataDir,
       );
 
-      const [state, stream, engine, cgroup, bootUptimeSeconds] =
+      const [state, stream, engine, cgroup, boot] =
         await Promise.all([
           readStoreDir(join(dataDir, STATE_STORE)),
           readStoreDir(join(dataDir, STREAM_STORE)),
@@ -469,7 +489,10 @@ export function registerDiagnosticsStoreFunction(
             ...(engine.unavailable ? { unavailable: engine.unavailable } : {}),
           },
           cgroup,
-          bootUptimeSeconds,
+          boot: {
+            uptimeSeconds: boot.seconds,
+            ...(boot.unavailable ? { unavailable: boot.unavailable } : {}),
+          },
         },
         index: {
           bm25Entries: getSearchIndex().size,

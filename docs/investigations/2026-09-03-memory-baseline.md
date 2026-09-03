@@ -39,14 +39,14 @@ curl -sS -w '\n== %{time_total}s\n' -H "Authorization: Bearer $AGENTMEMORY_SECRE
   https://<service>/agentmemory/diagnostics/store | tee read-1.json | jq '{
     at, success,
     dataDir, dataDirSource, candidates: .dataDirCandidates,
-    state: .stores.state | {fileCount, totalBytes, byScope, unreadableFiles, unavailable},
-    stream: .stores.stream | {fileCount, totalBytes, byScope, unreadableFiles, unavailable},
+    state: .stores.state | {fileCount, totalBytes, byScope, unreadableFiles, directoriesSkipped, unavailable},
+    stream: .stores.stream | {fileCount, totalBytes, byScope, unreadableFiles, directoriesSkipped, unavailable},
     largest: [.stores.state.largestFiles[0:6], .stores.stream.largestFiles[0:6]],
     node: .process.node,
     engine: .process.engine,
     cgroup: .process.cgroup,
     resolverUnavailable,
-    bootUptimeSeconds: .process.bootUptimeSeconds,
+    boot: .process.boot,
     index: .index
   }'
 ```
@@ -73,8 +73,13 @@ being wrong. Do not skip one because the number beside it looks plausible.
       counted this directory — the 2026-08-28 table covers `state_store.db`
       only. If it holds one file per stream *message* rather than per session
       group, the 5-second gate and the response size both change character.
-- [ ] `unreadableFiles` is absent on both stores. Present means entries were
-      dropped from `totalBytes`, so the denominator of k is short.
+- [ ] `unreadableFiles` and `directoriesSkipped` are absent on both stores.
+      Either one present means entries were dropped from `totalBytes`, so the
+      denominator of k is short. `directoriesSkipped` specifically means the
+      store has a nested layout this reader does not walk, and the byte totals
+      are not the store.
+- [ ] `process.boot.unavailable` is absent. Present means `/proc/uptime` could
+      not be read, so `startTicks` has nothing to be interpreted against.
 - [ ] `process.engine.processes` is non-empty **and `process.engine.unavailable`
       is absent**. It has three causes and the string says which:
       - *no iii engine process found* — the scan found nothing.
@@ -146,7 +151,7 @@ apart on ~1,900 files, but do not fold an instrument change into the delta.
 | node uptime (s) | | |
 | **engine pid(s)** | | |
 | **engine `startTicks`** | | |
-| **`bootUptimeSeconds`** | | |
+| **`boot.uptimeSeconds`** | | |
 | state store bytes | | |
 | state store file count | | |
 | **stream store bytes** | | |
