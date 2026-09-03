@@ -6,6 +6,7 @@ import type {
 } from "../src/types.js";
 import { registerEvictFunction } from "../src/functions/evict.js";
 import { KV } from "../src/state/schema.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -153,9 +154,10 @@ describe("mem::evict stale sessions", () => {
 
     expect(result.staleSessions).toBe(1);
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
+    // recordAudit writes to the current monthly partition now.
     const audits = await kv.list<{
       details: { reason: string };
-    }>(KV.audit);
+    }>(auditQueryScopes()[0]!);
     expect(audits[0].details.reason).toBe(
       "stale_session_recovered_then_evicted",
     );

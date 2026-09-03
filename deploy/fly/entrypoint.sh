@@ -23,6 +23,38 @@ III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-conf
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_AS" "$DATA_DIR"
 
+# U6 of the memory-reduction ladder. The legacy mem:audit scope is over the
+# enumeration guard in production: every /agentmemory/audit read of it is a
+# 413, its keys are random-suffixed, and the engine has no keys-only list, so
+# nothing inside the process can rotate or trim it. New rows go to a monthly
+# partition; this moves the one file that can never be read again out of the
+# eagerly-loaded store so it stops costing resident bytes.
+#
+# Retire by RENAME, never delete. Same helper shape as U2's stream retirement:
+# runs before the engine, every boot here is a stop-then-start so the engine
+# never sees the file mid-move, and any retirement is undone by moving it back.
+# Flagless on purpose -- a flag needs a second deploy to unset.
+retire_matching_file() {
+    _dir="$1"
+    _name="$2"
+    _f="$_dir/$_name"
+    [ -f "$_f" ] || return 0
+
+    _dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$_dest" || return 0
+    _size=$(wc -c < "$_f" 2>/dev/null || echo 0)
+    if mv "$_f" "$_dest/" 2>/dev/null; then
+        chown -R "$RUN_AS" "$_dest" 2>/dev/null || true
+        echo "agentmemory: retired $_name, $_size bytes, to $_dest"
+    fi
+}
+
+# The exact on-disk name is not pinned anywhere in this repo; U0's endpoint
+# reports it. Both plausible spellings are tried and the miss is silent, so a
+# wrong guess costs nothing and a right one costs one mv.
+retire_matching_file "$DATA_DIR/state_store.db" "mem:audit.bin"
+retire_matching_file "$DATA_DIR/state_store.db" "mem_audit.bin"
+
 cat > "$III_CONFIG" <<'EOF'
 workers:
   - name: iii-http

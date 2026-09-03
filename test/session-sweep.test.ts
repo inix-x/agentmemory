@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Session } from "../src/types.js";
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
 import { KV } from "../src/state/schema.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -259,7 +260,7 @@ describe("mem::session-sweep", () => {
 
     await runSweep(store);
 
-    const audit = Array.from(store.get(KV.audit)?.values() ?? []) as Array<{
+    const audit = Array.from(store.get(auditQueryScopes()[0]!)?.values() ?? []) as Array<{
       operation: string;
       functionId: string;
       targetIds: string[];
@@ -275,7 +276,7 @@ describe("mem::session-sweep", () => {
 
     await runSweep(store, { dryRun: true });
 
-    expect(store.get(KV.audit)?.size ?? 0).toBe(0);
+    expect(store.get(auditQueryScopes()[0]!)?.size ?? 0).toBe(0);
   });
 
   it("fans out a summary with consolidation suppressed", async () => {
