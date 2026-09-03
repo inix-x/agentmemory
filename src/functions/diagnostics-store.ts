@@ -3,27 +3,35 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ISdk } from "iii-sdk";
 import { resolveDataDir } from "../cli-data-dir.js";
+import { logger } from "../logger.js";
 import { getSearchIndex, getVectorIndex } from "./search.js";
 
-// U0 of the memory-reduction ladder. Railway reports one combined
-// container figure, so without this endpoint every unit in that ladder
-// is an owner-only gate that needs shell access. It answers the three
-// questions each later gate is judged on: what the store holds per
-// scope, how that maps to resident bytes in the engine versus node, and
-// what the container as a whole is charged for.
+// U0 of the memory-reduction ladder. Railway reports one combined container
+// figure, which cannot tell the engine's resident copy of the store apart from
+// node's heap. Every later unit's gate is stated in k = engine RSS / store bytes
+// on disk, so this endpoint reports both halves of that division.
 //
-// It takes no `kv` on purpose. The whole point is a cheap read, and a
-// function that cannot reach KV cannot grow a kv.list on the quiet.
-// Everything here is readdir/stat/readFile against paths.
+// Every degraded read answers "why is this missing?" in one shape,
+// `{ <value>, unavailable? }`. That is the contract: a believable zero is worse
+// than an error here, because a wrong k mis-ranks and mis-gates every unit below
+// it. CHANGELOG:689 is this repo's own precedent -- an EACCES on /data presented
+// as a silent empty store while the API kept reporting success: true.
 
 const LARGEST_FILES = 50;
 
-// The Railway image hardcodes these in deploy/railway/entrypoint.sh via a
-// quoted heredoc, so the container's stores are at /data regardless of
-// AGENTMEMORY_DATA_DIR. resolveDataDir() covers every other install.
+// The Railway image hardcodes these in deploy/railway/entrypoint.sh via a quoted
+// heredoc, so the container's stores are always at /data whatever
+// AGENTMEMORY_DATA_DIR says. /data is probed first for that reason;
+// resolveDataDir() covers every other install. The probe is load-bearing: inside
+// the container HOME=/root survives gosu, so resolveDataDir() answers
+// /root/.local/share/agentmemory, which uid node cannot read.
 const DEPLOY_DATA_DIR = "/data";
 const STATE_STORE = "state_store.db";
 const STREAM_STORE = "stream_store";
+const CGROUP_PATHS = [
+  "/sys/fs/cgroup/memory.current",
+  "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+];
 
 export type StoreReport = {
   path: string;
@@ -32,35 +40,37 @@ export type StoreReport = {
   totalBytes: number;
   byScope: Record<string, { files: number; bytes: number }>;
   largestFiles: Array<{ name: string; bytes: number }>;
+  unreadableFiles?: number;
+  unavailable?: string;
 };
 
 export type EngineProcess = {
   pid: number;
   comm: string;
   rssBytes: number | null;
+  // Raw clock ticks since boot, /proc/<pid>/stat field 22. Emitted unconverted:
+  // _SC_CLK_TCK is not reachable from Node without a native addon, and assuming
+  // 100 is the unit guess that turns an instrument into a confidently wrong
+  // reading. Pair with bootUptimeSeconds to derive an age.
+  startTicks: number | null;
 };
 
 export type StoreDiagnostics = {
-  success: true;
+  success: boolean;
   at: string;
   dataDir: string;
   dataDirSource: "override" | "resolver" | "deploy-default" | "unresolved";
   dataDirCandidates: string[];
   stores: { state: StoreReport; stream: StoreReport };
   process: {
-    node: {
-      pid: number;
-      uptimeSeconds: number;
-      rssBytes: number | null;
-      rssUnavailable?: string;
-    };
+    node: { pid: number; uptimeSeconds: number; rssBytes: number };
     engine: {
       rssBytes: number | null;
       processes: EngineProcess[];
       unavailable?: string;
     };
-    cgroupCurrentBytes: number | null;
-    cgroupUnavailable?: string;
+    cgroup: { currentBytes: number | null; unavailable?: string };
+    bootUptimeSeconds: number | null;
   };
   index: { bm25Entries: number; vectorEntries: number | null };
 };
@@ -70,11 +80,12 @@ function reason(err: unknown): string {
 }
 
 // mem:obs:ses_alpha.bin -> mem:obs, mem:graph:edges.bin -> mem:graph,
-// mem:audit.bin -> mem:audit. The engine's on-disk naming is not pinned
-// by anything in this repo, so both ":" and "_" are treated as scope
-// separators and the raw largestFiles list is always returned beside the
-// grouping — a wrong split stays visible instead of silently rebucketing
-// the numbers the ladder is ranked by.
+// mem:audit.bin -> mem:audit. Both ":" and "_" are separators because the
+// engine's on-disk naming is not pinned by anything in this repo. A name
+// splitting to exactly two parts is kept whole, so a stream group file named for
+// a raw session id does not collapse -- U0 measures that naming rather than
+// guessing at it, and largestFiles is always returned raw beside the grouping so
+// a wrong split stays visible.
 export function scopePrefix(fileName: string): string {
   const base = fileName.replace(/\.[A-Za-z0-9]{1,8}$/, "");
   const parts = base.split(/[:_]/);
@@ -94,23 +105,43 @@ async function readStoreDir(path: string): Promise<StoreReport> {
   let names: string[];
   try {
     names = await readdir(path);
-  } catch {
-    return empty;
+  } catch (err) {
+    // ENOENT is a real absence. Anything else -- EACCES, ENOTDIR -- is a store
+    // we could not read, and reporting that as an empty store would satisfy
+    // U1's gate ("stream file count and bytes frozen") by being blind to it.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return empty;
+    logger.warn("diagnostics-store: store directory unreadable", {
+      path,
+      error: reason(err),
+    });
+    return { ...empty, exists: true, unavailable: reason(err) };
   }
 
   const sized = await Promise.all(
     names.map(async (name) => {
       try {
         const info = await stat(join(path, name));
-        return info.isFile() ? { name, bytes: info.size } : null;
+        return { name, bytes: info.size, isFile: info.isFile() };
       } catch {
         return null;
       }
     }),
   );
 
-  const files = sized.filter((f): f is { name: string; bytes: number } => !!f);
-  const byScope: StoreReport["byScope"] = {};
+  const files: Array<{ name: string; bytes: number }> = [];
+  let unreadableFiles = 0;
+  for (const entry of sized) {
+    if (!entry) {
+      unreadableFiles++;
+      continue;
+    }
+    if (!entry.isFile) continue;
+    files.push({ name: entry.name, bytes: entry.bytes });
+  }
+
+  // Null prototype: a scope prefix comes from a filename, and an inherited key
+  // such as "constructor" would resolve truthy and swallow its own bucket.
+  const byScope: StoreReport["byScope"] = Object.create(null);
   let totalBytes = 0;
   for (const file of files) {
     totalBytes += file.bytes;
@@ -119,6 +150,13 @@ async function readStoreDir(path: string): Promise<StoreReport> {
     bucket.files += 1;
     bucket.bytes += file.bytes;
     byScope[prefix] = bucket;
+  }
+
+  if (unreadableFiles > 0) {
+    logger.warn("diagnostics-store: entries dropped from the store total", {
+      path,
+      unreadableFiles,
+    });
   }
 
   return {
@@ -130,14 +168,14 @@ async function readStoreDir(path: string): Promise<StoreReport> {
     largestFiles: [...files]
       .sort((a, b) => b.bytes - a.bytes)
       .slice(0, LARGEST_FILES),
+    ...(unreadableFiles > 0 ? { unreadableFiles } : {}),
   };
 }
 
-function resolveStoreDataDir(override?: string): {
-  dataDir: string;
-  dataDirSource: StoreDiagnostics["dataDirSource"];
-  dataDirCandidates: string[];
-} {
+function resolveStoreDataDir(
+  override: string | undefined,
+  deployDataDir: string,
+): Pick<StoreDiagnostics, "dataDir" | "dataDirSource" | "dataDirCandidates"> {
   if (override) {
     return {
       dataDir: override,
@@ -149,50 +187,77 @@ function resolveStoreDataDir(override?: string): {
   let resolved: string | null = null;
   try {
     resolved = resolveDataDir().dataDir;
-  } catch {
-    resolved = null;
+  } catch (err) {
+    logger.warn("diagnostics-store: data dir resolver threw", {
+      error: reason(err),
+    });
   }
 
-  const candidates = [resolved, DEPLOY_DATA_DIR].filter(
-    (c): c is string => !!c,
-  );
-  const sources: Array<StoreDiagnostics["dataDirSource"]> = resolved
-    ? ["resolver", "deploy-default"]
-    : ["deploy-default"];
+  const candidates: Array<[string, StoreDiagnostics["dataDirSource"]]> = [
+    [deployDataDir, "deploy-default"],
+  ];
+  if (resolved) candidates.push([resolved, "resolver"]);
 
-  for (let i = 0; i < candidates.length; i++) {
-    if (existsSync(join(candidates[i]!, STATE_STORE))) {
-      return {
-        dataDir: candidates[i]!,
-        dataDirSource: sources[i]!,
-        dataDirCandidates: candidates,
-      };
+  const paths = candidates.map(([dir]) => dir);
+  for (const [dir, source] of candidates) {
+    if (existsSync(join(dir, STATE_STORE))) {
+      return { dataDir: dir, dataDirSource: source, dataDirCandidates: paths };
     }
   }
 
-  // Nothing held a store. Report the first candidate anyway so the
-  // response shows an empty store at a named path rather than an
-  // unexplained zero.
+  // Nothing held a store. Name the directory that was read anyway, so the
+  // response shows an empty store at a stated path rather than a bare zero.
   return {
-    dataDir: candidates[0] ?? DEPLOY_DATA_DIR,
+    dataDir: paths[0]!,
     dataDirSource: "unresolved",
-    dataDirCandidates: candidates,
+    dataDirCandidates: paths,
   };
 }
 
-async function readVmRss(procDir: string): Promise<number | null> {
-  const status = await readFile(join(procDir, "status"), "utf-8");
+// Two "no number" outcomes, and both carry a reason: a throw, and a status file
+// that reads fine but has no VmRSS line (zombies and kernel threads have no Vm*
+// lines by design). A bare null from either is indistinguishable from a real
+// zero-RSS process.
+async function readVmRss(
+  procDir: string,
+): Promise<{ bytes: number | null; unavailable?: string }> {
+  let status: string;
+  try {
+    status = await readFile(join(procDir, "status"), "utf-8");
+  } catch (err) {
+    return { bytes: null, unavailable: reason(err) };
+  }
   const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
-  return match ? parseInt(match[1]!, 10) * 1024 : null;
+  if (!match) {
+    return { bytes: null, unavailable: `no VmRSS line in ${procDir}/status` };
+  }
+  return { bytes: parseInt(match[1]!, 10) * 1024 };
 }
 
-// The engine pid file (src/cli.ts) is not usable here: the Railway
-// entrypoint runs as root and execs `gosu node:node`, which leaves
-// HOME=/root, so the CLI's write to ~/.agentmemory/iii.pid fails EACCES
-// and is swallowed. lsof is absent from that image too, so the port
-// lookup returns nothing. /proc is what the plan's own fallback
-// one-liner reads, and the iii / iii-* name test is the same one
-// adoptRunningEngine uses before it will adopt a pid.
+// /proc/<pid>/stat field 22 is starttime. The comm field is parenthesised and
+// may itself contain spaces or parens, so the tail is taken from the LAST ")" --
+// splitting the whole line on " " and indexing 21 breaks on any such comm. After
+// lastIndexOf(")") + 2 the first token is field 3, so field 22 is index 19.
+async function readStartTicks(procDir: string): Promise<number | null> {
+  try {
+    const raw = await readFile(join(procDir, "stat"), "utf-8");
+    const close = raw.lastIndexOf(")");
+    if (close === -1) return null;
+    const ticks = Number(raw.slice(close + 2).split(" ")[19]);
+    return Number.isFinite(ticks) ? ticks : null;
+  } catch {
+    return null;
+  }
+}
+
+// The engine pid file (src/cli.ts) is not usable here: the Railway entrypoint
+// runs as root and execs `gosu node:node`, which preserves the environment, so
+// HOME stays /root -- mode 0700, root-owned -- and writeEnginePidfile's mkdir
+// EACCESes into a swallowed vlog. lsof is absent from the image too, so
+// findEnginePidsByPort returns []. /proc is what the plan's own fallback
+// one-liner reads, and this comm test is the exact inverse of
+// isForeignPortHolder (src/cli.ts:2659), so adoptRunningEngine and this endpoint
+// agree on what an engine is.
 function isEngineComm(comm: string): boolean {
   const base = comm.trim().split("/").pop() ?? "";
   return base === "iii" || base.startsWith("iii-");
@@ -213,6 +278,7 @@ async function findEngineProcesses(procRoot: string): Promise<{
   }
 
   const processes: EngineProcess[] = [];
+  let skipped = 0;
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const procDir = join(procRoot, entry);
@@ -220,81 +286,106 @@ async function findEngineProcesses(procRoot: string): Promise<{
     try {
       comm = await readFile(join(procDir, "comm"), "utf-8");
     } catch {
+      skipped++;
       continue;
     }
     if (!isEngineComm(comm)) continue;
-    let rssBytes: number | null = null;
-    try {
-      rssBytes = await readVmRss(procDir);
-    } catch {
-      rssBytes = null;
-    }
-    processes.push({ pid: parseInt(entry, 10), comm: comm.trim(), rssBytes });
+    const rss = await readVmRss(procDir);
+    processes.push({
+      pid: parseInt(entry, 10),
+      comm: comm.trim(),
+      rssBytes: rss.bytes,
+      startTicks: await readStartTicks(procDir),
+    });
   }
 
+  const skippedNote =
+    skipped > 0 ? ` (${skipped} pids skipped: comm unreadable)` : "";
   if (processes.length === 0) {
     return {
       processes,
-      unavailable: `no iii engine process found under ${procRoot}`,
+      unavailable: `no iii engine process found under ${procRoot}${skippedNote}`,
     };
   }
-  return { processes };
+  // A matched process whose VmRSS could not be read contributes nothing to the
+  // sum, so without this the response reports a strict subset of the engine as
+  // if it were all of it -- a silent undercount of k's numerator.
+  const missing = processes.filter((p) => p.rssBytes === null);
+  if (missing.length > 0) {
+    const shape = missing.length === processes.length ? "null" : "a partial sum";
+    return {
+      processes,
+      unavailable: `VmRSS unreadable for ${missing.length}/${processes.length} matched processes (pids ${missing
+        .map((p) => p.pid)
+        .join(", ")}); engine.rssBytes is ${shape}${skippedNote}`,
+    };
+  }
+  return {
+    processes,
+    ...(skipped > 0 ? { unavailable: skippedNote.trim() } : {}),
+  };
 }
 
-async function readCgroupCurrent(): Promise<{
-  bytes: number | null;
-  unavailable?: string;
-}> {
-  const paths = [
-    "/sys/fs/cgroup/memory.current",
-    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-  ];
+async function readCgroupCurrent(
+  paths: string[],
+): Promise<{ currentBytes: number | null; unavailable?: string }> {
   const failures: string[] = [];
   for (const path of paths) {
     try {
       const raw = await readFile(path, "utf-8");
       const bytes = parseInt(raw.trim(), 10);
-      if (Number.isFinite(bytes)) return { bytes };
+      if (Number.isFinite(bytes)) return { currentBytes: bytes };
       failures.push(`${path}: not a number`);
     } catch (err) {
       failures.push(`${path}: ${reason(err)}`);
     }
   }
-  return { bytes: null, unavailable: failures.join("; ") };
+  return { currentBytes: null, unavailable: failures.join("; ") };
 }
 
-// `overrides` exists so the /proc and store reads are drivable from a
-// temp directory. Without it the engine half is only exercised on Linux
-// with a live engine, which is neither the test host nor CI — and that
-// is precisely the half carrying VmRSS, the number every gate's k is
-// computed from.
+async function readBootUptime(procRoot: string): Promise<number | null> {
+  try {
+    const raw = await readFile(join(procRoot, "uptime"), "utf-8");
+    const seconds = Number(raw.trim().split(" ")[0]);
+    return Number.isFinite(seconds) ? seconds : null;
+  } catch {
+    return null;
+  }
+}
+
+// The overrides make the filesystem reads drivable from a temp directory.
+// Without them the engine and cgroup halves run on no machine the suite executes
+// on, and those halves carry VmRSS and the container figure -- two of the three
+// numbers this endpoint exists to report.
 export function registerDiagnosticsStoreFunction(
   sdk: ISdk,
-  overrides: { dataDir?: string; procRoot?: string } = {},
+  overrides: {
+    dataDir?: string;
+    deployDataDir?: string;
+    procRoot?: string;
+    cgroupPaths?: string[];
+  } = {},
 ): void {
   const procRoot = overrides.procRoot ?? "/proc";
+  const cgroupPaths = overrides.cgroupPaths ?? CGROUP_PATHS;
+  const deployDataDir = overrides.deployDataDir ?? DEPLOY_DATA_DIR;
   sdk.registerFunction(
     "mem::diagnostics-store",
     async (): Promise<StoreDiagnostics> => {
       const at = new Date().toISOString();
       const { dataDir, dataDirSource, dataDirCandidates } = resolveStoreDataDir(
         overrides.dataDir,
+        deployDataDir,
       );
 
-      const [state, stream, engine, cgroup] = await Promise.all([
-        readStoreDir(join(dataDir, STATE_STORE)),
-        readStoreDir(join(dataDir, STREAM_STORE)),
-        findEngineProcesses(procRoot),
-        readCgroupCurrent(),
-      ]);
-
-      let nodeRssBytes: number | null = null;
-      let nodeRssUnavailable: string | undefined;
-      try {
-        nodeRssBytes = await readVmRss(join(procRoot, "self"));
-      } catch (err) {
-        nodeRssUnavailable = reason(err);
-      }
+      const [state, stream, engine, cgroup, bootUptimeSeconds] =
+        await Promise.all([
+          readStoreDir(join(dataDir, STATE_STORE)),
+          readStoreDir(join(dataDir, STREAM_STORE)),
+          findEngineProcesses(procRoot),
+          readCgroupCurrent(cgroupPaths),
+          readBootUptime(procRoot),
+        ]);
 
       const engineRss = engine.processes.reduce<number | null>(
         (sum, proc) =>
@@ -303,7 +394,10 @@ export function registerDiagnosticsStoreFunction(
       );
 
       return {
-        success: true,
+        // Not a literal: 20+ sibling modules return success: false on failure,
+        // so callers branch on it. A hardcoded true would pass cleanly on a
+        // response whose every byte figure is a false zero (CHANGELOG:689).
+        success: state.exists && !state.unavailable,
         at,
         dataDir,
         dataDirSource,
@@ -313,20 +407,15 @@ export function registerDiagnosticsStoreFunction(
           node: {
             pid: process.pid,
             uptimeSeconds: Math.round(process.uptime()),
-            rssBytes: nodeRssBytes,
-            ...(nodeRssUnavailable
-              ? { rssUnavailable: nodeRssUnavailable }
-              : {}),
+            rssBytes: process.memoryUsage().rss,
           },
           engine: {
             rssBytes: engineRss,
             processes: engine.processes,
             ...(engine.unavailable ? { unavailable: engine.unavailable } : {}),
           },
-          cgroupCurrentBytes: cgroup.bytes,
-          ...(cgroup.unavailable
-            ? { cgroupUnavailable: cgroup.unavailable }
-            : {}),
+          cgroup,
+          bootUptimeSeconds,
         },
         index: {
           bm25Entries: getSearchIndex().size,
