@@ -373,6 +373,14 @@ export function loadSnapshotConfig(): {
   };
 }
 
+// Whole monthly partitions older than this are deleted on the hourly timer.
+// Three keeps the current month plus the two behind it, which covers the
+// dateFrom/dateTo window any operator has asked for so far.
+export function getAuditRetentionMonths(): number {
+  const n = safeParseInt(getMergedEnv()["AUDIT_RETENTION_MONTHS"], 3);
+  return n >= 1 ? n : 3;
+}
+
 export function isGraphExtractionEnabled(): boolean {
   return getMergedEnv()["GRAPH_EXTRACTION_ENABLED"] === "true";
 }

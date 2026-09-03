@@ -37,6 +37,8 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
 
       const memories = await kv.list<Memory>(KV.memories);
       const deletedIds = new Set<string>();
+      // Batched audit rows, one per resource per run (audit.ts bulk shape).
+      const demotedIds: string[] = [];
       for (const mem of memories) {
         if (mem.forgetAfter) {
           const expiry = new Date(mem.forgetAfter).getTime();
@@ -48,11 +50,6 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
                 await decrementImageRef(kv, sdk, mem.imageRef);
               }
               await kv.delete(KV.memories, mem.id);
-              await recordAudit(kv, "delete", "mem::auto-forget", [mem.id], {
-                resource: "memory",
-                reason: "auto-forget TTL",
-                timestamp: mem.forgetAfter,
-              });
               await deleteAccessLog(kv, mem.id);
               getSearchIndex().remove(mem.id);
               vectorIndexRemove(mem.id);
@@ -132,16 +129,26 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
                     : memB;
                 older.isLatest = false;
                 await kv.set(KV.memories, older.id, older);
-                await recordAudit(kv, "forget", "mem::auto-forget", [older.id], {
-                  resource: "memory",
-                  reason: "auto-forget contradiction",
-                  olderId: older.id,
-                  similarity: sim,
-                });
+                demotedIds.push(older.id);
               }
             }
           }
         }
+      }
+
+      if (!dryRun && result.ttlExpired.length > 0) {
+        await recordAudit(kv, "delete", "mem::auto-forget", result.ttlExpired, {
+          resource: "memory",
+          reason: "auto-forget TTL",
+          evicted: result.ttlExpired.length,
+        });
+      }
+      if (!dryRun && demotedIds.length > 0) {
+        await recordAudit(kv, "forget", "mem::auto-forget", demotedIds, {
+          resource: "memory",
+          reason: "auto-forget contradiction",
+          demoted: demotedIds.length,
+        });
       }
 
       const sessions = await kv.list<Session>(KV.sessions);

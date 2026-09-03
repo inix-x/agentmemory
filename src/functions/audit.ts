@@ -4,6 +4,16 @@ import { listBounded, isOversized } from "../state/scope-size.js";
 import type { OversizedPayload } from "../state/frame-guard.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import { getAuditRetentionMonths } from "../config.js";
+
+// Audit partitioning (U6 of the memory-reduction ladder).
+//
+// Rows are written to KV.auditMonth(now), one scope per UTC month. The legacy
+// mem:audit scope is over the enumeration guard in production and cannot be
+// listed, rotated, or trimmed from inside the process; it is retired at boot
+// by deploy/*/entrypoint.sh. Queries read the current and previous partition,
+// which is one fewer month than retention keeps, so a partition being deleted
+// on the timer is never one a query is reading.
 
 // Audit coverage policy (issue #125).
 //
@@ -42,9 +52,10 @@ export async function recordAudit(
   qualityScore?: number,
   userId?: string,
 ): Promise<AuditEntry> {
+  const now = new Date();
   const entry: AuditEntry = {
     id: generateId("aud"),
-    timestamp: new Date().toISOString(),
+    timestamp: now.toISOString(),
     operation,
     userId,
     functionId,
@@ -52,8 +63,65 @@ export async function recordAudit(
     details,
     qualityScore,
   };
-  await kv.set(KV.audit, entry.id, entry);
+  await kv.set(KV.auditMonth(now), entry.id, entry);
   return entry;
+}
+
+// The partitions a query reads: this month and last. A row written seconds
+// before a month boundary is in last month's scope, so reading one partition
+// would lose the most recent rows exactly when they matter.
+export function auditQueryScopes(now = new Date()): string[] {
+  const prev = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  return [KV.auditMonth(now), KV.auditMonth(prev)];
+}
+
+// Deletes every row in partitions older than the retention window. Whole-scope
+// deletion is the one cheap delete the engine offers: when a scope's last key
+// goes, the save loop drops the file. Bounded by walking the months between the
+// retention cutoff and a floor rather than enumerating scope names, which the
+// engine cannot do.
+export async function rotateAuditPartitions(
+  kv: StateKV,
+  now = new Date(),
+  retentionMonths = getAuditRetentionMonths(),
+): Promise<{ partitionsEmptied: number; rowsDeleted: number }> {
+  let partitionsEmptied = 0;
+  let rowsDeleted = 0;
+  // Nothing wrote a monthly partition before U6 shipped, so there is no
+  // reason to look back further than a year past the cutoff.
+  const LOOKBACK_MONTHS = 12;
+  for (let back = retentionMonths; back < retentionMonths + LOOKBACK_MONTHS; back++) {
+    const at = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - back, 1));
+    const scope = KV.auditMonth(at);
+    let rows: AuditEntry[];
+    try {
+      rows = await kv.list<AuditEntry>(scope);
+    } catch (err) {
+      logger.warn("audit rotation: partition read failed", {
+        scope,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    if (rows.length === 0) continue;
+    for (const row of rows) {
+      try {
+        await kv.delete(scope, row.id);
+        rowsDeleted++;
+      } catch (err) {
+        logger.warn("audit rotation: row delete failed", {
+          scope,
+          id: row.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    partitionsEmptied++;
+  }
+  if (partitionsEmptied > 0) {
+    logger.info("audit rotation complete", { partitionsEmptied, rowsDeleted });
+  }
+  return { partitionsEmptied, rowsDeleted };
 }
 
 export async function safeAudit(
@@ -92,21 +160,26 @@ export async function queryAudit(
   // and not the enumeration. On a large audit scope that inbound frame is
   // what stalls the worker heartbeat, which is why /agentmemory/audit was
   // the second-worst 5xx source in production. Refuse rather than pay it.
-  const listed = await listBounded<AuditEntry>(
-    kv,
-    KV.audit,
-    "narrow with ?operation, or trim the audit scope; it is too large to enumerate",
-  );
-  if (isOversized(listed)) {
-    // Hand the refusal back rather than throwing it. The comment above
-    // dates from when this was the second-worst 5xx source; once the
-    // other sources were fixed it became the largest by far, 125 of 136
-    // 5xx per hour, every one a correct refusal reported as a server
-    // fault. Callers must branch on isOversized(); see the contract on
-    // listBounded in state/scope-size.ts.
-    return listed;
+  //
+  // Two monthly partitions instead of the one unbounded scope. Each is at
+  // most a month of rows, so the guard is a ceiling that should not be hit;
+  // if a partition does trip it, the refusal is handed back the same way.
+  const all: AuditEntry[] = [];
+  for (const scope of auditQueryScopes()) {
+    const listed = await listBounded<AuditEntry>(
+      kv,
+      scope,
+      "narrow with ?operation, or lower AUDIT_RETENTION_MONTHS; this partition is too large to enumerate",
+    );
+    if (isOversized(listed)) {
+      // Hand the refusal back rather than throwing it. Once the other 5xx
+      // sources were fixed this became the largest by far, 125 of 136 per
+      // hour, every one a correct refusal reported as a server fault.
+      // Callers must branch on isOversized(); see listBounded's contract.
+      return listed;
+    }
+    all.push(...listed);
   }
-  const all = listed;
   let entries = [...all].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );
