@@ -8,6 +8,14 @@ to forbid that, and a fabricated k propagates into every gate in the ladder.
 
 Plan: `docs/plans/2026-09-03-0317-perf-memory-reduction-ladder-plan.md` (U0).
 
+**Both documents this file sends you to live outside the deployed branch.** The
+plan above and
+`docs/solutions/measurement/prove-the-instrument-before-trusting-a-negative.md`
+are untracked working files, not on `production`. If a check below fails and you
+are reading this from a fresh checkout, the fallback it names is not beside you —
+get the plan from whoever is running the ladder rather than proceeding on the
+number you already have, which is what a missing fallback quietly encourages.
+
 ---
 
 ## What this measures and why
@@ -37,6 +45,7 @@ curl -sS -w '\n== %{time_total}s\n' -H "Authorization: Bearer $AGENTMEMORY_SECRE
     node: .process.node,
     engine: .process.engine,
     cgroup: .process.cgroup,
+    resolverUnavailable,
     bootUptimeSeconds: .process.bootUptimeSeconds,
     index: .index
   }'
@@ -47,7 +56,9 @@ curl -sS -w '\n== %{time_total}s\n' -H "Authorization: Bearer $AGENTMEMORY_SECRE
 Every item here exists because a review lens showed the reading passing while
 being wrong. Do not skip one because the number beside it looks plausible.
 
-- [ ] `success` is `true`. It is computed from the state store, not hardcoded.
+- [ ] `success` is `true`. It is computed, not hardcoded: both stores must be
+      readable. An *absent* stream store still passes, which is why the next
+      items check `unavailable` rather than `exists`.
 - [ ] `dataDirSource` is `resolver` or `deploy-default`, **not** `unresolved`.
       `unresolved` means neither candidate held a `state_store.db` and every byte
       figure below is a false zero. On a miss, `dataDirCandidates` names what was
@@ -65,18 +76,43 @@ being wrong. Do not skip one because the number beside it looks plausible.
 - [ ] `unreadableFiles` is absent on both stores. Present means entries were
       dropped from `totalBytes`, so the denominator of k is short.
 - [ ] `process.engine.processes` is non-empty **and `process.engine.unavailable`
-      is absent**. `unavailable` now also fires when a matched process had an
-      unreadable VmRSS, which means `engine.rssBytes` is null or a partial sum.
-      Either way **k cannot be computed** — fall back to the plan's Appendix
-      `railway ssh` one-liner.
-- [ ] **If `process.engine.processes` has more than one entry, stop and
-      reconcile before summing.** VmRSS includes shared pages, so a sum across
-      processes overstates resident bytes, and `iii-*` is exactly the worker
-      naming `deploy/railway/entrypoint.sh` uses. Steady state on 2026-08-28 was
-      a single `iii` at 8,225 MB.
-- [ ] `process.cgroup.currentBytes` is non-null **and at least node RSS plus
-      engine RSS**. A smaller figure means a hybrid or non-namespaced cgroup
-      mount is reporting the *host* root cgroup, which looks entirely plausible.
+      is absent**. It has three causes and the string says which:
+      - *no iii engine process found* — the scan found nothing.
+      - *VmRSS unreadable for N/M* — `engine.rssBytes` is null or a partial sum.
+        Read the per-process `rssUnavailable`: "no VmRSS line" is a zombie, which
+        means the engine died inside the window and the window is void too;
+        anything else is an instrument problem and is retryable.
+      - *sums N processes* — see the next item.
+
+      For the first two, **k cannot be computed** — fall back to the plan's
+      Appendix `railway ssh` one-liner.
+
+      A pid that vanished mid-scan does **not** set this field. It is only noted
+      inside the other messages, because on its own it does not make the reading
+      incomplete.
+- [ ] **If `process.engine.processes` has more than one entry, stop.** The
+      endpoint now says so in `engine.unavailable`. VmRSS counts shared pages, so
+      the sum overstates resident bytes, and `iii-*` is exactly the worker naming
+      `deploy/railway/entrypoint.sh` uses. Steady state on 2026-08-28 was a
+      single `iii` at 8,225 MB, so more than one entry is itself the finding.
+      **Fallback:** the payload cannot separate shared from private pages — take
+      the engine figure from the Appendix `railway ssh` one-liner instead, and
+      record which process each reading came from.
+- [ ] `process.cgroup.currentBytes` is non-null.
+- [ ] `process.cgroup.currentBytes` is in the same order of magnitude as node RSS
+      plus engine RSS. **Both directions mean something and neither is the one an
+      earlier draft of this list claimed:**
+      - Much **larger** is the non-namespaced-mount case. The host root cgroup
+        accounts everything the container's does and more, so reading the host
+        can only make this number bigger, never smaller.
+      - **Smaller** than node + engine RSS does **not** indicate a mount problem.
+        It is the expected shape when the engine RSS sum double-counts pages
+        shared between processes — see the multi-process item above — because
+        cgroup accounting charges a shared page once and RSS charges it per
+        process.
+- [ ] `resolverUnavailable` is absent. Present means `resolveDataDir()` threw and
+      the candidate list is a candidate short, so `dataDirCandidates` is not the
+      full set of paths that would have been tried.
 - [ ] The call returned in under 5 seconds (U0's gate threshold).
 
 Take the second read **6 hours later, on the same `deploymentId`**, under the
@@ -88,6 +124,11 @@ Compare `process.engine.processes[].startTicks` and `pid` between the two reads:
 if either moved, the engine restarted, its RSS reset to the post-boot floor, and
 the delta below is not a measurement. `startTicks` is raw clock ticks, so compare
 it for equality rather than converting it.
+
+**A null `startTicks` on either read voids the comparison, it does not pass it.**
+`null === null`, so two failed reads look exactly like an engine that never
+restarted. If `startTicks` is null on either side, fall back to comparing `pid`
+alone and say in the closeout that restart detection was degraded.
 
 **Record which instrument produced each read.** `stat().size` (this endpoint) is
 apparent size; `du -sm` (the Appendix fallback) is allocated blocks. Under 1%
