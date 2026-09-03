@@ -18,6 +18,50 @@ number you already have, which is what a missing fallback quietly encourages.
 
 ---
 
+## Pre-deploy container baseline — measured 2026-09-03T10:32Z
+
+These are Railway **container** metrics on the deployment that is live *before*
+U0 ships (`9574ac61`, PR #9, up since 2026-09-01T18:44Z). They are not the two
+endpoint reads, and they do not fill any slot below. They are recorded here
+because Railway drops metrics for removed deployments, so a baseline not taken
+now cannot be taken later.
+
+| reading | value | plan's figure (2026-09-02T19:00Z) |
+|---|---|---|
+| container memory, current | **19,766 MB (80.4% of 24,576)** | 15,870 MB |
+| container memory, 6 h max | **21,994 MB (89.5%)** | — |
+| headroom to cap | **4,810 MB** | 8,200 MB |
+| volume `/data` | 4,015 MB of 20,000 | 3,380 MB |
+| CPU | 0.22 of 24 vCPU (0.9%) | — |
+| HTTP, 6 h | 3,135 total · 3,121 2xx · 11 4xx · **3 5xx** (0.096%) | — |
+| latency | p50 43 ms · p90 1,920 ms · p95 2,230 ms | — |
+| `/agentmemory/livez` | 200 in 110-123 ms, 3 of 3 | — |
+
+**Two things this changes.**
+
+**1. The runway is roughly half what the plan assumed.** 15,870 MB → 19,766 MB
+over 15.5 hours is ~250 MB/h, which matches the plan's rate exactly — but from a
+higher floor. 4,810 MB of headroom at that rate is **~19 hours to the 24 GB cap**,
+not the ~33 the plan states, and the 6-hour max of 21,994 MB means it has already
+touched within 2.6 GB of it. OQ4 (the `GRAPH_EXTRACTION_ENABLED=false` emergency
+lever) is closer than the plan assumed.
+
+**2. The load floor cannot be met by ambient traffic.** 3,135 requests over 6
+hours is **8.7 req/min**. Every gate in the ladder — U0's included — specifies 45
+req/min for 1 to 2 hours. Ambient traffic is 5x short, so either the windows are
+driven by generated load at a fixed rate, or no gate in the ladder is judgeable.
+`docs/solutions/measurement/prove-the-instrument-before-trusting-a-negative.md`
+is explicit about why this cannot be waved through: "any before/after needs
+generated load at a fixed rate. Ambient traffic here varies by an order of
+magnitude and will 'prove' anything."
+
+The 5xx figure above is the pre-U1 baseline KTD14 asks for, at this request rate
+(R8: rate stated beside the count). Three 5xx in six hours at 8.7 req/min is not
+the same baseline as three 5xx at 45 req/min, and the tripwire threshold has to
+be re-read against whatever rate the window actually runs at.
+
+---
+
 ## What this measures and why
 
 The engine's two stores are one eagerly-loaded in-memory map with no eviction, so
