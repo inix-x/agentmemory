@@ -25,13 +25,8 @@ const LARGEST_FILES = 50;
 // resolveDataDir() covers every other install. The probe is load-bearing: inside
 // the container HOME=/root survives gosu, so resolveDataDir() answers
 // /root/.local/share/agentmemory, which uid node cannot read.
-const DEPLOY_DATA_DIR = "/data";
 const STATE_STORE = "state_store.db";
 const STREAM_STORE = "stream_store";
-const CGROUP_PATHS = [
-  "/sys/fs/cgroup/memory.current",
-  "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-];
 
 export type StoreReport = {
   path: string;
@@ -48,6 +43,11 @@ export type EngineProcess = {
   pid: number;
   comm: string;
   rssBytes: number | null;
+  // Why rssBytes is null. A zombie carries no Vm* lines, which means the engine
+  // just died and the six-hour window is void; EACCES means the endpoint runs as
+  // the wrong uid, which is a retryable config fix. Different operator actions,
+  // so the aggregate count is not enough.
+  rssUnavailable?: string;
   // Raw clock ticks since boot, /proc/<pid>/stat field 22. Emitted unconverted:
   // _SC_CLK_TCK is not reachable from Node without a native addon, and assuming
   // 100 is the unit guess that turns an instrument into a confidently wrong
@@ -55,12 +55,25 @@ export type EngineProcess = {
   startTicks: number | null;
 };
 
+// The values production actually runs on. src/index.ts registers with no
+// overrides, so a typo in any of these returns an unresolved dataDir or a null
+// cgroup on Railway while every test still passes.
+export const DIAGNOSTICS_DEFAULTS = {
+  procRoot: "/proc",
+  deployDataDir: "/data",
+  cgroupPaths: [
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+  ],
+} as const;
+
 export type StoreDiagnostics = {
   success: boolean;
   at: string;
   dataDir: string;
   dataDirSource: "override" | "resolver" | "deploy-default" | "unresolved";
   dataDirCandidates: string[];
+  resolverUnavailable?: string;
   stores: { state: StoreReport; stream: StoreReport };
   process: {
     node: { pid: number; uptimeSeconds: number; rssBytes: number };
@@ -175,7 +188,10 @@ async function readStoreDir(path: string): Promise<StoreReport> {
 function resolveStoreDataDir(
   override: string | undefined,
   deployDataDir: string,
-): Pick<StoreDiagnostics, "dataDir" | "dataDirSource" | "dataDirCandidates"> {
+): Pick<
+  StoreDiagnostics,
+  "dataDir" | "dataDirSource" | "dataDirCandidates" | "resolverUnavailable"
+> {
   if (override) {
     return {
       dataDir: override,
@@ -185,11 +201,16 @@ function resolveStoreDataDir(
   }
 
   let resolved: string | null = null;
+  let resolverUnavailable: string | undefined;
   try {
     resolved = resolveDataDir().dataDir;
   } catch (err) {
+    // This is the one degraded path whose only signal used to be a log line,
+    // in an endpoint that exists so gates are judgeable without shell access on
+    // the container. A silently shorter candidate list reads as intended.
+    resolverUnavailable = reason(err);
     logger.warn("diagnostics-store: data dir resolver threw", {
-      error: reason(err),
+      error: resolverUnavailable,
     });
   }
 
@@ -199,9 +220,15 @@ function resolveStoreDataDir(
   if (resolved) candidates.push([resolved, "resolver"]);
 
   const paths = candidates.map(([dir]) => dir);
+  const carry = resolverUnavailable ? { resolverUnavailable } : {};
   for (const [dir, source] of candidates) {
     if (existsSync(join(dir, STATE_STORE))) {
-      return { dataDir: dir, dataDirSource: source, dataDirCandidates: paths };
+      return {
+        dataDir: dir,
+        dataDirSource: source,
+        dataDirCandidates: paths,
+        ...carry,
+      };
     }
   }
 
@@ -211,6 +238,7 @@ function resolveStoreDataDir(
     dataDir: paths[0]!,
     dataDirSource: "unresolved",
     dataDirCandidates: paths,
+    ...carry,
   };
 }
 
@@ -295,6 +323,7 @@ async function findEngineProcesses(procRoot: string): Promise<{
       pid: parseInt(entry, 10),
       comm: comm.trim(),
       rssBytes: rss.bytes,
+      ...(rss.unavailable ? { rssUnavailable: rss.unavailable } : {}),
       startTicks: await readStartTicks(procDir),
     });
   }
@@ -320,14 +349,26 @@ async function findEngineProcesses(procRoot: string): Promise<{
         .join(", ")}); engine.rssBytes is ${shape}${skippedNote}`,
     };
   }
-  return {
-    processes,
-    ...(skipped > 0 ? { unavailable: skippedNote.trim() } : {}),
-  };
+  // VmRSS counts shared pages, so adding it across processes overstates
+  // resident bytes -- and k inflating is the direction that makes every unit in
+  // the ladder look more attractive than it is. `iii-*` is exactly the worker
+  // naming the entrypoint uses, so this is one engine build away from live.
+  if (processes.length > 1) {
+    return {
+      processes,
+      unavailable: `engine.rssBytes sums ${processes.length} processes (pids ${processes
+        .map((p) => p.pid)
+        .join(", ")}); VmRSS counts shared pages, so the sum overstates resident bytes${skippedNote}`,
+    };
+  }
+  // A pid whose comm could not be read was never shown to be an engine process,
+  // so on its own it does not make this reading incomplete. Reporting it through
+  // `unavailable` would tell the operator k cannot be computed when it can.
+  return { processes };
 }
 
 async function readCgroupCurrent(
-  paths: string[],
+  paths: readonly string[],
 ): Promise<{ currentBytes: number | null; unavailable?: string }> {
   const failures: string[] = [];
   for (const path of paths) {
@@ -363,17 +404,22 @@ export function registerDiagnosticsStoreFunction(
     dataDir?: string;
     deployDataDir?: string;
     procRoot?: string;
-    cgroupPaths?: string[];
+    cgroupPaths?: readonly string[];
   } = {},
 ): void {
-  const procRoot = overrides.procRoot ?? "/proc";
-  const cgroupPaths = overrides.cgroupPaths ?? CGROUP_PATHS;
-  const deployDataDir = overrides.deployDataDir ?? DEPLOY_DATA_DIR;
+  const procRoot = overrides.procRoot ?? DIAGNOSTICS_DEFAULTS.procRoot;
+  const cgroupPaths = overrides.cgroupPaths ?? DIAGNOSTICS_DEFAULTS.cgroupPaths;
+  const deployDataDir = overrides.deployDataDir ?? DIAGNOSTICS_DEFAULTS.deployDataDir;
   sdk.registerFunction(
     "mem::diagnostics-store",
     async (): Promise<StoreDiagnostics> => {
       const at = new Date().toISOString();
-      const { dataDir, dataDirSource, dataDirCandidates } = resolveStoreDataDir(
+      const {
+        dataDir,
+        dataDirSource,
+        dataDirCandidates,
+        resolverUnavailable,
+      } = resolveStoreDataDir(
         overrides.dataDir,
         deployDataDir,
       );
@@ -397,11 +443,19 @@ export function registerDiagnosticsStoreFunction(
         // Not a literal: 20+ sibling modules return success: false on failure,
         // so callers branch on it. A hardcoded true would pass cleanly on a
         // response whose every byte figure is a false zero (CHANGELOG:689).
-        success: state.exists && !state.unavailable,
+        //
+        // An unreadable STREAM store counts too. U1's gate metric is "stream
+        // file count and total bytes from the U0 endpoint", threshold "frozen
+        // across the window" -- so a blind stream read passes U1 by seeing
+        // nothing. An ABSENT stream store is not a failure: the plan's own U0
+        // scenario requires "a missing stream directory reports zero files and
+        // no error", which is why this tests `unavailable` and not `exists`.
+        success: state.exists && !state.unavailable && !stream.unavailable,
         at,
         dataDir,
         dataDirSource,
         dataDirCandidates,
+        ...(resolverUnavailable ? { resolverUnavailable } : {}),
         stores: { state, stream },
         process: {
           node: {

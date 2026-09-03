@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  symlinkSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,9 +14,23 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+// `resolveDataDir` honours `./data/state_store.db` relative to cwd, and the
+// repo's own iii-config.yaml:16 tells the engine to write exactly there. Without
+// this stub, clone -> install -> run the engine once -> `npm test` turns the
+// unresolved test red against unmodified source, and the maintainer sees a gate
+// failure that looks like a bug in this diff. vitest.config.ts already stubs
+// HOME for the same class of reason; this covers the axis that stub cannot
+// reach. `resolverDataDir` lets a test point it at a seeded directory, which is
+// also the only way to reach the resolver-wins branch.
+let resolverDataDir = "/nonexistent-resolver-dir";
+vi.mock("../src/cli-data-dir.js", () => ({
+  resolveDataDir: () => ({ dataDir: resolverDataDir, source: "default" }),
+}));
+
 import {
   registerDiagnosticsStoreFunction,
   scopePrefix,
+  DIAGNOSTICS_DEFAULTS,
   type StoreDiagnostics,
 } from "../src/functions/diagnostics-store.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
@@ -132,6 +153,7 @@ beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), "am-diag-"));
   procRoot = mkdtempSync(join(tmpdir(), "am-proc-"));
   cgroupDir = mkdtempSync(join(tmpdir(), "am-cg-"));
+  resolverDataDir = "/nonexistent-resolver-dir";
 });
 
 afterEach(() => {
@@ -210,6 +232,38 @@ describe("store byte accounting", () => {
     expect(stream.fileCount).toBe(0);
     expect(typeof stream.unavailable).toBe("string");
     expect(stream.unavailable!.length).toBeGreaterThan(0);
+    // U1 is judged on the stream store alone, so a blind stream read must not
+    // report success even when the state store is perfectly healthy.
+    expect(result.success).toBe(false);
+  });
+
+  it("counts entries dropped from the total instead of quietly shrinking it", async () => {
+    seedStateStore({ "mem:memories.bin": 10, "mem:obs:ses_a.bin": 20 });
+    // A dangling symlink makes stat throw ENOENT every run, which is the same
+    // shape as a file deleted between readdir and stat by the engine's own GC.
+    symlinkSync(
+      join(dataDir, "state_store.db", "gone"),
+      join(dataDir, "state_store.db", "mem:obs:ses_dead.bin"),
+    );
+
+    const state = (await readDiagnostics()).stores.state;
+
+    expect(state.fileCount).toBe(2);
+    expect(state.totalBytes).toBe(30);
+    expect(state.unreadableFiles).toBe(1);
+  });
+
+  it("reports a readable but genuinely empty store as a success", async () => {
+    // The one shape that must stay a pass while its byte figures look identical
+    // to the blind read above.
+    seedStateStore({});
+
+    const result = await readDiagnostics();
+
+    expect(result.stores.state.exists).toBe(true);
+    expect(result.stores.state.fileCount).toBe(0);
+    expect(result.stores.state.unavailable).toBeUndefined();
+    expect(result.success).toBe(true);
   });
 
   it("reports success false when the state store itself is unreadable", async () => {
@@ -240,6 +294,12 @@ describe("scopePrefix", () => {
     ["mem:memories.bin", "mem:memories"],
     ["mem:recent-searches.bin", "mem:recent-searches"],
     ["mem:audit", "mem:audit"],
+    // A stream group file is named for the raw session id. Two parts on "_", so
+    // it stays whole -- this is the row that makes `> 2` load-bearing.
+    ["ses_alpha.bin", "ses_alpha"],
+    // Three parts on "_", so the underscore in the character class is what does
+    // the splitting here.
+    ["mem:obs_ses_alpha.bin", "mem:obs"],
   ])("maps %s to %s", (name, expected) => {
     expect(scopePrefix(name)).toBe(expected);
   });
@@ -259,6 +319,22 @@ describe("data directory resolution", () => {
     expect(result.dataDirCandidates[0]).toBe(dataDir);
   });
 
+  it("falls back to the resolver when the deploy default holds no store", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    resolverDataDir = dataDir;
+    const bare = mkdtempSync(join(tmpdir(), "am-bare-"));
+
+    const result = await readDiagnostics({
+      dataDir: undefined,
+      deployDataDir: bare,
+    });
+
+    expect(result.dataDirSource).toBe("resolver");
+    expect(result.dataDir).toBe(dataDir);
+    expect(result.dataDirCandidates).toEqual([bare, dataDir]);
+    rmSync(bare, { recursive: true, force: true });
+  });
+
   it("says unresolved when no candidate holds a store", async () => {
     const bare = mkdtempSync(join(tmpdir(), "am-bare-"));
 
@@ -274,6 +350,20 @@ describe("data directory resolution", () => {
     expect(result.success).toBe(false);
     rmSync(bare, { recursive: true, force: true });
   });
+
+  it("pins the values production actually runs on", async () => {
+    // src/index.ts registers with no overrides, so these constants are the only
+    // paths production ever uses and nothing else asserts them. A typo returns
+    // an unresolved dataDir and a null cgroup on Railway with every test green.
+    expect(DIAGNOSTICS_DEFAULTS).toEqual({
+      procRoot: "/proc",
+      deployDataDir: "/data",
+      cgroupPaths: [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+      ],
+    });
+  });
 });
 
 describe("process memory", () => {
@@ -281,7 +371,10 @@ describe("process memory", () => {
     seedStateStore({ "mem:memories.bin": 10 });
     seedProc("101", "node", { vmRssKb: 4096 });
     seedProc("202", "iii", { vmRssKb: 2048, startTicks: 987654 });
-    seedProc("self", "node", { vmRssKb: 4096 });
+    // Non-numeric, so the pid filter must exclude it. comm is `iii` on purpose:
+    // with `node` the isEngineComm test would reject it first and the pid filter
+    // would never do any work. On real Linux /proc/self mirrors this process.
+    seedProc("self", "iii", { vmRssKb: 4096 });
 
     const engine = (await readDiagnostics()).process.engine;
 
@@ -292,7 +385,7 @@ describe("process memory", () => {
     expect(engine.unavailable).toBeUndefined();
   });
 
-  it("sums every iii-* process so a multi-process engine is not undercounted", async () => {
+  it("marks a multi-process sum as overstating rather than reporting it clean", async () => {
     seedStateStore({ "mem:memories.bin": 10 });
     seedProc("202", "iii", { vmRssKb: 1000 });
     seedProc("303", "iii-state", { vmRssKb: 500 });
@@ -301,6 +394,38 @@ describe("process memory", () => {
 
     expect(engine.processes).toHaveLength(2);
     expect(engine.rssBytes).toBe(1500 * 1024);
+    // VmRSS counts shared pages, so the sum overstates -- and k inflating is the
+    // direction that makes every unit in the ladder look better than it is. The
+    // runbook tells the operator to stop and reconcile; that instruction is only
+    // reachable if the payload says so through the field the checklist gates on.
+    expect(engine.unavailable).toContain("overstates");
+    expect(engine.unavailable).toContain("202");
+    expect(engine.unavailable).toContain("303");
+  });
+
+  it("does not call a reading incomplete because an unrelated pid vanished", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    seedProc("202", "iii", { vmRssKb: 1000 });
+    // A numeric pid with no comm file: the process exited between readdir and
+    // the read. It was never shown to be an engine process, so the engine sum is
+    // complete and `unavailable` must stay absent -- otherwise the runbook sends
+    // the operator to the ssh fallback and discards a valid six-hour window.
+    mkdirSync(join(procRoot, "404"), { recursive: true });
+
+    const engine = (await readDiagnostics()).process.engine;
+
+    expect(engine.rssBytes).toBe(1000 * 1024);
+    expect(engine.unavailable).toBeUndefined();
+  });
+
+  it("names the skipped pids when the scan also failed to find an engine", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    mkdirSync(join(procRoot, "404"), { recursive: true });
+
+    const engine = (await readDiagnostics()).process.engine;
+
+    expect(engine.unavailable).toContain("no iii engine");
+    expect(engine.unavailable).toContain("1 pids skipped");
   });
 
   it("flags a partial sum when one matched process has no readable VmRSS", async () => {
@@ -332,6 +457,36 @@ describe("process memory", () => {
     expect(engine.rssBytes).toBeNull();
     expect(engine.processes[0]!.rssBytes).toBeNull();
     expect(engine.unavailable).toContain("VmRSS unreadable");
+    // A zombie means the engine just died, which voids the window; EACCES means
+    // the wrong uid, which is retryable. The aggregate count cannot say which,
+    // so the per-process reason has to survive to the payload.
+    expect(engine.processes[0]!.rssUnavailable).toContain("no VmRSS line");
+  });
+
+  it("carries the errno when the status file cannot be read at all", async () => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    seedProc("202", "iii");
+
+    const engine = (await readDiagnostics()).process.engine;
+
+    expect(engine.processes[0]!.rssUnavailable).toBeTruthy();
+    expect(engine.processes[0]!.rssUnavailable).not.toContain("no VmRSS line");
+  });
+
+  it.each([
+    ["no stat file", undefined],
+    ["a line with no closing paren", "202 iii 3 4 5\n"],
+    ["a non-numeric field 22", `202 (iii) ${Array.from({ length: 40 }, (_, i) => (i === 19 ? "-" : String(i + 3))).join(" ")}\n`],
+  ])("reports startTicks null on %s", async (_label, rawStat) => {
+    seedStateStore({ "mem:memories.bin": 10 });
+    seedProc("202", "iii", { vmRssKb: 10 });
+    if (rawStat) writeFileSync(join(procRoot, "202", "stat"), rawStat);
+
+    const engine = (await readDiagnostics()).process.engine;
+
+    // Null, never 0. A 0 reads as "started at boot" and hides exactly the
+    // restart the runbook uses this field to detect.
+    expect(engine.processes[0]!.startTicks).toBeNull();
   });
 
   it("explains an absent engine instead of reporting a bare null", async () => {
@@ -436,6 +591,17 @@ describe("index counts", () => {
 });
 
 describe("GET /agentmemory/diagnostics/store", () => {
+  it("registers the path, method, and auth middleware the runbook curls", () => {
+    // mockSdk discards registerTrigger configs, so nothing else in this file
+    // pins the route. consistency.test.ts counts `api_path:` occurrences rather
+    // than their values, so a rename keeps the endpoint total at 132 too -- and
+    // the operator runbook curls this exact URL.
+    const api = readFileSync("src/triggers/api.ts", "utf-8");
+    expect(api).toMatch(
+      /api_path:\s*"\/agentmemory\/diagnostics\/store",\s*http_method:\s*"GET",\s*middleware_function_ids:\s*\["middleware::api-auth"\]/,
+    );
+  });
+
   it("denies an unauthenticated request the way every other endpoint does", async () => {
     const { sdk, handlers } = mockSdk();
     registerDiagnosticsStoreFunction(sdk as never, { dataDir, procRoot });
