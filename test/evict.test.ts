@@ -154,13 +154,17 @@ describe("mem::evict stale sessions", () => {
 
     expect(result.staleSessions).toBe(1);
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
-    // recordAudit writes to the current monthly partition now.
+    // recordAudit writes to the current monthly partition now, and evict
+    // emits one row per resource per run rather than one per item.
     const audits = await kv.list<{
-      details: { reason: string };
+      targetIds: string[];
+      details: { resource: string; byReason: Record<string, number> };
     }>(auditQueryScopes()[0]!);
-    expect(audits[0].details.reason).toBe(
-      "stale_session_recovered_then_evicted",
-    );
+    const sessionRow = audits.find((a) => a.details.resource === "session");
+    expect(sessionRow?.targetIds).toEqual([sessionId]);
+    expect(sessionRow?.details.byReason).toEqual({
+      stale_session_recovered_then_evicted: 1,
+    });
     expect(calls.map((call) => call.function_id)).toContain(
       "event::session::stopped",
     );

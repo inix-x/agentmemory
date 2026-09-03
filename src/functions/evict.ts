@@ -125,6 +125,13 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         nonLatestMemories: 0,
         dryRun,
       };
+      // Ids deleted this run, per resource, for the batched audit rows at the
+      // end. Only ids whose delete succeeded land here.
+      const evicted: Record<"session" | "observation" | "memory", Array<{ id: string; reason: string }>> = {
+        session: [],
+        observation: [],
+        memory: [],
+      };
 
       let recoveredStaleSessions = 0;
       const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
@@ -180,12 +187,11 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               });
               continue;
             }
-            await recordAudit(kv, "delete", "mem::evict", [session.id], {
-              resource: "session",
+            evicted.session.push({
+              id: session.id,
               reason: recovered
                 ? "stale_session_recovered_then_evicted"
                 : "stale_session_without_summary",
-              dryRun,
             });
           }
         }
@@ -227,11 +233,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               }
               if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
               if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
+              evicted.observation.push({
+                id: o.id,
                 reason: "low_importance_old_observation",
-                sessionId: session.id,
-                dryRun,
               });
             }
           }
@@ -270,11 +274,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               }
               if (o.imageData) await decrementImageRef(kv, sdk, o.imageData);
               if (o.imageRef && o.imageRef !== o.imageData) await decrementImageRef(kv, sdk, o.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
+              evicted.observation.push({
+                id: o.id,
                 reason: "project_observation_cap",
-                sessionId: o.sessionId,
-                dryRun,
               });
             }
           }
@@ -307,11 +309,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               if (mem.imageRef) {
                 await decrementImageRef(kv, sdk, mem.imageRef);
               }
-              await recordAudit(kv, "delete", "mem::evict", [mem.id], {
-                resource: "memory",
-                reason: "expired_memory",
-                dryRun,
-              });
+              evicted.memory.push({ id: mem.id, reason: "expired_memory" });
               await deleteAccessLog(kv, mem.id);
             }
           }
@@ -342,15 +340,28 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               if (mem.imageRef) {
                 await decrementImageRef(kv, sdk, mem.imageRef);
               }
-              await recordAudit(kv, "delete", "mem::evict", [mem.id], {
-                resource: "memory",
-                reason: "old_non_latest_memory",
-                dryRun,
-              });
+              evicted.memory.push({ id: mem.id, reason: "old_non_latest_memory" });
               await deleteAccessLog(kv, mem.id);
             }
           }
         }
+      }
+
+      // One row per resource per run, the bulk-deletion shape audit.ts
+      // requires. This used to be one row per item across five sites, which
+      // is most of what pushed the audit scope over the enumeration guard.
+      // Per-item reasons ride along as a count map so nothing is lost.
+      for (const [resource, rows] of Object.entries(evicted)) {
+        if (rows.length === 0) continue;
+        const byReason: Record<string, number> = {};
+        for (const r of rows) byReason[r.reason] = (byReason[r.reason] ?? 0) + 1;
+        await recordAudit(
+          kv,
+          "delete",
+          "mem::evict",
+          rows.map((r) => r.id),
+          { resource, evicted: rows.length, byReason, dryRun },
+        );
       }
 
       logger.info("Eviction complete", { stats });
