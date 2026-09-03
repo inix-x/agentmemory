@@ -193,17 +193,11 @@ export function registerCompressFunction(
           { kind: "observation", logId: compressed.id },
         );
 
-        const streamResults = await Promise.allSettled([
-          sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(data.sessionId),
-              item_id: data.observationId,
-              data: { type: "compressed", observation: compressed },
-            },
-          }),
-          sdk.trigger({
+        // Publishing to the viewer must not fail the compression that already
+        // committed. This was an allSettled over two sends; the session-group
+        // one is gone, so a single catch says the same thing.
+        try {
+          await sdk.trigger({
             function_id: "stream::send",
             payload: {
               stream_name: STREAM.name,
@@ -217,19 +211,13 @@ export function registerCompressFunction(
               },
             },
             action: TriggerAction.Void(),
-          }),
-        ]);
-        for (const result of streamResults) {
-          if (result.status === "rejected") {
-            logger.warn("Non-fatal stream publish failure after compress", {
-              sessionId: data.sessionId,
-              observationId: data.observationId,
-              error:
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason),
-            });
-          }
+          });
+        } catch (err) {
+          logger.warn("Non-fatal stream publish failure after compress", {
+            sessionId: data.sessionId,
+            observationId: data.observationId,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
 
         const latencyMs = Date.now() - startMs;
