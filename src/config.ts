@@ -381,6 +381,17 @@ export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
 }
 
+// Governs WRITERS only. Readers resolve both provenance shapes regardless, so
+// flipping this back to `legacy` is a rollback for new writes while every row
+// already written in batch mode stays readable. Read per call rather than at
+// boot so the flip takes effect without a redeploy. Defaults to legacy for one
+// deploy so the readers ship before any row depends on them.
+export type GraphProvenanceMode = "legacy" | "batch";
+
+export function getGraphProvenanceMode(): GraphProvenanceMode {
+  return getMergedEnv()["GRAPH_PROVENANCE_MODE"] === "batch" ? "batch" : "legacy";
+}
+
 // window for the smart-search followup-rate diagnostic. A second
 // search arriving within this many seconds (with disjoint results)
 // counts as a "follow-up" — a directional signal that the first result

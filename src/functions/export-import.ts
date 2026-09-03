@@ -21,6 +21,7 @@ import type {
   Insight,
   ExportPagination,
   AccessLogExport,
+  GraphBatch,
 } from "../types.js";
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
@@ -115,6 +116,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         signals,
         checkpoints,
         accessLogs,
+        graphBatches,
       ] = await Promise.all([
         listGraphScopes(kv, "mem::export"),
         listBoundedOrSkip<SemanticMemory>(kv, KV.semantic, "mem::export"),
@@ -131,6 +133,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         listBoundedOrSkip<Signal>(kv, KV.signals, "mem::export"),
         listBoundedOrSkip<Checkpoint>(kv, KV.checkpoints, "mem::export"),
         listBoundedOrSkip<AccessLogExport>(kv, KV.accessLog, "mem::export"),
+        listBoundedOrSkip<GraphBatch>(kv, KV.graphBatches, "mem::export"),
       ]);
 
       if (!graph.enumerated) {
@@ -151,6 +154,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         profiles: profiles.length > 0 ? profiles : undefined,
         graphNodes: graph.nodes.length > 0 ? graph.nodes : undefined,
         graphEdges: graph.edges.length > 0 ? graph.edges : undefined,
+        graphBatches: graphBatches.length > 0 ? graphBatches : undefined,
         semanticMemories:
           semanticMemories.length > 0 ? semanticMemories : undefined,
         proceduralMemories:
@@ -494,6 +498,17 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             if (existing) { stats.skipped++; return; }
           }
           await kv.set(KV.graphEdges, edge.id, edge);
+        });
+      }
+      // A batch-mode row imported without its batch resolves to no
+      // observations, so batches travel with the graph.
+      if (importData.graphBatches) {
+        await runChunked(importData.graphBatches, async (batch) => {
+          if (strategy === "skip") {
+            const existing = await kv.get(KV.graphBatches, batch.id).catch(() => null);
+            if (existing) { stats.skipped++; return; }
+          }
+          await kv.set(KV.graphBatches, batch.id, batch);
         });
       }
       if (importData.semanticMemories) {

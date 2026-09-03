@@ -1,11 +1,14 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import type { Memory, GraphNode, GraphEdge } from "../types.js";
+import type { Memory } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { listGraphScopes } from "./graph.js";
+import { resolveGraphObservationIds } from "./graph-provenance.js";
+import { logger } from "../logger.js";
 
 export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::cascade-update", 
+  sdk.registerFunction("mem::cascade-update",
     async (data: { supersededMemoryId: string }) => {
       if (!data.supersededMemoryId || typeof data.supersededMemoryId !== "string") {
         return { success: false, error: "supersededMemoryId is required" };
@@ -19,41 +22,59 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
       let flaggedNodes = 0;
       let flaggedEdges = 0;
       let flaggedMemories = 0;
+      let graphSkipped = false;
 
       const obsIds = new Set(superseded.sourceObservationIds || []);
 
       if (obsIds.size > 0) {
-        const now = new Date().toISOString();
-        const nodes = await kv.list<GraphNode>(KV.graphNodes);
-        for (const node of nodes) {
-          if (node.stale) continue;
-          const overlap = (node.sourceObservationIds ?? []).some((id) => obsIds.has(id));
-          if (overlap) {
-            node.stale = true;
-            node.updatedAt = now;
-            await kv.set(KV.graphNodes, node.id, node);
-            await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
-              resourceType: "GraphNode",
-              change: "marked stale from superseded memory",
-              supersededMemoryId: data.supersededMemoryId,
-            });
-            flaggedNodes++;
-          }
-        }
+        // This used to kv.list both graph scopes directly, bypassing the
+        // enumeration guard every other graph reader goes through. On a
+        // refused graph that is the unbounded read that gets the worker
+        // declared dead; the guard returns empty and says so instead.
+        const graph = await listGraphScopes(kv, "mem::cascade-update");
+        if (!graph.enumerated) {
+          graphSkipped = true;
+          logger.warn("Cascade skipped graph flagging: enumeration refused", {
+            supersededMemoryId: data.supersededMemoryId,
+          });
+        } else {
+          const now = new Date().toISOString();
+          // Provenance resolved across both shapes, so a row that carries a
+          // batch id flags exactly when the legacy array would have (R10).
+          const provenance = await resolveGraphObservationIds(kv, [
+            ...graph.nodes,
+            ...graph.edges,
+          ]);
+          const overlaps = (rowId: string) =>
+            (provenance.get(rowId) ?? []).some((id) => obsIds.has(id));
 
-        const edges = await kv.list<GraphEdge>(KV.graphEdges);
-        for (const edge of edges) {
-          if (edge.stale) continue;
-          const overlap = (edge.sourceObservationIds ?? []).some((id) => obsIds.has(id));
-          if (overlap) {
-            edge.stale = true;
-            await kv.set(KV.graphEdges, edge.id, edge);
-            await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
-              resourceType: "GraphEdge",
-              change: "marked stale from superseded memory",
-              supersededMemoryId: data.supersededMemoryId,
-            });
-            flaggedEdges++;
+          for (const node of graph.nodes) {
+            if (node.stale) continue;
+            if (overlaps(node.id)) {
+              node.stale = true;
+              node.updatedAt = now;
+              await kv.set(KV.graphNodes, node.id, node);
+              await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
+                resourceType: "GraphNode",
+                change: "marked stale from superseded memory",
+                supersededMemoryId: data.supersededMemoryId,
+              });
+              flaggedNodes++;
+            }
+          }
+
+          for (const edge of graph.edges) {
+            if (edge.stale) continue;
+            if (overlaps(edge.id)) {
+              edge.stale = true;
+              await kv.set(KV.graphEdges, edge.id, edge);
+              await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
+                resourceType: "GraphEdge",
+                change: "marked stale from superseded memory",
+                supersededMemoryId: data.supersededMemoryId,
+              });
+              flaggedEdges++;
+            }
           }
         }
       }
@@ -84,6 +105,7 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
           siblingMemories: flaggedMemories,
         },
         total: flaggedNodes + flaggedEdges + flaggedMemories,
+        ...(graphSkipped ? { warning: "graph enumeration refused; graph rows not flagged" } : {}),
       };
     },
   );
