@@ -23,6 +23,58 @@ III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-conf
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_AS" "$DATA_DIR"
 
+# U2 of the memory-reduction ladder. The engine loads every store file into one
+# in-memory map at boot and never evicts, so historical stream items stay
+# resident for the life of the process. After U1 nothing writes a per-session
+# stream group, and the viewer publishes over `stream::send` rather than storing,
+# so those files have no reader and no writer.
+#
+# Retire by RENAME, never delete. The volume has room, so keeping them costs
+# nothing and any retirement is undone by moving the directory back. This runs
+# before the engine starts and every boot here is a stop-then-start, so the
+# engine never sees a file mid-move.
+#
+# Deliberately flagless (KTD5): a flag would need a second deploy to unset and
+# would be one more thing to forget.
+retire_stream_files() {
+    _src="$1"
+    [ -d "$_src" ] || return 0
+
+    _dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    _count=0
+    _bytes=0
+
+    for _f in "$_src"/*; do
+        # Unmatched glob stays literal, and directories are left alone.
+        [ -f "$_f" ] || continue
+        # Skip the group the dashboard subscribes to, whatever the engine names
+        # it on disk. U0 records the real naming; this pattern is deliberately
+        # loose because a kept file costs bytes while a wrongly-moved one costs
+        # the live feed.
+        case "${_f##*/}" in
+            *viewer*) continue ;;
+        esac
+
+        if [ "$_count" -eq 0 ]; then
+            mkdir -p "$_dest" || return 0
+        fi
+        _size=$(wc -c < "$_f" 2>/dev/null || echo 0)
+        if mv "$_f" "$_dest/" 2>/dev/null; then
+            _count=$((_count + 1))
+            _bytes=$((_bytes + _size))
+        fi
+    done
+
+    # Idempotent: a boot with nothing to move creates no directory and logs
+    # nothing, so this is silent on every deploy after the first.
+    if [ "$_count" -gt 0 ]; then
+        chown -R "$RUN_AS" "$_dest" 2>/dev/null || true
+        echo "agentmemory: retired $_count stream file(s), $_bytes bytes, to $_dest"
+    fi
+}
+
+retire_stream_files "$DATA_DIR/stream_store"
+
 cat > "$III_CONFIG" <<'EOF'
 workers:
   - name: iii-http
