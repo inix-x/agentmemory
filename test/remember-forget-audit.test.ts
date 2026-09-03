@@ -15,6 +15,7 @@ import {
 } from "../src/functions/search.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
 import type { Memory } from "../src/types.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -70,7 +71,7 @@ describe("mem::forget audit coverage (issue #125)", () => {
       functionId: string;
       targetIds: string[];
       details: Record<string, unknown>;
-    }>("mem:audit");
+    }>(auditQueryScopes()[0]!);
     expect(auditRows).toHaveLength(1);
     const [row] = auditRows;
     expect(row.operation).toBe("forget");
@@ -99,7 +100,7 @@ describe("mem::forget audit coverage (issue #125)", () => {
     const auditRows = await kv.list<{
       targetIds: string[];
       details: Record<string, unknown>;
-    }>("mem:audit");
+    }>(auditQueryScopes()[0]!);
     expect(auditRows).toHaveLength(1);
     const [row] = auditRows;
     expect([...row.targetIds].sort()).toEqual(["obs_a", "obs_b"]);
@@ -119,7 +120,7 @@ describe("mem::forget audit coverage (issue #125)", () => {
       payload: { sessionId: undefined, memoryId: undefined },
     });
 
-    const auditRows = await kv.list("mem:audit");
+    const auditRows = await kv.list(auditQueryScopes()[0]!);
     expect(auditRows).toHaveLength(0);
   });
 
@@ -153,7 +154,7 @@ describe("mem::forget audit coverage (issue #125)", () => {
       payload: { memoryId: "lsn_4f9cb07017a7c8ac" },
     });
 
-    const auditRows = await kv.list("mem:audit");
+    const auditRows = await kv.list(auditQueryScopes()[0]!);
     expect(auditRows).toHaveLength(0);
   });
 });

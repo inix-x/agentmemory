@@ -1300,7 +1300,32 @@ export function registerApiTriggers(
     },
   });
 
-  sdk.registerFunction("api::timeline", 
+  // U0 of the memory-reduction ladder. Railway metrics only expose the
+  // combined container figure, so every unit's gate needs this split
+  // (per-scope store bytes, node RSS vs engine RSS, cgroup current) to be
+  // judgeable without shell access on the container.
+  sdk.registerFunction("api::diagnostics-store",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::diagnostics-store",
+        payload: {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::diagnostics-store",
+    config: {
+      api_path: "/agentmemory/diagnostics/store",
+      http_method: "GET",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::timeline",
     async (
       req: ApiRequest<{
         anchor: string;

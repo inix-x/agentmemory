@@ -373,6 +373,14 @@ export function loadSnapshotConfig(): {
   };
 }
 
+// Whole monthly partitions older than this are deleted on the hourly timer.
+// Three keeps the current month plus the two behind it, which covers the
+// dateFrom/dateTo window any operator has asked for so far.
+export function getAuditRetentionMonths(): number {
+  const n = safeParseInt(getMergedEnv()["AUDIT_RETENTION_MONTHS"], 3);
+  return n >= 1 ? n : 3;
+}
+
 // Observation retention (U5 of the memory-reduction ladder). The defaults are
 // today's hardcoded values, so a deploy with the env unset changes nothing; the
 // deletion policy is Omar's to set from the dry-run counts, not this code's

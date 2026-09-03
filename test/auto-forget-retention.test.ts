@@ -7,15 +7,13 @@ vi.mock("../src/logger.js", () => ({
 import { registerAutoForgetFunction } from "../src/functions/auto-forget.js";
 import { getSearchIndex, setVectorIndex } from "../src/functions/search.js";
 import { VectorIndex } from "../src/state/vector-index.js";
-import { KV } from "../src/state/schema.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 import type { CompressedObservation, Session } from "../src/types.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 
-// The scope recordAudit writes to on THIS branch. U6 (#13) moves it to a
-// monthly partition and re-points every such read; when the two land together
-// this becomes `auditQueryScopes()[0]!`, the same substitution #13 makes in six
-// other test files.
-const AUDIT_SCOPE = KV.audit;
+// recordAudit writes to the current monthly partition (U6, #13, now on
+// production). This is the same substitution #13 made in six other test files.
+const AUDIT_SCOPE = auditQueryScopes()[0]!;
 
 // U5 of the memory-reduction ladder. The low-value pass in mem::auto-forget
 // gains: eligibility by when the SESSION was last touched rather than by row age

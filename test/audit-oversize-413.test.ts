@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 import { KV } from "../src/state/schema.js";
 import { SAFE_ENUMERATION_BYTES } from "../src/state/scope-size.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 import { registerGovernanceFunction } from "../src/functions/governance.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { registerMcpEndpoints } from "../src/mcp/server.js";
@@ -87,7 +88,9 @@ describe("/agentmemory/audit answers 413 on an oversized audit scope", () => {
   });
 
   async function oversizeAuditScope() {
-    await kv.set(KV.scopeSize, KV.audit, {
+    // Queries now read the current monthly partition, not the legacy scope;
+    // the refusal has to be recorded against the scope that is actually read.
+    await kv.set(KV.scopeSize, auditQueryScopes()[0]!, {
       rows: 1,
       bytes: SAFE_ENUMERATION_BYTES + 1,
       measuredAt: new Date().toISOString(),
