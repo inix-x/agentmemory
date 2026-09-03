@@ -26,36 +26,72 @@ splits it: per-scope store bytes, node RSS versus engine RSS, and cgroup current
 
 ```bash
 # Through the local auth proxy. AGENTMEMORY_SECRET is the value in /data/.hmac.
-curl -sS -H "Authorization: Bearer $AGENTMEMORY_SECRET" \
+# Time it: the U0 gate is "answers in under 5 seconds".
+curl -sS -w '\n== %{time_total}s\n' -H "Authorization: Bearer $AGENTMEMORY_SECRET" \
   https://<service>/agentmemory/diagnostics/store | tee read-1.json | jq '{
-    at,
-    dataDir, dataDirSource,
-    state: .stores.state | {fileCount, totalBytes, byScope},
-    stream: .stores.stream | {fileCount, totalBytes, byScope},
+    at, success,
+    dataDir, dataDirSource, candidates: .dataDirCandidates,
+    state: .stores.state | {fileCount, totalBytes, byScope, unreadableFiles, unavailable},
+    stream: .stores.stream | {fileCount, totalBytes, byScope, unreadableFiles, unavailable},
+    largest: [.stores.state.largestFiles[0:6], .stores.stream.largestFiles[0:6]],
     node: .process.node,
     engine: .process.engine,
-    cgroup: .process.cgroupCurrentBytes,
+    cgroup: .process.cgroup,
+    bootUptimeSeconds: .process.bootUptimeSeconds,
     index: .index
   }'
 ```
 
 **Check the instrument before trusting any of it**
-(`docs/solutions/measurement/prove-the-instrument-before-trusting-a-negative.md`):
+(`docs/solutions/measurement/prove-the-instrument-before-trusting-a-negative.md`).
+Every item here exists because a review lens showed the reading passing while
+being wrong. Do not skip one because the number beside it looks plausible.
 
+- [ ] `success` is `true`. It is computed from the state store, not hardcoded.
 - [ ] `dataDirSource` is `resolver` or `deploy-default`, **not** `unresolved`.
       `unresolved` means neither candidate held a `state_store.db` and every byte
-      figure below is a false zero.
-- [ ] `stores.state.fileCount` is in the thousands, not 0.
-- [ ] `process.engine.processes` is non-empty. If `unavailable` is set, the
-      `/proc` scan found no `iii` process and **k cannot be computed** — fall
-      back to the plan's Appendix `railway ssh` one-liner and record that the
-      endpoint's engine half did not work in this image.
-- [ ] `process.node.rssBytes` is non-null.
-- [ ] `process.cgroupCurrentBytes` is non-null.
-- [ ] The whole call returned in under 5 seconds (U0's gate threshold).
+      figure below is a false zero. On a miss, `dataDirCandidates` names what was
+      tried.
+- [ ] `stores.state.fileCount` is in the thousands, not 0. (1,903 files / 1,064 MB
+      on 2026-08-28.)
+- [ ] **`stores.state.unavailable` and `stores.stream.unavailable` are both
+      absent.** An unreadable store reports `exists: true` with a reason; a
+      genuinely missing one reports `exists: false` with none. A blind stream
+      read would otherwise satisfy U1's gate by returning a frozen 0/0.
+- [ ] **`stores.stream.fileCount` is recorded**, whatever it is. Nobody has ever
+      counted this directory — the 2026-08-28 table covers `state_store.db`
+      only. If it holds one file per stream *message* rather than per session
+      group, the 5-second gate and the response size both change character.
+- [ ] `unreadableFiles` is absent on both stores. Present means entries were
+      dropped from `totalBytes`, so the denominator of k is short.
+- [ ] `process.engine.processes` is non-empty **and `process.engine.unavailable`
+      is absent**. `unavailable` now also fires when a matched process had an
+      unreadable VmRSS, which means `engine.rssBytes` is null or a partial sum.
+      Either way **k cannot be computed** — fall back to the plan's Appendix
+      `railway ssh` one-liner.
+- [ ] **If `process.engine.processes` has more than one entry, stop and
+      reconcile before summing.** VmRSS includes shared pages, so a sum across
+      processes overstates resident bytes, and `iii-*` is exactly the worker
+      naming `deploy/railway/entrypoint.sh` uses. Steady state on 2026-08-28 was
+      a single `iii` at 8,225 MB.
+- [ ] `process.cgroup.currentBytes` is non-null **and at least node RSS plus
+      engine RSS**. A smaller figure means a hybrid or non-namespaced cgroup
+      mount is reporting the *host* root cgroup, which looks entirely plausible.
+- [ ] The call returned in under 5 seconds (U0's gate threshold).
 
 Take the second read **6 hours later, on the same `deploymentId`**, under the
 load and write floors. A deploy inside the window voids it (KTD2).
+
+**An engine restart also voids it, and KTD2 does not cover that.** The worker
+survives engine death and reconnects, so node uptime keeps climbing across one.
+Compare `process.engine.processes[].startTicks` and `pid` between the two reads:
+if either moved, the engine restarted, its RSS reset to the post-boot floor, and
+the delta below is not a measurement. `startTicks` is raw clock ticks, so compare
+it for equality rather than converting it.
+
+**Record which instrument produced each read.** `stat().size` (this endpoint) is
+apparent size; `du -sm` (the Appendix fallback) is allocated blocks. Under 1%
+apart on ~1,900 files, but do not fold an instrument change into the delta.
 
 ---
 
@@ -65,15 +101,24 @@ load and write floors. A deploy inside the window voids it (KTD2).
 |---|---|---|
 | `at` (UTC) | | |
 | `deploymentId` | | |
+| instrument (endpoint / `du -sm`) | | |
 | node uptime (s) | | |
+| **engine pid(s)** | | |
+| **engine `startTicks`** | | |
+| **`bootUptimeSeconds`** | | |
 | state store bytes | | |
-| stream store bytes | | |
+| state store file count | | |
+| **stream store bytes** | | |
+| **stream store file count** | | |
 | store total on disk | | |
 | node RSS | | |
 | engine RSS | | |
 | cgroup current | | |
 | BM25 entries | | |
 | vector entries | | |
+
+Engine pid and `startTicks` must match across the two reads. If they differ the
+window is void — see the engine-restart note above.
 
 Request rate beside every count (R8): reads/min and `/observe` calls across the
 span, from `railway metrics`.
@@ -100,6 +145,29 @@ k = engine RSS / (state store bytes + stream store bytes)
 | RSS delta (read 2 − read 1) | | 100% |
 | data (disk delta × k) | | |
 | churn (remainder) | | |
+
+**The split divides by the disk delta, and the disk delta is not clean.** The
+engine re-serializes whole scopes every 5 seconds, and single scopes are large
+relative to what is being measured: `mem:index:bm25:bm25` was 388.5 MB against a
+measured 77-minute disk delta of only −62 MB. One save in flight during either
+read can therefore perturb the split by more than the delta it divides. No
+readdir-based reader can be atomic against a live writer, so **take three reads
+at the second timepoint a minute apart and record the spread as the error bar**.
+If the spread is comparable to the delta, the split is not a measurement and the
+churn threshold below cannot be judged.
+
+| repeat read at read-2 | disk total | engine RSS |
+|---|---|---|
+| a | | |
+| b | | |
+| c | | |
+| spread | | |
+
+**k is a function of engine uptime, not only of data.** The 2026-08-28
+investigation measured engine RSS growing +1,071 MB in 77 minutes while the
+store on disk *shrank* 62 MB, and attributed it to allocator fragmentation. So
+k at 2 h of engine uptime and k at 20 h are different quantities. Record engine
+uptime beside every k, and do not compare a k across a restart.
 
 **Gate (U0).** k recorded; churn share under 30%; endpoint answers under 5 s.
 
@@ -136,10 +204,28 @@ Verbatim largest files (naming evidence):
 
 **Stream store file naming.** U2 retires every stream file except the viewer
 group's, so it needs the naming from `stores.stream.largestFiles`. Paste it
-verbatim — U2 cannot be written until this is filled:
+verbatim — U2 cannot be written until this is filled. An **empty** list here
+means "no stream files to name", which is a different answer from "the read
+failed"; check `stores.stream.unavailable` before treating it as the former:
 
 ```
 ```
+
+Also record `stores.stream.byScope`. `scopePrefix` collapses a filename only
+when it splits into more than two `[:_]` segments. Every state-store name does.
+A stream group file is named for the raw session id (`schema.ts:86` is
+`group: (sessionId) => sessionId`, and `session-start.ts:73` generates
+`ses_${Date.now().toString(36)}`), which splits to exactly three parts and does
+**not** collapse — so `byScope` would carry one key per file. That is measured
+here, not guessed at: at ~4,000 stream files it costs ~136 KB and is harmless;
+if the count is far higher, the grouping needs a cap before any later unit reads
+it.
+
+| reading | value |
+|---|---|
+| `stores.stream.fileCount` | |
+| `stores.stream.byScope` key count | |
+| one key per file? | |
 
 ---
 
