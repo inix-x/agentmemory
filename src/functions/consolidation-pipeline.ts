@@ -20,6 +20,7 @@ import {
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
+import { payloadByteLength } from "../state/frame-guard.js";
 import { logger } from "../logger.js";
 
 function applyDecay(
@@ -106,21 +107,55 @@ async function countTurnedAwayTrigger(kv: StateKV, runId: string): Promise<void>
     .catch(() => undefined);
 }
 
+/** What one whole-scope enumeration cost the worker. */
+type ScopeRead = { scope: string; rows: number; bytes: number };
+
+/** Per-tier cost accumulated during the tier's own block. */
+type TierCost = { reads: ScopeRead[]; rowsWritten: number };
+
+function newTierCost(): TierCost {
+  return { reads: [], rowsWritten: 0 };
+}
+
 /**
- * Records how long a tier took, onto the outcome it already produced. Stamped
- * after the block rather than at each assignment site, so the timing cannot
- * disagree with itself across a tier's success, skip, and error paths.
+ * kv.list, with what it cost recorded against the calling tier.
+ *
+ * A whole-scope enumeration is the unit of work this pipeline is being measured
+ * for: a payload large enough to stall the worker event loop gets the worker
+ * declared dead mid-invocation (see src/state/scope-size.ts). Knowing a tier was
+ * slow is not the same as knowing it parsed 25.6 MB to do it, and only the
+ * second says which read to remove.
  */
-function stampMs(
+async function measuredList<T>(
+  kv: StateKV,
+  scope: string,
+  cost: TierCost,
+): Promise<T[]> {
+  const rows = await kv.list<T>(scope);
+  cost.reads.push({ scope, rows: rows.length, bytes: payloadByteLength(rows) });
+  return rows;
+}
+
+/**
+ * Records what a tier cost, onto the outcome it already produced. Stamped after
+ * the block rather than at each assignment site, so the numbers cannot disagree
+ * with themselves across a tier's success, skip, and error paths — a tier that
+ * paid for its reads and then threw still reports what it paid.
+ */
+function stampTier(
   results: Record<string, unknown>,
   key: string,
   startedMs: number,
+  cost: TierCost,
 ): void {
   const entry = results[key];
   if (entry && typeof entry === "object") {
     results[key] = {
       ...(entry as Record<string, unknown>),
       ms: Date.now() - startedMs,
+      reads: cost.reads,
+      readBytes: cost.reads.reduce((sum, r) => sum + r.bytes, 0),
+      rowsWritten: cost.rowsWritten,
     };
   }
 }
@@ -272,9 +307,18 @@ export function registerConsolidationPipelineFunction(
         });
 
         const semanticStartedMs = Date.now();
+        const semanticCost = newTierCost();
         if (tier === "all" || tier === "semantic") {
-          const summaries = await kv.list<SessionSummary>(KV.summaries);
-          const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
+          const summaries = await measuredList<SessionSummary>(
+            kv,
+            KV.summaries,
+            semanticCost,
+          );
+          const existingSemantic = await measuredList<SemanticMemory>(
+            kv,
+            KV.semantic,
+            semanticCost,
+          );
 
           if (summaries.length >= 5) {
             const recentSummaries = summaries
@@ -318,6 +362,7 @@ export function registerConsolidationPipelineFunction(
                   existing.updatedAt = now;
                   existing.confidence = Math.max(existing.confidence, confidence);
                   await kv.set(KV.semantic, existing.id, existing);
+                  semanticCost.rowsWritten++;
                 } else {
                   const sem: SemanticMemory = {
                     id: generateId("sem"),
@@ -332,6 +377,7 @@ export function registerConsolidationPipelineFunction(
                     updatedAt: now,
                   };
                   await kv.set(KV.semantic, sem.id, sem);
+                  semanticCost.rowsWritten++;
                   newFacts++;
                 }
               }
@@ -352,8 +398,9 @@ export function registerConsolidationPipelineFunction(
           }
         }
 
-        stampMs(results, "semantic", semanticStartedMs);
+        stampTier(results, "semantic", semanticStartedMs, semanticCost);
         const reflectStartedMs = Date.now();
+        const reflectCost = newTierCost();
 
         if (tier === "all" || tier === "reflect") {
           try {
@@ -372,11 +419,16 @@ export function registerConsolidationPipelineFunction(
           }
         }
 
-        stampMs(results, "reflect", reflectStartedMs);
+        stampTier(results, "reflect", reflectStartedMs, reflectCost);
         const proceduralStartedMs = Date.now();
+        const proceduralCost = newTierCost();
 
         if (tier === "all" || tier === "procedural") {
-          const memories = await kv.list<Memory>(KV.memories);
+          const memories = await measuredList<Memory>(
+            kv,
+            KV.memories,
+            proceduralCost,
+          );
           const patterns = memories
             .filter((m) => m.isLatest && m.type === "pattern")
             .map((m) => ({
@@ -399,8 +451,10 @@ export function registerConsolidationPipelineFunction(
               let match;
               let newProcs = 0;
               const now = new Date().toISOString();
-              const existingProcs = await kv.list<ProceduralMemory>(
+              const existingProcs = await measuredList<ProceduralMemory>(
+                kv,
                 KV.procedural,
+                proceduralCost,
               );
 
               while ((match = procRegex.exec(response)) !== null) {
@@ -423,6 +477,7 @@ export function registerConsolidationPipelineFunction(
                   existing.updatedAt = now;
                   existing.strength = Math.min(1, existing.strength + 0.1);
                   await kv.set(KV.procedural, existing.id, existing);
+                  proceduralCost.rowsWritten++;
                 } else {
                   const proc: ProceduralMemory = {
                     id: generateId("proc"),
@@ -436,6 +491,7 @@ export function registerConsolidationPipelineFunction(
                     updatedAt: now,
                   };
                   await kv.set(KV.procedural, proc.id, proc);
+                  proceduralCost.rowsWritten++;
                   newProcs++;
                 }
               }
@@ -456,20 +512,31 @@ export function registerConsolidationPipelineFunction(
           }
         }
 
-        stampMs(results, "procedural", proceduralStartedMs);
+        stampTier(results, "procedural", proceduralStartedMs, proceduralCost);
         const decayStartedMs = Date.now();
+        const decayCost = newTierCost();
 
         if (tier === "all" || tier === "decay") {
-          const semantic = await kv.list<SemanticMemory>(KV.semantic);
+          const semantic = await measuredList<SemanticMemory>(
+            kv,
+            KV.semantic,
+            decayCost,
+          );
           applyDecay(semantic, decayDays);
           for (const s of semantic) {
             await kv.set(KV.semantic, s.id, s);
+            decayCost.rowsWritten++;
           }
 
-          const procedural = await kv.list<ProceduralMemory>(KV.procedural);
+          const procedural = await measuredList<ProceduralMemory>(
+            kv,
+            KV.procedural,
+            decayCost,
+          );
           applyDecay(procedural, decayDays);
           for (const p of procedural) {
             await kv.set(KV.procedural, p.id, p);
+            decayCost.rowsWritten++;
           }
 
           results.decay = withStatus("ok", {
@@ -478,7 +545,7 @@ export function registerConsolidationPipelineFunction(
           });
         }
 
-        stampMs(results, "decay", decayStartedMs);
+        stampTier(results, "decay", decayStartedMs, decayCost);
 
         if (process.env["OBSIDIAN_AUTO_EXPORT"] === "true") {
           try {

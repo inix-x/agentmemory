@@ -81,7 +81,16 @@ type RunRecord = {
   runId: string;
   startedAt: string;
   finishedAt?: string;
-  results?: Record<string, { ms?: number; status?: string }>;
+  results?: Record<
+    string,
+    {
+      ms?: number;
+      status?: string;
+      reads?: Array<{ scope: string; rows: number; bytes: number }>;
+      readBytes?: number;
+      rowsWritten?: number;
+    }
+  >;
 };
 
 function runRow(store: Store): RunRecord {
@@ -221,6 +230,89 @@ describe("Consolidation tier instrumentation", () => {
 
     const onRunRow = runRow(store).results!;
     expect(typeof onRunRow["semantic"]!.ms).toBe("number");
+  });
+
+  it("reports what each whole-scope read cost the worker", async () => {
+    // "The tier was slow" does not say which read to remove. In production the
+    // semantic tier lists all summaries AND all of mem:semantic on every run,
+    // and only the byte figures say which of the two is worth attacking.
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => "<facts></facts>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    const semantic = runRow(store).results!["semantic"]!;
+    const scopes = semantic.reads!.map((r) => r.scope);
+    expect(scopes).toContain(KV.summaries);
+    expect(scopes).toContain(KV.semantic);
+
+    const summaryRead = semantic.reads!.find((r) => r.scope === KV.summaries)!;
+    expect(summaryRead.rows).toBe(6);
+    // A non-empty scope cannot cost zero bytes to enumerate.
+    expect(summaryRead.bytes).toBeGreaterThan(0);
+    expect(semantic.readBytes).toBeGreaterThanOrEqual(summaryRead.bytes);
+  });
+
+  it("counts the decay tier's write-back, one row per row it read", async () => {
+    // This is the number that makes the case for deriving decayed strength at
+    // read instead: the tier writes every row back whether or not decay changed
+    // anything, so rowsWritten tracks corpus size rather than actual change.
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => "<facts></facts>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    const fresh = new Date().toISOString();
+    for (let i = 0; i < 7; i++) {
+      await kv.set(KV.semantic, `sem_${i}`, {
+        id: `sem_${i}`,
+        fact: `fact ${i}`,
+        confidence: 0.9,
+        sourceSessionIds: [],
+        sourceMemoryIds: [],
+        accessCount: 1,
+        lastAccessedAt: fresh,
+        strength: 0.9,
+        createdAt: fresh,
+        updatedAt: fresh,
+      });
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "decay" });
+
+    const decay = runRow(store).results!["decay"]!;
+    // Every row rewritten, and not one of them decayed: they are all fresh.
+    expect(decay.rowsWritten).toBe(7);
+    expect(decay.reads!.find((r) => r.scope === KV.semantic)!.rows).toBe(7);
+  });
+
+  it("counts the rows a tier actually wrote, not the ones it considered", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(
+        async () =>
+          `<facts><fact confidence="0.9">One</fact><fact confidence="0.8">Two</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+
+    const semantic = runRow(store).results!["semantic"]!;
+    // Two facts minted from six summaries read: writes track output, not input.
+    expect(semantic.rowsWritten).toBe(2);
   });
 
   it("times a tier that threw, not just one that succeeded", async () => {
