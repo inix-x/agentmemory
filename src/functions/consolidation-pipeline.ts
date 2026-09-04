@@ -333,6 +333,9 @@ export function registerConsolidationPipelineFunction(
             const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
               maxClusters: 10,
               project: data?.project,
+              // Stamped here, read at the far side, so the run record can
+              // separate reflect waiting for the worker from reflect working.
+              triggeredAtMs: Date.now(),
             } });
             results.reflect = withStatus("ok", reflectResult);
           } catch (err) {

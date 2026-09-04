@@ -168,7 +168,22 @@ export function registerReflectFunctions(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::reflect", 
-    async (data: { maxClusters?: number; project?: string }) => {
+    async (data: {
+      maxClusters?: number;
+      project?: string;
+      triggeredAtMs?: number;
+    }) => {
+      // How long this invocation waited for the worker before it began. Reflect
+      // is a separate engine invocation served by the same single-threaded
+      // worker as hook ingest and recall, so a reflect that "took 180 seconds"
+      // may have spent nearly all of that queued behind a sibling rather than
+      // doing its own work. Without this the two are indistinguishable, and
+      // they call for opposite fixes.
+      const startedAtMs = Date.now();
+      const queuedMs =
+        typeof data?.triggeredAtMs === "number"
+          ? Math.max(0, startedAtMs - data.triggeredAtMs)
+          : undefined;
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
@@ -330,6 +345,8 @@ export function registerReflectFunctions(
         clustersProcessed: conceptClusters.length - clustersSkipped,
         clustersSkipped,
         usedFallback,
+        ...(queuedMs === undefined ? {} : { queuedMs }),
+        workMs: Date.now() - startedAtMs,
       };
     },
   );

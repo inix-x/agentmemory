@@ -160,6 +160,32 @@ describe("Consolidation tier instrumentation", () => {
     expect(results["decay"]!.ms).toBeLessThan(55);
   });
 
+  it("stamps the reflect trigger time so the wait is measurable at the far side", async () => {
+    // Reflect is a separate engine invocation on the same single worker. Only
+    // the caller knows when it dispatched, so the far side cannot compute its
+    // own wait unless the trigger time travels with the payload.
+    let seen: { triggeredAtMs?: number } | undefined;
+    sdk.registerFunction(
+      "mem::reflect",
+      async (payload: { triggeredAtMs?: number }) => {
+        seen = payload;
+        return { success: true, newInsights: 0, reinforced: 0 };
+      },
+    );
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      { name: "test", compress: vi.fn(), summarize: vi.fn() } as never,
+    );
+
+    const before = Date.now();
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "reflect" });
+
+    expect(typeof seen!.triggeredAtMs).toBe("number");
+    expect(seen!.triggeredAtMs).toBeGreaterThanOrEqual(before);
+    expect(seen!.triggeredAtMs).toBeLessThanOrEqual(Date.now());
+  });
+
   it("times a tier that threw, not just one that succeeded", async () => {
     const provider = {
       name: "test",
