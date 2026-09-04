@@ -106,6 +106,25 @@ async function countTurnedAwayTrigger(kv: StateKV, runId: string): Promise<void>
     .catch(() => undefined);
 }
 
+/**
+ * Records how long a tier took, onto the outcome it already produced. Stamped
+ * after the block rather than at each assignment site, so the timing cannot
+ * disagree with itself across a tier's success, skip, and error paths.
+ */
+function stampMs(
+  results: Record<string, unknown>,
+  key: string,
+  startedMs: number,
+): void {
+  const entry = results[key];
+  if (entry && typeof entry === "object") {
+    results[key] = {
+      ...(entry as Record<string, unknown>),
+      ms: Date.now() - startedMs,
+    };
+  }
+}
+
 async function finalizeRun(
   kv: StateKV,
   runId: string,
@@ -225,6 +244,7 @@ export function registerConsolidationPipelineFunction(
           startedAt,
         });
 
+        const semanticStartedMs = Date.now();
         if (tier === "all" || tier === "semantic") {
           const summaries = await kv.list<SessionSummary>(KV.summaries);
           const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
@@ -305,6 +325,9 @@ export function registerConsolidationPipelineFunction(
           }
         }
 
+        stampMs(results, "semantic", semanticStartedMs);
+        const reflectStartedMs = Date.now();
+
         if (tier === "all" || tier === "reflect") {
           try {
             const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
@@ -318,6 +341,9 @@ export function registerConsolidationPipelineFunction(
             results.reflect = withStatus("error", { error: msg });
           }
         }
+
+        stampMs(results, "reflect", reflectStartedMs);
+        const proceduralStartedMs = Date.now();
 
         if (tier === "all" || tier === "procedural") {
           const memories = await kv.list<Memory>(KV.memories);
@@ -400,6 +426,9 @@ export function registerConsolidationPipelineFunction(
           }
         }
 
+        stampMs(results, "procedural", proceduralStartedMs);
+        const decayStartedMs = Date.now();
+
         if (tier === "all" || tier === "decay") {
           const semantic = await kv.list<SemanticMemory>(KV.semantic);
           applyDecay(semantic, decayDays);
@@ -418,6 +447,8 @@ export function registerConsolidationPipelineFunction(
             procedural: procedural.length,
           });
         }
+
+        stampMs(results, "decay", decayStartedMs);
 
         if (process.env["OBSIDIAN_AUTO_EXPORT"] === "true") {
           try {
