@@ -50,6 +50,12 @@ export const KV = {
   scopeSize: "mem:scope-size",
   semantic: "mem:semantic",
   procedural: "mem:procedural",
+  // One row per consolidation run: its per-tier outcome and timings. Kept as a
+  // trimmed ring, because a run row per Stop hook would grow without bound —
+  // the same defect this scope exists to help measure. The fixed "current" key
+  // holds a pointer to the in-flight run, so a worker death mid-run is
+  // detectable by the next trigger rather than holding the exclusion for good.
+  consolidationRuns: "mem:consolidation-runs",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,
   teamUsers: (teamId: string, userId: string) =>
     `mem:team:${teamId}:users:${userId}`,

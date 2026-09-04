@@ -42,6 +42,71 @@ function applyDecay(
   }
 }
 
+/** Fixed key holding a pointer to the in-flight run, if there is one. */
+const RUN_POINTER_KEY = "current";
+
+// A run whose worker dies mid-invocation never finalizes its row, and must not
+// hold the exclusion for good. The next trigger past this age stamps that row
+// interrupted and starts. Sized well above the observed run length (~6 minutes
+// in the 2026-09-04 production reading) so a slow but living run is never
+// displaced by a competing one.
+const RUN_EXCLUSION_LIFETIME_MS = 15 * 60 * 1000;
+
+// The run scope is a ring. Reliability work must not hand this service another
+// scope that grows one row per Stop hook forever.
+const MAX_RUN_ROWS = 50;
+
+export type ConsolidationRunStatus = "running" | "completed" | "interrupted";
+
+export type ConsolidationRunRecord = {
+  runId: string;
+  startedAt: string;
+  finishedAt?: string;
+  status: ConsolidationRunStatus;
+  tier: string;
+  results?: Record<string, unknown>;
+};
+
+type RunPointer = { runId: string; startedAt: string };
+
+async function finalizeRun(
+  kv: StateKV,
+  runId: string,
+  status: ConsolidationRunStatus,
+  results: Record<string, unknown>,
+): Promise<void> {
+  const row = await kv
+    .get<ConsolidationRunRecord>(KV.consolidationRuns, runId)
+    .catch(() => null);
+  if (!row) return;
+  await kv
+    .set<ConsolidationRunRecord>(KV.consolidationRuns, runId, {
+      ...row,
+      status,
+      finishedAt: new Date().toISOString(),
+      results,
+    })
+    .catch(() => undefined);
+}
+
+async function trimRunRows(kv: StateKV): Promise<void> {
+  const rows = await kv
+    .list<ConsolidationRunRecord>(KV.consolidationRuns)
+    .catch(() => [] as ConsolidationRunRecord[]);
+  // The pointer lives in this scope too and carries no status, which is what
+  // separates it from a run row here.
+  const runs = rows.filter(
+    (r) => r && typeof r.status === "string" && typeof r.runId === "string",
+  );
+  if (runs.length <= MAX_RUN_ROWS) return;
+  runs.sort(
+    (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+  );
+  for (const stale of runs.slice(MAX_RUN_ROWS)) {
+    await kv.delete(KV.consolidationRuns, stale.runId).catch(() => undefined);
+  }
+}
+
 export function registerConsolidationPipelineFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -76,7 +141,41 @@ export function registerConsolidationPipelineFunction(
       const tier = data?.tier || "all";
       const decayDays = getConsolidationDecayDays();
       const results: Record<string, unknown> = {};
+      let runId: string | null = null;
+      let completed = false;
       try {
+        const pointer = await kv
+          .get<RunPointer>(KV.consolidationRuns, RUN_POINTER_KEY)
+          .catch(() => null);
+        if (pointer?.runId) {
+          const age = Date.now() - new Date(pointer.startedAt).getTime();
+          // An unparseable startedAt yields NaN, and NaN < lifetime is false,
+          // so it falls through to the release below. Releasing a run we cannot
+          // date is the safe direction; holding the exclusion on one is not.
+          if (age < RUN_EXCLUSION_LIFETIME_MS) {
+            return {
+              success: true,
+              skipped: true,
+              reason: "A consolidation run is already in flight",
+            };
+          }
+          await finalizeRun(kv, pointer.runId, "interrupted", {
+            reason: "Run exceeded its exclusion lifetime without finalizing",
+          });
+        }
+
+        runId = generateId("crun");
+        const startedAt = new Date().toISOString();
+        await kv.set<ConsolidationRunRecord>(KV.consolidationRuns, runId, {
+          runId,
+          startedAt,
+          status: "running",
+          tier,
+        });
+        await kv.set<RunPointer>(KV.consolidationRuns, RUN_POINTER_KEY, {
+          runId,
+          startedAt,
+        });
 
         if (tier === "all" || tier === "semantic") {
           const summaries = await kv.list<SessionSummary>(KV.summaries);
@@ -282,12 +381,33 @@ export function registerConsolidationPipelineFunction(
 
         await recordAudit(kv, "consolidate", "mem::consolidate-pipeline", [], {
           tier,
+          runId,
           results,
         });
 
-        logger.info("Consolidation pipeline complete", { tier, results });
-        return { success: true, results };
+        await finalizeRun(kv, runId, "completed", results);
+        completed = true;
+
+        logger.info("Consolidation pipeline complete", { tier, runId, results });
+        return { success: true, runId, results };
       } finally {
+        // runId is null when the exclusion turned this invocation away before a
+        // run began; there is nothing of ours to finalize or clean up then.
+        if (runId) {
+          // A throw anywhere above leaves the row saying "running", which the
+          // next trigger would otherwise honour as a live run for the whole
+          // exclusion lifetime. Stamp it here instead, while the process is
+          // still alive to tell a crash apart from a worker death.
+          if (!completed) {
+            await finalizeRun(kv, runId, "interrupted", results).catch(
+              () => undefined,
+            );
+          }
+          await kv
+            .delete(KV.consolidationRuns, RUN_POINTER_KEY)
+            .catch(() => undefined);
+          await trimRunRows(kv);
+        }
         inFlight = false;
       }
     },
