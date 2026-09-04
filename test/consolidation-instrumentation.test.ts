@@ -12,6 +12,7 @@ vi.mock("../src/config.js", () => ({
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
+import { auditQueryScopes } from "../src/functions/audit.js";
 import type { SessionSummary } from "../src/types.js";
 
 type Store = Map<string, Map<string, unknown>>;
@@ -184,6 +185,42 @@ describe("Consolidation tier instrumentation", () => {
     expect(typeof seen!.triggeredAtMs).toBe("number");
     expect(seen!.triggeredAtMs).toBeGreaterThanOrEqual(before);
     expect(seen!.triggeredAtMs).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("keeps the audit row small no matter how big the run measurements get", async () => {
+    // The audit row is the surface an operator reads to answer "did the last
+    // run finish, and what did it skip". Audit partitions refuse enumeration
+    // past 15 MiB, so fattening every row with per-tier measurements would take
+    // that surface down exactly when it is needed.
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => "<facts></facts>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    const audits = await kv.list<{ details?: unknown }>(auditQueryScopes()[0]!);
+    expect(audits.length).toBe(1);
+    const meta = audits[0]!.details as {
+      runId?: string;
+      outcomes?: Record<string, string>;
+    };
+
+    // The shape stays on the audit row, so outcomes are still answerable there.
+    expect(meta.runId).toBeTruthy();
+    expect(meta.outcomes!["semantic"]).toBe("ok");
+    expect(meta.outcomes!["decay"]).toBe("ok");
+    // The numbers do not. They live on the run row, which is a bounded ring.
+    expect(JSON.stringify(audits[0]).length).toBeLessThan(600);
+    expect(JSON.stringify(audits[0])).not.toContain('"ms"');
+
+    const onRunRow = runRow(store).results!;
+    expect(typeof onRunRow["semantic"]!.ms).toBe("number");
   });
 
   it("times a tier that threw, not just one that succeeded", async () => {

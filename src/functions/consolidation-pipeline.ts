@@ -125,6 +125,33 @@ function stampMs(
   }
 }
 
+/**
+ * Reduces a run's per-tier outcomes to one status word each.
+ *
+ * The audit row is what memory_audit and GET /agentmemory/audit expose, and it
+ * is also what an operator reads to answer "did the last run finish, and what
+ * did it skip". It must stay small: audit partitions refuse enumeration past
+ * 15 MiB (src/functions/audit.ts), and the legacy scope is already over that
+ * ceiling in production. Writing per-tier timings, byte counts, and row counts
+ * onto every row would push the partition toward the same wall, and take the
+ * surface the answer is read from down with it.
+ *
+ * So the audit row carries the shape and the run id; the run row carries the
+ * numbers. Bounded by the tier count rather than by a byte budget, which is a
+ * cap that cannot be exceeded by adding a measurement later.
+ */
+function auditOutcomes(results: Record<string, unknown>): Record<string, string> {
+  const outcomes: Record<string, string> = {};
+  for (const [tier, outcome] of Object.entries(results)) {
+    const status =
+      outcome && typeof outcome === "object"
+        ? (outcome as { status?: unknown }).status
+        : undefined;
+    outcomes[tier] = typeof status === "string" ? status : "unknown";
+  }
+  return outcomes;
+}
+
 async function finalizeRun(
   kv: StateKV,
   runId: string,
@@ -467,7 +494,7 @@ export function registerConsolidationPipelineFunction(
         await recordAudit(kv, "consolidate", "mem::consolidate-pipeline", [], {
           tier,
           runId,
-          results,
+          outcomes: auditOutcomes(results),
         });
 
         await finalizeRun(kv, runId, "completed", results, turnedAway);
