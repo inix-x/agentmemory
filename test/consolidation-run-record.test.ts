@@ -12,6 +12,7 @@ vi.mock("../src/config.js", () => ({
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
+import type { SessionSummary } from "../src/types.js";
 
 type Store = Map<string, Map<string, unknown>>;
 
@@ -81,6 +82,20 @@ function runRows(store: Store): RunRecord[] {
 
 function idleProvider() {
   return { name: "test", compress: vi.fn(), summarize: vi.fn() };
+}
+
+function makeSummary(i: number): SessionSummary {
+  return {
+    sessionId: `ses_${i}`,
+    project: "test-project",
+    createdAt: new Date(Date.now() - i * 86400000).toISOString(),
+    title: `Session ${i} summary`,
+    narrative: `Worked on feature ${i}`,
+    keyDecisions: [`Decision ${i}`],
+    filesModified: [`src/file${i}.ts`],
+    concepts: ["typescript", "testing"],
+    observationCount: 5,
+  };
 }
 
 /** Seeds a run row still marked running, plus the pointer that finds it. */
@@ -216,5 +231,35 @@ describe("Consolidation run record", () => {
     const rows = runRows(store);
     expect(rows.length).toBeLessThanOrEqual(50);
     expect(rows.length).toBeGreaterThan(0);
+  });
+  it("distinguishes a tier that skipped by policy from a tier that threw", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => {
+        throw new Error("provider exploded");
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    // Six summaries clears the semantic precondition, so that tier reaches the
+    // provider and throws. Procedural has no patterns and declines by policy.
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    const results = runRows(store)[0]!.results as Record<
+      string,
+      { status?: string; reason?: string; error?: string }
+    >;
+
+    expect(results["semantic"]!.status).toBe("error");
+    expect(results["semantic"]!.error).toContain("provider exploded");
+    expect(results["procedural"]!.status).toBe("skipped");
+    expect(results["procedural"]!.reason).toContain("fewer than 2");
+    // One value carrying both meanings is the collapse this split removes.
+    expect(results["semantic"]!.status).not.toBe(results["procedural"]!.status);
   });
 });

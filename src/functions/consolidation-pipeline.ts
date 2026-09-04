@@ -69,6 +69,20 @@ export type ConsolidationRunRecord = {
 
 type RunPointer = { runId: string; startedAt: string };
 
+/**
+ * Tags a tier outcome with an explicit status, so an operator can tell a tier
+ * that declined to run from one that threw. Collapsing those two into one
+ * value is what made the graph scope guard self-perpetuating.
+ */
+function withStatus(
+  status: "ok" | "skipped" | "error",
+  value: unknown,
+): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { status, ...(value as Record<string, unknown>) }
+    : { status, result: value };
+}
+
 async function finalizeRun(
   kv: StateKV,
   runId: string,
@@ -240,17 +254,20 @@ export function registerConsolidationPipelineFunction(
                   newFacts++;
                 }
               }
-              results.semantic = { newFacts, totalSummaries: summaries.length };
+              results.semantic = withStatus("ok", {
+                newFacts,
+                totalSummaries: summaries.length,
+              });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               logger.error("Semantic consolidation failed", { error: msg });
-              results.semantic = { error: msg };
+              results.semantic = withStatus("error", { error: msg });
             }
           } else {
-            results.semantic = {
+            results.semantic = withStatus("skipped", {
               skipped: true,
               reason: "fewer than 5 summaries",
-            };
+            });
           }
         }
 
@@ -260,11 +277,11 @@ export function registerConsolidationPipelineFunction(
               maxClusters: 10,
               project: data?.project,
             } });
-            results.reflect = reflectResult;
+            results.reflect = withStatus("ok", reflectResult);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.warn("Reflect tier failed", { error: msg });
-            results.reflect = { error: msg };
+            results.reflect = withStatus("error", { error: msg });
           }
         }
 
@@ -332,20 +349,20 @@ export function registerConsolidationPipelineFunction(
                   newProcs++;
                 }
               }
-              results.procedural = {
+              results.procedural = withStatus("ok", {
                 newProcedures: newProcs,
                 patternsAnalyzed: patterns.length,
-              };
+              });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               logger.error("Procedural extraction failed", { error: msg });
-              results.procedural = { error: msg };
+              results.procedural = withStatus("error", { error: msg });
             }
           } else {
-            results.procedural = {
+            results.procedural = withStatus("skipped", {
               skipped: true,
               reason: "fewer than 2 recurring patterns",
-            };
+            });
           }
         }
 
@@ -362,10 +379,10 @@ export function registerConsolidationPipelineFunction(
             await kv.set(KV.procedural, p.id, p);
           }
 
-          results.decay = {
+          results.decay = withStatus("ok", {
             semantic: semantic.length,
             procedural: procedural.length,
-          };
+          });
         }
 
         if (process.env["OBSIDIAN_AUTO_EXPORT"] === "true") {
