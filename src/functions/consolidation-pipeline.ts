@@ -64,6 +64,7 @@ export type ConsolidationRunRecord = {
   finishedAt?: string;
   status: ConsolidationRunStatus;
   tier: string;
+  triggersDuringRun: number;
   results?: Record<string, unknown>;
 };
 
@@ -83,11 +84,29 @@ function withStatus(
     : { status, result: value };
 }
 
+/**
+ * Counts one turned-away trigger against a row this process does not own, which
+ * only happens on the durable-pointer path after a worker death.
+ */
+async function countTurnedAwayTrigger(kv: StateKV, runId: string): Promise<void> {
+  const row = await kv
+    .get<ConsolidationRunRecord>(KV.consolidationRuns, runId)
+    .catch(() => null);
+  if (!row) return;
+  await kv
+    .set<ConsolidationRunRecord>(KV.consolidationRuns, runId, {
+      ...row,
+      triggersDuringRun: (row.triggersDuringRun ?? 0) + 1,
+    })
+    .catch(() => undefined);
+}
+
 async function finalizeRun(
   kv: StateKV,
   runId: string,
   status: ConsolidationRunStatus,
   results: Record<string, unknown>,
+  triggersDuringRun?: number,
 ): Promise<void> {
   const row = await kv
     .get<ConsolidationRunRecord>(KV.consolidationRuns, runId)
@@ -99,6 +118,7 @@ async function finalizeRun(
       status,
       finishedAt: new Date().toISOString(),
       results,
+      ...(triggersDuringRun === undefined ? {} : { triggersDuringRun }),
     })
     .catch(() => undefined);
 }
@@ -131,6 +151,11 @@ export function registerConsolidationPipelineFunction(
   // tool — so a single in-process flag excludes all five. Mirrors the session
   // sweep's guard (src/functions/session-sweep.ts).
   let inFlight = false;
+  // Triggers the current run turned away, held in memory and written once at
+  // finalize. Counting them against the row as they arrive costs a get plus a
+  // set per trigger, on the one worker this work exists to unblock, and misses
+  // every trigger landing before the row exists — in a burst, most of them.
+  let turnedAway = 0;
 
   sdk.registerFunction("mem::consolidate-pipeline",
     async (data?: { tier?: string; force?: boolean; project?: string }) => {
@@ -141,6 +166,7 @@ export function registerConsolidationPipelineFunction(
       // The exclusion sits after the enabled gate on purpose: force is meant to
       // bypass the gate, never the exclusion.
       if (inFlight) {
+        turnedAway++;
         return {
           success: true,
           skipped: true,
@@ -151,6 +177,7 @@ export function registerConsolidationPipelineFunction(
       // tick both clear a check that yields before it claims, and a guard that
       // yields first is not a guard.
       inFlight = true;
+      turnedAway = 0;
 
       const tier = data?.tier || "all";
       const decayDays = getConsolidationDecayDays();
@@ -167,6 +194,7 @@ export function registerConsolidationPipelineFunction(
           // so it falls through to the release below. Releasing a run we cannot
           // date is the safe direction; holding the exclusion on one is not.
           if (age < RUN_EXCLUSION_LIFETIME_MS) {
+            await countTurnedAwayTrigger(kv, pointer.runId);
             return {
               success: true,
               skipped: true,
@@ -185,6 +213,7 @@ export function registerConsolidationPipelineFunction(
           startedAt,
           status: "running",
           tier,
+          triggersDuringRun: 0,
         });
         await kv.set<RunPointer>(KV.consolidationRuns, RUN_POINTER_KEY, {
           runId,
@@ -402,7 +431,7 @@ export function registerConsolidationPipelineFunction(
           results,
         });
 
-        await finalizeRun(kv, runId, "completed", results);
+        await finalizeRun(kv, runId, "completed", results, turnedAway);
         completed = true;
 
         logger.info("Consolidation pipeline complete", { tier, runId, results });
@@ -416,9 +445,13 @@ export function registerConsolidationPipelineFunction(
           // exclusion lifetime. Stamp it here instead, while the process is
           // still alive to tell a crash apart from a worker death.
           if (!completed) {
-            await finalizeRun(kv, runId, "interrupted", results).catch(
-              () => undefined,
-            );
+            await finalizeRun(
+              kv,
+              runId,
+              "interrupted",
+              results,
+              turnedAway,
+            ).catch(() => undefined);
           }
           await kv
             .delete(KV.consolidationRuns, RUN_POINTER_KEY)

@@ -50,7 +50,8 @@ export const KV = {
   scopeSize: "mem:scope-size",
   semantic: "mem:semantic",
   procedural: "mem:procedural",
-  // One row per consolidation run: its per-tier outcome and timings. Kept as a
+  // One row per consolidation run: per-tier outcome, timings, and the count of
+  // triggers that arrived mid-run. Kept as a
   // trimmed ring, because a run row per Stop hook would grow without bound —
   // the same defect this scope exists to help measure. The fixed "current" key
   // holds a pointer to the in-flight run, so a worker death mid-run is

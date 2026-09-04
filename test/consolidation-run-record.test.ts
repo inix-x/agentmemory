@@ -69,6 +69,7 @@ type RunRecord = {
   startedAt: string;
   finishedAt?: string;
   status: string;
+  triggersDuringRun: number;
   results?: Record<string, unknown>;
 };
 
@@ -215,6 +216,10 @@ describe("Consolidation run record", () => {
     expect(live!.status).toBe("running");
     expect(live!.finishedAt).toBeUndefined();
     expect(provider.summarize).not.toHaveBeenCalled();
+    // The turned-away trigger still counts, against the row that turned it
+    // away. This path crosses a process boundary, so it cannot use the
+    // in-memory counter.
+    expect(live!.triggersDuringRun).toBe(1);
   });
 
   it("keeps the run scope bounded rather than growing one row per run forever", async () => {
@@ -261,5 +266,34 @@ describe("Consolidation run record", () => {
     expect(results["procedural"]!.reason).toContain("fewer than 2");
     // One value carrying both meanings is the collapse this split removes.
     expect(results["semantic"]!.status).not.toBe(results["procedural"]!.status);
+  });
+  it("counts a burst of turned-away triggers, including those landing before the run row exists", async () => {
+    let started = 0;
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => {
+        started++;
+        return `<facts><fact confidence="0.9">A fact</fact></facts>`;
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    // All in one tick, so every trigger after the first lands during run
+    // startup, before the run row is written. Counting against the row as they
+    // arrive would drop all of them.
+    await Promise.all(
+      Array.from({ length: 8 }, () =>
+        sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" }),
+      ),
+    );
+
+    expect(started).toBe(1);
+    const rows = runRows(store);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.triggersDuringRun).toBe(7);
   });
 });
