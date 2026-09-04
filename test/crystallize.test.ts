@@ -353,6 +353,94 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::auto-crystallize", () => {
+    it("turns away a second auto-crystallize while one is in flight", async () => {
+      // Holds the first crystallize open so the second invocation lands
+      // mid-flight. Later calls return at once, so an unguarded second run
+      // finishes and shows as a second summarize rather than as a deadlock.
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let started = 0;
+      const gated = {
+        ...mockProvider(),
+        summarize: vi.fn(async () => {
+          started++;
+          if (started === 1) await gate;
+          return '{"narrative":"t","keyOutcomes":[],"filesAffected":[],"lessons":[]}';
+        }),
+      } as MemoryProvider;
+      registerCrystallizeFunction(sdk as never, kv as never, gated);
+
+      const action = makeAction({ id: "act_g1", status: "done", project: "p" });
+      await kv.set("mem:actions", action.id, action);
+
+      const first = sdk.trigger("mem::auto-crystallize", { olderThanDays: 0 });
+      await vi.waitFor(() => expect(started).toBe(1));
+
+      const second = (await sdk.trigger("mem::auto-crystallize", {
+        olderThanDays: 0,
+      })) as { skipped?: boolean; reason?: string };
+
+      expect(started).toBe(1);
+      expect(second.skipped).toBe(true);
+      expect(second.reason).toContain("already in flight");
+
+      release();
+      const firstResult = (await first) as {
+        success: boolean;
+        crystalIds: string[];
+      };
+      // Asserting only "second skipped" would also pass if no run ever started.
+      expect(firstResult.success).toBe(true);
+      expect(firstResult.crystalIds.length).toBe(1);
+    });
+
+    it("releases the guard so a later auto-crystallize still runs", async () => {
+      const first = makeAction({ id: "act_r1", status: "done", project: "p1" });
+      await kv.set("mem:actions", first.id, first);
+      const one = (await sdk.trigger("mem::auto-crystallize", {
+        olderThanDays: 0,
+      })) as { crystalIds: string[] };
+      expect(one.crystalIds.length).toBe(1);
+
+      const second = makeAction({ id: "act_r2", status: "done", project: "p2" });
+      await kv.set("mem:actions", second.id, second);
+      const two = (await sdk.trigger("mem::auto-crystallize", {
+        olderThanDays: 0,
+      })) as { skipped?: boolean; crystalIds: string[] };
+
+      // A guard never released turns this into a one-shot that runs once per
+      // process and never again.
+      expect(two.skipped).toBeUndefined();
+      expect(two.crystalIds.length).toBe(1);
+    });
+
+    it("releases the guard when the scope read throws", async () => {
+      const realList = kv.list;
+      let fail = true;
+      kv.list = (async (scope: string) => {
+        if (fail && scope === "mem:actions") {
+          throw new Error("scope read failed");
+        }
+        return realList(scope);
+      }) as typeof kv.list;
+
+      await expect(
+        sdk.trigger("mem::auto-crystallize", { olderThanDays: 0 }),
+      ).rejects.toThrow("scope read failed");
+
+      fail = false;
+      const action = makeAction({ id: "act_t1", status: "done", project: "p" });
+      await kv.set("mem:actions", action.id, action);
+      const after = (await sdk.trigger("mem::auto-crystallize", {
+        olderThanDays: 0,
+      })) as { skipped?: boolean };
+
+      expect(after.skipped).toBeUndefined();
+      kv.list = realList;
+    });
+
     it("returns group summaries in dryRun mode", async () => {
       const action = makeAction({
         id: "act_dry",
