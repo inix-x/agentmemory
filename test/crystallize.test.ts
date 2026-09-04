@@ -353,6 +353,32 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::auto-crystallize", () => {
+    it("records itself against an in-flight consolidation run", async () => {
+      // The wiring, not the helper: auto-crystallize fires on the same
+      // Stop-hook trigger as consolidation, so an overlap is the normal case
+      // and the run's own latency numbers are unreadable without it.
+      const runId = "crun_live";
+      const startedAt = new Date().toISOString();
+      await kv.set("mem:consolidation-runs", runId, {
+        runId,
+        startedAt,
+        status: "running",
+        tier: "all",
+        triggersDuringRun: 0,
+      });
+      await kv.set("mem:consolidation-runs", "current", { runId, startedAt });
+
+      const action = makeAction({ id: "act_ov", status: "done", project: "p" });
+      await kv.set("mem:actions", action.id, action);
+
+      await sdk.trigger("mem::auto-crystallize", { olderThanDays: 0 });
+
+      const row = (await kv.get("mem:consolidation-runs", runId)) as {
+        overlaps?: Record<string, number>;
+      };
+      expect(row.overlaps!["auto-crystallize"]).toBe(1);
+    });
+
     it("turns away a second auto-crystallize while one is in flight", async () => {
       // Holds the first crystallize open so the second invocation lands
       // mid-flight. Later calls return at once, so an unguarded second run

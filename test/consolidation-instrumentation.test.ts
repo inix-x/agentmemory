@@ -13,6 +13,7 @@ import { registerConsolidationPipelineFunction } from "../src/functions/consolid
 import { isConsolidationEnabled } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
 import { auditQueryScopes } from "../src/functions/audit.js";
+import { noteRunOverlap } from "../src/functions/consolidation-pipeline.js";
 import type { SessionSummary } from "../src/types.js";
 
 type Store = Map<string, Map<string, unknown>>;
@@ -81,6 +82,7 @@ type RunRecord = {
   runId: string;
   startedAt: string;
   finishedAt?: string;
+  overlaps?: Record<string, number>;
   results?: Record<
     string,
     {
@@ -313,6 +315,50 @@ describe("Consolidation tier instrumentation", () => {
     const semantic = runRow(store).results!["semantic"]!;
     // Two facts minted from six summaries read: writes track output, not input.
     expect(semantic.rowsWritten).toBe(2);
+  });
+
+  it("records a sibling job that ran while a consolidation run was in flight", async () => {
+    // Serialising consolidation with itself reclaims nothing if a sibling is
+    // still on the worker, and an overlapping sibling inflates the reflect
+    // latency this same record reports. A run measured against a busy worker
+    // has to say so.
+    let overlapped = 0;
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => {
+        // Fires mid-run, which is exactly when the pointer is live.
+        await noteRunOverlap(kv as never, "auto-crystallize");
+        await noteRunOverlap(kv as never, "auto-crystallize");
+        overlapped += 2;
+        return "<facts></facts>";
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set(KV.summaries, `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+
+    expect(overlapped).toBe(2);
+    expect(runRow(store).overlaps!["auto-crystallize"]).toBe(2);
+  });
+
+  it("records nothing when no consolidation run is in flight", async () => {
+    // The common case. A sibling running on an idle worker is not an overlap,
+    // and counting it would make every run look contended.
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      { name: "test", compress: vi.fn(), summarize: vi.fn() } as never,
+    );
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+
+    await noteRunOverlap(kv as never, "auto-crystallize");
+
+    // The finished run is not retroactively marked contended.
+    expect(runRow(store).overlaps).toBeUndefined();
   });
 
   it("times a tier that threw, not just one that succeeded", async () => {

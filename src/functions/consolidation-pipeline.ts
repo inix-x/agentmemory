@@ -71,6 +71,8 @@ export type ConsolidationRunRecord = {
   status: ConsolidationRunStatus;
   tier: string;
   triggersDuringRun: number;
+  /** Sibling jobs that ran on the same worker while this run was in flight. */
+  overlaps?: Record<string, number>;
   results?: Record<string, unknown>;
 };
 
@@ -88,6 +90,42 @@ function withStatus(
   return value && typeof value === "object" && !Array.isArray(value)
     ? { status, ...(value as Record<string, unknown>) }
     : { status, result: value };
+}
+
+/**
+ * Notes that a sibling job ran on the shared worker while a consolidation run
+ * was in flight.
+ *
+ * Serialising consolidation with itself does not reclaim the worker if a
+ * sibling is still piling onto it, and an overlapping sibling inflates the very
+ * trigger-to-start latency the run record reports for reflect. A run whose
+ * numbers were measured against a busy worker has to say so, or the Phase A
+ * reading cannot tell "reflect is slow" from "something else was running".
+ *
+ * Exported so a sibling records the overlap without reaching into the run
+ * scope: this module owns the run record's shape and stays the only writer of
+ * it. A no-op when nothing is in flight, which is the common case.
+ */
+export async function noteRunOverlap(
+  kv: StateKV,
+  job: string,
+): Promise<void> {
+  const pointer = await kv
+    .get<RunPointer>(KV.consolidationRuns, RUN_POINTER_KEY)
+    .catch(() => null);
+  if (!pointer?.runId) return;
+  const row = await kv
+    .get<ConsolidationRunRecord>(KV.consolidationRuns, pointer.runId)
+    .catch(() => null);
+  if (!row) return;
+  const overlaps = { ...(row.overlaps ?? {}) };
+  overlaps[job] = (overlaps[job] ?? 0) + 1;
+  await kv
+    .set<ConsolidationRunRecord>(KV.consolidationRuns, pointer.runId, {
+      ...row,
+      overlaps,
+    })
+    .catch(() => undefined);
 }
 
 /**

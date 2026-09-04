@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import { noteRunOverlap } from "./consolidation-pipeline.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -172,6 +173,12 @@ export function registerCrystallizeFunction(
       }
       autoCrystallizeInFlight = true;
       try {
+        // Records this run against an in-flight consolidation run, if there is
+        // one, so that run's reflect latency is readable as "the worker was
+        // busy" rather than as "reflect is slow".
+        await noteRunOverlap(kv, "auto-crystallize");
+
+
         const olderThanDays = data.olderThanDays ?? 7;
         const dryRun = data.dryRun ?? false;
         const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
