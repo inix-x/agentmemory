@@ -23,6 +23,7 @@ import {
   getConsolidationCooldownMs,
 } from "../src/config.js";
 import { isReflectEnabled } from "../src/functions/slots.js";
+import { CONSOLIDATION_MARKER_KEY, KV } from "../src/state/schema.js";
 import { logger } from "../src/logger.js";
 
 // event::session::stopped is the single source of truth for consolidation.
@@ -268,9 +269,29 @@ describe("session-stop consolidation debounce", () => {
     vi.mocked(getConsolidationCooldownMs).mockReturnValue(300000);
   });
 
+  // mem::consolidate-pipeline stamps the cooldown marker when a run ENDS. This
+  // stands in for that, so the debounce is testable at the events layer without
+  // running the real pipeline.
+  function stampingSdk(kv: ReturnType<typeof persistentKV>) {
+    const made = mockSdk();
+    made.trigger.mockImplementation(
+      async (input: { function_id: string }) => {
+        if (input.function_id === "mem::consolidate-pipeline") {
+          await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: Date.now() });
+        }
+        if (input.function_id === "mem::summarize") {
+          return { summary: "session summary", sessionId: "ses_1" };
+        }
+        return { ok: true };
+      },
+    );
+    return made;
+  }
+
   it("consolidates at most once across many per-turn stops within the cooldown", async () => {
-    const { sdk, handlers, trigger } = mockSdk();
-    registerEventTriggers(sdk as never, persistentKV() as never);
+    const kv = persistentKV();
+    const { sdk, handlers, trigger } = stampingSdk(kv);
+    registerEventTriggers(sdk as never, kv as never);
     const stopped = handlers.get("event::session::stopped")!;
 
     // 5 per-turn Stop hooks in quick succession (all within the cooldown).
@@ -288,11 +309,42 @@ describe("session-stop consolidation debounce", () => {
     expect(count("mem::summarize")).toBe(5);
   });
 
-  it("consolidates once when stops arrive concurrently (serialized cooldown check)", async () => {
-    // Regression: without serialization, two stops racing through the marker
-    // read-check-write both observe the stale marker and both fire.
+  it("does not debounce at the events layer until a run has ended", async () => {
+    // The marker is written by the pipeline at run END, so before any run
+    // finishes every stop passes the cooldown read and dispatches. That is not
+    // five consolidations: the pipeline's own in-flight exclusion turns the
+    // extras away, and its run record counts them as triggersDuringRun.
+    //
+    // The cost of this is dispatch volume during a burst, which the Phase A
+    // window sizes from that count.
+    const kv = persistentKV();
     const { sdk, handlers, trigger } = mockSdk();
-    registerEventTriggers(sdk as never, persistentKV() as never);
+    registerEventTriggers(sdk as never, kv as never);
+    const stopped = handlers.get("event::session::stopped")!;
+
+    for (let i = 0; i < 5; i++) await stopped({ sessionId: "ses_1" });
+
+    const dispatched = trigger.mock.calls.filter(
+      (c) => (c[0] as { function_id: string }).function_id === "mem::consolidate-pipeline",
+    ).length;
+    expect(dispatched).toBe(5);
+  });
+
+  it("debounces concurrent stops against the marker a finished run wrote", async () => {
+    // The old form of this test asserted that exactly one of several concurrent
+    // stops wins the cooldown. That guarantee came from the marker's
+    // read-check-write being atomic inside the serialized chain, and it does not
+    // survive moving the write to run end: the check is a pure read now, so
+    // whether a concurrent stop sees a stamp depends on when the run that writes
+    // it finishes. Asserting the old number here would pass on scheduling luck.
+    //
+    // What is guaranteed is that concurrent stops all read the same marker and
+    // all agree about it. Collapsing simultaneous stops into one run is the
+    // pipeline exclusion's job now, covered in consolidation-exclusion.test.ts.
+    const kv = persistentKV();
+    await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: Date.now() });
+    const { sdk, handlers, trigger } = mockSdk();
+    registerEventTriggers(sdk as never, kv as never);
     const stopped = handlers.get("event::session::stopped")!;
 
     await Promise.all([
@@ -304,7 +356,12 @@ describe("session-stop consolidation debounce", () => {
     const consolidateCount = trigger.mock.calls.filter(
       (c) => (c[0] as { function_id: string }).function_id === "mem::consolidate-pipeline",
     ).length;
-    expect(consolidateCount).toBe(1);
+    expect(consolidateCount).toBe(0);
+    // The cheap per-turn path is untouched by the debounce.
+    const summarizeCount = trigger.mock.calls.filter(
+      (c) => (c[0] as { function_id: string }).function_id === "mem::summarize",
+    ).length;
+    expect(summarizeCount).toBe(3);
   });
 
   it("consolidates on every stop when the cooldown is disabled (0)", async () => {

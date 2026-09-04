@@ -6,7 +6,11 @@ import type {
   Memory,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import {
+  CONSOLIDATION_MARKER_KEY,
+  KV,
+  generateId,
+} from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
@@ -44,6 +48,7 @@ function applyDecay(
 
 /** Fixed key holding a pointer to the in-flight run, if there is one. */
 const RUN_POINTER_KEY = "current";
+
 
 // A run whose worker dies mid-invocation never finalizes its row, and must not
 // hold the exclusion for good. The next trigger past this age stamps that row
@@ -457,6 +462,14 @@ export function registerConsolidationPipelineFunction(
             .delete(KV.consolidationRuns, RUN_POINTER_KEY)
             .catch(() => undefined);
           await trimRunRows(kv);
+          // Stamp the cooldown from the END of the run. Stamped at check time,
+          // as it was, a run longer than the cooldown leaves a marker already
+          // stale by the time it finishes, so the next run starts immediately
+          // and the cooldown spaces nothing. An interrupted run stamps too: the
+          // worker paid for the work either way.
+          await kv
+            .set(KV.config, CONSOLIDATION_MARKER_KEY, { at: Date.now() })
+            .catch(() => undefined);
         }
         inFlight = false;
       }

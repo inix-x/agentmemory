@@ -1,6 +1,11 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
 import type { CompressedObservation, HookPayload, Session } from "../types.js";
-import { KV, STREAM, fingerprintId } from "../state/schema.js";
+import {
+  CONSOLIDATION_MARKER_KEY,
+  KV,
+  STREAM,
+  fingerprintId,
+} from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
@@ -9,10 +14,6 @@ import {
   isConsolidationEnabled,
 } from "../config.js";
 import { logger } from "../logger.js";
-
-// Global marker recording when corpus consolidation last ran, used to debounce
-// the per-turn session-stop fan-out.
-const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
 
 // Order-independent fingerprint of an observation set: tells whether the
 // already-extracted half of a session still looks the way it did at the last
@@ -31,14 +32,18 @@ async function consolidationDueUnserialized(kv: StateKV): Promise<boolean> {
     .get<{ at?: number }>(KV.config, CONSOLIDATION_MARKER_KEY)
     .catch(() => null);
   const lastAt = typeof marker?.at === "number" ? marker.at : 0;
-  if (now - lastAt < cooldownMs) return false;
-  await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: now }).catch(() => {});
-  return true;
+  return now - lastAt >= cooldownMs;
 }
 
-// Concurrent session-stop events would otherwise interleave the marker
-// read-check-write above and both pass the cooldown. Serialize the whole
-// check through an in-process chain so exactly one concurrent caller wins.
+// The check above is now a pure read: mem::consolidate-pipeline stamps the
+// marker when a run ENDS, so the cooldown measures the gap after a run rather
+// than between two checks. Concurrent stops therefore all read the same value
+// and all agree, and it is the pipeline's own in-flight exclusion that collapses
+// them into one run.
+//
+// The chain is kept because it costs nothing and keeps the ordering stable for
+// callers, but it no longer guards a read-modify-write, and nothing depends on
+// exactly one caller winning here.
 let consolidationCheckChain: Promise<unknown> = Promise.resolve();
 
 function consolidationDue(kv: StateKV): Promise<boolean> {

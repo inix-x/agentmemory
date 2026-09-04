@@ -100,6 +100,13 @@ export const KV = {
   recentSearches: "mem:recent-searches",
 } as const;
 
+// Key within KV.config recording when a consolidation run last ENDED. Named
+// here beside the scopes rather than in either module that touches it: the
+// pipeline writes it at run end and the session-stop trigger reads it, and
+// routing one string through a function module would drag that module's whole
+// dependency graph into every consumer of the trigger module.
+export const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
+
 export const STREAM = {
   name: "mem-live",
   group: (sessionId: string) => sessionId,
