@@ -9,7 +9,7 @@ parent: dd59718
 
 # U1 build record: frame-safe graph writes
 
-Four commits on `feat/u1-frame-safe-graph-writes`, branched off `dd59718`
+Seven commits on `feat/u1-frame-safe-graph-writes`, branched off `dd59718`
 (production `878174f` plus the log-only graph-write diagnostic). Not pushed, not
 deployed, no sandbox run. This document records what was built, what was proved,
 and what a reader must not assume.
@@ -19,14 +19,16 @@ and what a reader must not assume.
 1. **No sandbox measurement was taken.** Every number below comes from unit tests
    and from the plan's own census. U1's promotion gate is a sandbox sample, and
    nothing here substitutes for it. The gate list is at the end.
-2. **`npm test` on the branch is NOT green.** Two full runs each ended with 14
-   failures. **Zero of them are attributable to U1**, proved by running the same
-   command on the parent commit under the same machine load: the parent produced
-   25 failures, and every branch failure appears in a parent run. Zero failures
-   sit in a file U1 touches. The suite is loaded-machine flaky in this tree; the
-   quiet baseline taken before any edit was 4 failures
-   (`test/antigravity-connect-hooks.test.ts` 1, `test/copilot-plugin.test.ts` 3).
-   This is reported as "not green, with attribution proved", not as "verified".
+2. **`npm test` on the branch is NOT green.** The final run ended with 8
+   failures; two earlier runs, on a busier machine, ended with 14 each. **Zero of
+   them are attributable to U1**, proved by running the same command on the
+   parent commit under the same machine load: the parent produced 25 failures,
+   and every single branch failure appears in a parent run. Zero failures sit in
+   a file U1 touches. The suite is loaded-machine flaky in this tree; the quiet
+   baseline taken before any edit was 4 failures
+   (`test/antigravity-connect-hooks.test.ts` 1, `test/copilot-plugin.test.ts` 3),
+   and all four are in the final run. This is reported as "not green, with
+   attribution proved", not as "verified".
 3. **A.7 predicts U1's effect on peak memory is small.** U1 makes the snapshot
    write land, so the extract finishes in seconds instead of 33. The row writes
    still dirty the same two gigabyte-scale scopes, so the engine's save-loop
@@ -35,7 +37,7 @@ and what a reader must not assume.
 4. **The shrink loop is untested against production's actual shape**, because at
    the projected size it never runs. Its coverage is a synthetic corpus.
 5. **One plan number could not be reconciled** against the tree, and it is the
-   justification for one of the four changes. See "Unresolved: topEdges 2,454 vs
+   justification for one of the changes. See "Unresolved: topEdges 2,454 vs
    1,000" below. The change was made anyway, because it is correct under both
    readings and costs four lines.
 
@@ -48,7 +50,17 @@ and what a reader must not assume.
 | `740876d` | `feat(graph): bound the snapshot by bytes and shrink an oversized topEdges` | `SNAPSHOT_BUDGET_BYTES = 4 MiB`; a proportional shrink loop before the write; `topEdges` truncated to `SNAPSHOT_TOP_EDGES` by weight wherever a snapshot is loaded or built. Retargets the two diagnostic fixtures, which relied on an oversized snapshot the bound now prevents. |
 | `3137220` | `test(graph): a merge-only batch does not rewrite the snapshot` | Test-only. **R4's gate already holds on the parent**; this test passed unmodified against `dd59718` and is recorded as such. |
 
-Diff: 5 files, 464 insertions, 92 deletions.
+Three follow-up commits from the review pass. Each is a distinct logical change,
+so each gets its own commit rather than an amend, per
+`.claude/rules/commit-convention.md`.
+
+| hash | title | what it fixes |
+|---|---|---|
+| `9e2fe77` | `fix(graph): keep the measured row size a monotonic upper bound` | The write-path row-size sample covers only the rows that batch wrote. A thin batch dropped the recorded size from 20,000 bytes to 179, re-opening the enumeration loosening by a different door. Take the max on the write path; the rebuild still ratchets it down from a representative sample. |
+| `9e987d2` | `fix(graph): account a refused write in the write ledger` | `guardedSet` returned above the ledger accounting, so a refused write reported no bytes and `snapshotBytes` read `undefined` on the one call where the size is the whole story. Refusals now record bytes and a `refused` count, separate from `writes`. |
+| `0cdf000` | `fix(graph): keep the row-size stats out of the public stats shape` | `mem::graph-stats` and `mem::graph-snapshot-rebuild` spread `snap.stats`, so the two new internal fields silently widened `/graph/stats` and `/graph/build`. Both now name the four count fields. |
+
+Diff: 6 files, 555 insertions, 96 deletions.
 
 ## Q5 resolved: strip-only, not lean
 
@@ -133,6 +145,9 @@ All four pass on `3137220`.
 | remove `shrinkSnapshotToBudget(snap)` from the write path | test 1 dies: `expected 6064209 to be less than or equal to 4194304` |
 | R4 gate → `if (true)` | test 4 dies: `expected [ { …(3) } ] to have a length of +0 but got 1` |
 | reinstate cached-row sampling in `estimateScopeBytes` | the new enumeration-guard test dies: `expected [] to not deeply equal []` |
+| write-path row size back to latest-wins | "never lowers the recorded row size" dies: `expected 179 to be 20000` |
+| drop the `refused` counter from the ledger | "reports a refused write in the summary" dies: `expected +0 to be 1` |
+| spread `snap.stats` back into `mem::graph-stats` | the stats-shape assertion dies: `to not have property "nodeRowBytes"` |
 
 The first mutation is the one the plan asked for. It only bites because test 1
 asserts against a **literal** 4 MiB, not against the imported constant: an
@@ -234,8 +249,8 @@ log is right and the truncation is dormant defence.
 |---|---|
 | `npx tsc --noEmit` | **29 errors, byte-identical to the `dd59718` baseline.** Diff of the normalised error lists is empty. |
 | `npm run build` | **pass**, exit 0, 20 files / 3.19 MB. |
-| `npm test` (full) | **not green.** 14 failures, two runs. Zero attributable to U1 (see Limitations 2). |
-| graph-touching tests in isolation (11 files) | **144 passed, 0 failed.** `graph-write-frame`, `graph-write-frame-diagnostic`, `graph`, `graph-scope-enumeration`, `graph-snapshot-bootstrap-orphan`, `graph-provenance-batch`, `graph-retrieval`, `graph-import`, `cascade`, `reflect`, `temporal-graph`. |
+| `npm test` (full) | **not green.** 8 failures on the final run. Zero attributable to U1 (see Limitations 2). |
+| graph-touching tests in isolation (11 files) | **144 passed, 0 failed** at `3137220`, and green on every run since. `graph-write-frame`, `graph-write-frame-diagnostic`, `graph`, `graph-scope-enumeration`, `graph-snapshot-bootstrap-orphan`, `graph-provenance-batch`, `graph-retrieval`, `graph-import`, `cascade`, `reflect`, `temporal-graph`. |
 
 Baseline evidence for the `npm test` attribution:
 
@@ -243,6 +258,8 @@ Baseline evidence for the `npm test` attribution:
 - parent, loaded machine, same session: 25 failures / 19 files.
 - branch, loaded machine, run 1: 14 failures / 10 files. Branch-only: **0**.
 - branch, loaded machine, run 2: 14 failures / 12 files. Branch-only: **0**.
+- branch, final state, quieter machine: 8 failures / 6 files. Branch-only: **0**,
+  graph-file failures: **0**. The 4-failure quiet baseline set is contained in it.
 
 The failing set drifts run to run across the same non-graph files, which is the
 flakiness `.claude/rules/pr-governance.md` already records for this tree.
@@ -259,7 +276,9 @@ retained on the branch so all of this is readable.
 2. **A new line to watch: `Graph write refused over the frame limit`.** Added by
    `260c55e`. Any occurrence means a write was refused rather than dispatched,
    which is a success for the guard and a failure for the bound, and it names the
-   scope and key that did it.
+   scope and key that did it. The `Graph delta persisted` summary carries a
+   matching `refused` count, at the call level and per scope, so a refusal is
+   also countable from the summary alone.
 3. **`worker_registrations: 0`**, and specifically **zero re-registrations
    attributable to a graph `state::set`**: an `ECANCELED` within about one second
    after a warn line carrying `overFrameLimit: true`. Report the absolute count
@@ -277,6 +296,14 @@ retained on the branch so all of this is readable.
 8. **Q4's free answer:** `snapshotTotalNodes` growth against the count of new
    rows in the same line. If they track, U1 closed the 4.4x undercount going
    forward.
+
+**Expected once, at boot, and not a failure.** The first extract after deploy
+still pulls the existing 16,772,000-byte snapshot inbound. The raw read at the
+top of `persistGraphDelta` is unbounded, and it fits under the frame, which is
+why reads work today while writes do not. That extract then writes the bounded
+one. So the first `Graph delta persisted` line after deploy carries a large
+inbound cost and a small `snapshotBytes`. From the second extract onward the
+inbound cost is gone too. Do not read the first line as U1 not working.
 
 Promotion gate, per the plan and KTD4: zero graph-attributable worker
 re-registrations, `livez_ok: 1`, `recall_hit_rate_100 >= 0.54`, zero
