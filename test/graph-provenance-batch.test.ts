@@ -336,7 +336,10 @@ describe("readers resolve both shapes regardless of the flag (R10)", () => {
 
     expect(result.success).toBe(true);
     expect(result.flagged.nodes).toBe(0);
-    expect(result.warning).toContain("refused");
+    // Same contract, different mechanism since U3: cascade no longer reads the
+    // scopes at all, so a graph it cannot use is one with no obs-index entry
+    // behind the memory's observations rather than one the guard refused.
+    expect(result.warning).toContain("mem::graph-index-backfill");
     // The row was not touched: the old code would have kv.list'ed and flagged it.
     const n = await kv.get<GraphNode>("mem:graph:nodes", "n1");
     expect(n?.stale).toBeUndefined();

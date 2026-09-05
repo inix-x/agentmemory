@@ -90,13 +90,21 @@ describe("graph write frame diagnostic", () => {
     const summaries = summaryCalls();
     expect(summaries).toHaveLength(1);
     const fields = summaries[0]![1] as Record<string, unknown>;
-    // One new node is a node row, a name-index entry, a degree counter, and
-    // the snapshot: four writes across four scopes. Per-scope, not per-write,
-    // so the line is bounded by the schema rather than by the batch.
-    expect(fields.writes).toBe(4);
+    // One new node is a node row, a name-index entry, a degree counter, a
+    // catalog entry, an obs-index entry, and the snapshot: six writes across
+    // six scopes. Per-scope, not per-write, so the line stays bounded by the
+    // schema rather than by the batch, which is the property that matters here.
+    expect(fields.writes).toBe(6);
     const byScope = fields.byScope as Record<string, { writes: number; bytes: number }>;
     expect(Object.keys(byScope).sort()).toEqual(
-      [KV.graphNodes, KV.graphNameIndex, KV.graphNodeDegree, KV.graphSnapshot].sort(),
+      [
+        KV.graphNodes,
+        KV.graphNameIndex,
+        KV.graphNodeDegree,
+        KV.graphNames,
+        KV.graphObsIndex,
+        KV.graphSnapshot,
+      ].sort(),
     );
     expect(byScope[KV.graphSnapshot]!.bytes).toBe(payloadByteLength(snapshotPayload(kv)));
     expect(fields.bytes).toBe(
