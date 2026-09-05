@@ -132,4 +132,44 @@ describe("frame-safe graph writes", () => {
     expect(result).toMatchObject({ oversized: true, success: false });
     expect(kv.writes).toHaveLength(0);
   });
+
+  it("does not rewrite the snapshot for a merge-only batch that mutates nothing", async () => {
+    const kv = recordingKV();
+    const existing = node("existing", ["obs_old"], 0);
+    // Seeded OUTSIDE topNodes on purpose: a merge into a cached row sets
+    // snapMutated and legitimately rewrites the snapshot, which would pass this
+    // assertion for the wrong reason.
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 1,
+        totalEdges: 0,
+        nodesByType: { concept: 1 },
+        edgesByType: {},
+      },
+      updatedAt: "2026-09-01T00:00:00Z",
+      dirty: false,
+    } satisfies GraphSnapshot);
+    await kv.set(KV.graphNodes, existing.id, existing);
+    await kv.set(
+      KV.graphNameIndex,
+      `${existing.type}|${existing.name}`,
+      existing.id,
+    );
+    kv.writes.length = 0;
+
+    await persistGraphDelta(
+      kv as never,
+      [{ ...existing, id: "fresh" }],
+      [] as GraphEdge[],
+      ["obs_old"],
+    );
+
+    expect(kv.writes.filter((w) => w.scope === KV.graphSnapshot)).toHaveLength(0);
+    // The merge itself still happened; it is the snapshot that stays put.
+    expect(kv.writes.map((w) => w.scope)).toContain(KV.graphNodes);
+  });
 });
