@@ -14,11 +14,23 @@ import { isConsolidationEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 import { auditQueryScopes } from "../src/functions/audit.js";
 
+// The real StateKV is an SDK round-trip, so every read returns a fresh object.
+// Handing back a live reference lets a caller's later mutation retroactively
+// rewrite the snapshot it was already given, which hides the stale-snapshot
+// class of bug outright — and here it would make the decay assertions vacuous,
+// because applyDecay mutates rows in place. Same reason as the sweep mock's
+// clone (test/session-sweep.test.ts), widened to `get` and made structural so
+// arrays and nested values survive the copy intact.
+function detach<T>(value: T): T {
+  return value && typeof value === "object" ? structuredClone(value) : value;
+}
+
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
-      return (store.get(scope)?.get(key) as T) ?? null;
+      const found = store.get(scope)?.get(key);
+      return found === undefined ? null : detach(found as T);
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
@@ -30,7 +42,7 @@ function mockKV() {
     },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
-      return entries ? (Array.from(entries.values()) as T[]) : [];
+      return entries ? (Array.from(entries.values()).map((v) => detach(v)) as T[]) : [];
     },
   };
 }
@@ -91,6 +103,25 @@ describe("Consolidation Pipeline", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+  });
+
+  // Harness guard. The real StateKV is an SDK round-trip that returns fresh
+  // objects, so a caller cannot reach back into stored state through a value it
+  // was handed. A mock that returns live references breaks that, and the whole
+  // decay class of assertion goes vacuous: the decay tier mutates rows in place
+  // via applyDecay, so "the write-back changed stored strength" reads as true
+  // even when no kv.set ran at all. Keep this passing or those tests prove
+  // nothing.
+  it("hands back detached copies, so a caller's mutation cannot rewrite stored state", async () => {
+    await kv.set("mem:semantic", "sem_1", { id: "sem_1", strength: 1 });
+
+    const [listed] = await kv.list<{ id: string; strength: number }>("mem:semantic");
+    listed!.strength = 0.5;
+    const fetched = await kv.get<{ id: string; strength: number }>("mem:semantic", "sem_1");
+    fetched!.strength = 0.25;
+
+    const stored = await kv.get<{ id: string; strength: number }>("mem:semantic", "sem_1");
+    expect(stored!.strength).toBe(1);
   });
 
   it("pipeline skips semantic when fewer than 5 summaries", async () => {

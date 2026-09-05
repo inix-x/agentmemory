@@ -50,6 +50,13 @@ export const KV = {
   scopeSize: "mem:scope-size",
   semantic: "mem:semantic",
   procedural: "mem:procedural",
+  // One row per consolidation run: per-tier outcome, timings, and the count of
+  // triggers that arrived mid-run. Kept as a
+  // trimmed ring, because a run row per Stop hook would grow without bound —
+  // the same defect this scope exists to help measure. The fixed "current" key
+  // holds a pointer to the in-flight run, so a worker death mid-run is
+  // detectable by the next trigger rather than holding the exclusion for good.
+  consolidationRuns: "mem:consolidation-runs",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,
   teamUsers: (teamId: string, userId: string) =>
     `mem:team:${teamId}:users:${userId}`,
@@ -92,6 +99,13 @@ export const KV = {
   // the followup-rate diagnostic. Key = sessionId. TTL-swept hourly.
   recentSearches: "mem:recent-searches",
 } as const;
+
+// Key within KV.config recording when a consolidation run last ENDED. Named
+// here beside the scopes rather than in either module that touches it: the
+// pipeline writes it at run end and the session-stop trigger reads it, and
+// routing one string through a function module would drag that module's whole
+// dependency graph into every consumer of the trigger module.
+export const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
 
 export const STREAM = {
   name: "mem-live",

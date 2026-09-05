@@ -158,6 +158,39 @@ describe("Reflect", () => {
   });
 
   describe("mem::reflect", () => {
+    it("reports how long it waited for the worker, separately from its own work", async () => {
+      // A reflect that "took 180 seconds" is two very different bugs depending
+      // on whether it was queued or busy, and they call for opposite fixes.
+      const waitedMs = 80;
+      const result = (await sdk.trigger("mem::reflect", {
+        triggeredAtMs: Date.now() - waitedMs,
+      })) as { queuedMs?: number; workMs?: number };
+
+      expect(result.queuedMs).toBeGreaterThanOrEqual(waitedMs - 5);
+      // The wait belongs to queuedMs and must not be charged to the work.
+      expect(result.workMs).toBeLessThan(waitedMs);
+    });
+
+    it("omits the wait when the caller did not stamp a trigger time", async () => {
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        queuedMs?: number;
+        workMs?: number;
+      };
+
+      // Reporting 0 would be a lie: an unstamped caller means unknown, and a
+      // zero would read as "the worker was free" in the run record.
+      expect(result.queuedMs).toBeUndefined();
+      expect(typeof result.workMs).toBe("number");
+    });
+
+    it("never reports a negative wait when clocks disagree", async () => {
+      const result = (await sdk.trigger("mem::reflect", {
+        triggeredAtMs: Date.now() + 5000,
+      })) as { queuedMs?: number };
+
+      expect(result.queuedMs).toBe(0);
+    });
+
     it("returns empty when no graph nodes or memories exist", async () => {
       const result = (await sdk.trigger("mem::reflect", {})) as {
         success: boolean;
