@@ -133,6 +133,33 @@ describe("frame-safe graph writes", () => {
     expect(kv.writes).toHaveLength(0);
   });
 
+  it("never lowers the recorded row size from a batch of thin rows", async () => {
+    const kv = recordingKV();
+    // A fat corpus already measured, then a batch of thin new rows. The mean of
+    // what THIS batch wrote is small, and taking it would tell the enumeration
+    // guard the scope shrank when only the batch was thin.
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 5_000,
+        totalEdges: 0,
+        nodesByType: { concept: 5_000 },
+        edgesByType: {},
+        nodeRowBytes: 20_000,
+      },
+      updatedAt: "2026-09-01T00:00:00Z",
+      dirty: false,
+    } satisfies GraphSnapshot);
+
+    await persistGraphDelta(kv as never, [node("thin", [], 0)], [], []);
+
+    const snap = kv.store.get(KV.graphSnapshot)!.get("current") as GraphSnapshot;
+    expect(snap.stats.nodeRowBytes).toBe(20_000);
+  });
+
   it("does not rewrite the snapshot for a merge-only batch that mutates nothing", async () => {
     const kv = recordingKV();
     const existing = node("existing", ["obs_old"], 0);

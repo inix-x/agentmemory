@@ -1147,15 +1147,26 @@ async function persistGraphDeltaMeasured(
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
-    // Free: the ledger already sized every row this call wrote. Latest
-    // measurement wins, so the enumeration guard tracks the corpus as it grows.
+    // Free: the ledger already sized every row this call wrote. It samples only
+    // the rows THIS batch touched, though, and a new-node-heavy batch writes
+    // thin rows while the scope still holds fat legacy ones -- so the mean can
+    // read low against the corpus. Keep it a monotonic upper bound here.
+    // Over-restrictive is the safe direction for a fail-closed guard, and
+    // buildSnapshotFromArrays ratchets it back down from a representative
+    // sample when a rebuild recomputes the corpus for real.
     const nodeScope = ledger.byScope[KV.graphNodes];
     if (nodeScope && nodeScope.writes > 0) {
-      snap.stats.nodeRowBytes = Math.round(nodeScope.bytes / nodeScope.writes);
+      snap.stats.nodeRowBytes = Math.max(
+        snap.stats.nodeRowBytes ?? 0,
+        Math.round(nodeScope.bytes / nodeScope.writes),
+      );
     }
     const edgeScope = ledger.byScope[KV.graphEdges];
     if (edgeScope && edgeScope.writes > 0) {
-      snap.stats.edgeRowBytes = Math.round(edgeScope.bytes / edgeScope.writes);
+      snap.stats.edgeRowBytes = Math.max(
+        snap.stats.edgeRowBytes ?? 0,
+        Math.round(edgeScope.bytes / edgeScope.writes),
+      );
     }
     shrinkSnapshotToBudget(snap);
     await guardedSet(kv, KV.graphSnapshot, SNAPSHOT_KEY, snap, ledger, {
