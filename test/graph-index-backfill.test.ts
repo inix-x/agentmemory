@@ -139,6 +139,29 @@ describe("mem::graph-index-backfill", () => {
     expect((await readObsIndex(kv as never, "obs_1")).nodes).toHaveLength(6);
   });
 
+  it("reaches the edges after several runs that the nodes alone exhaust", async () => {
+    // processed is per invocation and the edge loop shares the budget, so a
+    // store with more nodes than maxRows takes no edges on run one. Confirm
+    // that is a delay rather than a floor.
+    const nodes = Array.from({ length: 7 }, (_, i) => node(i));
+    await seed(nodes, [edge(0), edge(1)]);
+
+    const first = await run({ maxRows: 3 });
+    expect(first.cursor.nodesDone).toBe(3);
+    expect(first.cursor.edgesDone).toBe(0);
+
+    const second = await run({ maxRows: 3 });
+    expect(second.cursor.nodesDone).toBe(6);
+    expect(second.cursor.edgesDone).toBe(0);
+    expect(await readAdj(kv as never, "gn_0")).toEqual([]);
+
+    const third = await run({ maxRows: 3 });
+    expect(third.cursor.nodesDone).toBe(7);
+    expect(third.cursor.edgesDone).toBe(2);
+    expect(third.cursor.complete).toBe(true);
+    expect(await readAdj(kv as never, "gn_0")).toHaveLength(1);
+  });
+
   it("stops transposing provenance at the pair ceiling, and still catalogs", async () => {
     // KTD2 rejects the full transpose at 33,767,235 pairs / 902 MiB. The
     // catch-up takes what it can and stops; names and adjacency are derived

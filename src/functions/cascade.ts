@@ -59,6 +59,17 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
 
         const now = new Date().toISOString();
         const write = graphWriter(kv);
+        // guardedSet refuses an oversized value and returns rather than throws,
+        // so counting a flag before checking the result would report a row as
+        // stale while it is still live. Not reachable at today's row sizes --
+        // production's largest node is 572,956 B against a 15 MiB limit -- but
+        // the row scopes are what U2 exists to shrink, which is a statement
+        // about how they grow.
+        const refused = (result: unknown) =>
+          typeof result === "object" &&
+          result !== null &&
+          (result as { oversized?: unknown }).oversized === true;
+        let flagsRefused = 0;
 
         for (const nodeId of nodeIds) {
           const node = await kv
@@ -67,7 +78,10 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
           if (!node || node.stale) continue;
           node.stale = true;
           node.updatedAt = now;
-          await write(KV.graphNodes, node.id, node);
+          if (refused(await write(KV.graphNodes, node.id, node))) {
+            flagsRefused++;
+            continue;
+          }
           await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
             resourceType: "GraphNode",
             change: "marked stale from superseded memory",
@@ -82,13 +96,23 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
             .catch(() => null);
           if (!edge || edge.stale) continue;
           edge.stale = true;
-          await write(KV.graphEdges, edge.id, edge);
+          if (refused(await write(KV.graphEdges, edge.id, edge))) {
+            flagsRefused++;
+            continue;
+          }
           await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
             resourceType: "GraphEdge",
             change: "marked stale from superseded memory",
             supersededMemoryId: data.supersededMemoryId,
           });
           flaggedEdges++;
+        }
+
+        if (flagsRefused > 0) {
+          logger.warn("Cascade could not write every stale flag", {
+            supersededMemoryId: data.supersededMemoryId,
+            refused: flagsRefused,
+          });
         }
       }
 

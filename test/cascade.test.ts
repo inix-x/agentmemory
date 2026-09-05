@@ -412,6 +412,32 @@ describe("Cascade flags through mem:graph:obs-index", () => {
     expect(result.flagged.nodes).toBe(0);
   });
 
+  it("does not count a stale flag the frame guard refused", async () => {
+    await persistGraphDelta(
+      kv as never,
+      [node("gn_a", "Alpha")],
+      [] as GraphEdge[],
+      ["obs_1"],
+    );
+    await kv.set("mem:memories", "mem_old", memory(["obs_1"]));
+    // Over SAFE_PAYLOAD_BYTES, so guardedSet returns the refusal rather than
+    // dispatching. Counting the flag before checking would report a row as
+    // stale while it is still live.
+    const fat = kv.store.get("mem:graph:nodes")!.get("gn_a") as GraphNode;
+    fat.properties = { blob: "x".repeat(16 * 1024 * 1024) };
+
+    const result = (await sdk.trigger("mem::cascade-update", {
+      supersededMemoryId: "mem_old",
+    })) as { flagged: { nodes: number } };
+
+    expect(result.flagged.nodes).toBe(0);
+    expect(
+      vi
+        .mocked(logger.warn)
+        .mock.calls.filter(([msg]) => msg === "Cascade could not write every stale flag"),
+    ).toHaveLength(1);
+  });
+
   it("says so loudly when the rows predate the index", async () => {
     // Rows on disk, no obs-index behind them: exactly an imported store, or one
     // deployed before U3. Flagging nothing is the honest answer, and it has to
