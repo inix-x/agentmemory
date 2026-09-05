@@ -1,10 +1,10 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import type { Memory } from "../types.js";
+import type { GraphEdge, GraphNode, Memory } from "../types.js";
 import { recordAudit } from "./audit.js";
-import { listGraphScopes } from "./graph.js";
-import { resolveGraphObservationIds } from "./graph-provenance.js";
+import { graphWriter } from "./graph.js";
+import { readObsIndex } from "../state/graph-store.js";
 import { logger } from "../logger.js";
 
 export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
@@ -22,60 +22,73 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
       let flaggedNodes = 0;
       let flaggedEdges = 0;
       let flaggedMemories = 0;
-      let graphSkipped = false;
+      let graphUnindexed = false;
 
       const obsIds = new Set(superseded.sourceObservationIds || []);
 
       if (obsIds.size > 0) {
-        // This used to kv.list both graph scopes directly, bypassing the
-        // enumeration guard every other graph reader goes through. On a
-        // refused graph that is the unbounded read that gets the worker
-        // declared dead; the guard returns empty and says so instead.
-        const graph = await listGraphScopes(kv, "mem::cascade-update");
-        if (!graph.enumerated) {
-          graphSkipped = true;
-          logger.warn("Cascade skipped graph flagging: enumeration refused", {
+        // This used to enumerate both graph scopes and resolve every row's
+        // provenance to test membership -- the whole corpus read to find a
+        // handful of rows, refused outright on a graph over the guard. The
+        // inverted index answers in the direction this actually asks, so the
+        // read is one kv.get per superseded observation plus one per row it
+        // names. It is also what keeps the flagging exact once U2 caps
+        // sourceBatchIds (KTD5): the cap drops old batch ids, membership
+        // testing would silently stop matching, and obs-index does not care
+        // which provenance shape the row carries because it never reads it.
+        const nodeIds = new Set<string>();
+        const edgeIds = new Set<string>();
+        for (const obsId of obsIds) {
+          const entry = await readObsIndex(kv, obsId);
+          for (const id of entry.nodes) nodeIds.add(id);
+          for (const id of entry.edges) edgeIds.add(id);
+        }
+
+        if (nodeIds.size === 0 && edgeIds.size === 0) {
+          // A store whose rows predate the index flags nothing here, and that
+          // has to be loud rather than a silent zero. mem::graph-index-backfill
+          // is what closes it; until it runs, this line is the signal.
+          graphUnindexed = true;
+          logger.warn("Cascade found no obs-index entries for the superseded memory", {
+            supersededMemoryId: data.supersededMemoryId,
+            observationIds: obsIds.size,
+            remedy:
+              "run mem::graph-index-backfill, or GRAPH_INDEX_BACKFILL=true on boot",
+          });
+        }
+
+        const now = new Date().toISOString();
+        const write = graphWriter(kv);
+
+        for (const nodeId of nodeIds) {
+          const node = await kv
+            .get<GraphNode>(KV.graphNodes, nodeId)
+            .catch(() => null);
+          if (!node || node.stale) continue;
+          node.stale = true;
+          node.updatedAt = now;
+          await write(KV.graphNodes, node.id, node);
+          await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
+            resourceType: "GraphNode",
+            change: "marked stale from superseded memory",
             supersededMemoryId: data.supersededMemoryId,
           });
-        } else {
-          const now = new Date().toISOString();
-          // Provenance resolved across both shapes, so a row that carries a
-          // batch id flags exactly when the legacy array would have (R10).
-          const provenance = await resolveGraphObservationIds(kv, [
-            ...graph.nodes,
-            ...graph.edges,
-          ]);
-          const overlaps = (rowId: string) =>
-            (provenance.get(rowId) ?? []).some((id) => obsIds.has(id));
+          flaggedNodes++;
+        }
 
-          for (const node of graph.nodes) {
-            if (node.stale) continue;
-            if (overlaps(node.id)) {
-              node.stale = true;
-              node.updatedAt = now;
-              await kv.set(KV.graphNodes, node.id, node);
-              await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
-                resourceType: "GraphNode",
-                change: "marked stale from superseded memory",
-                supersededMemoryId: data.supersededMemoryId,
-              });
-              flaggedNodes++;
-            }
-          }
-
-          for (const edge of graph.edges) {
-            if (edge.stale) continue;
-            if (overlaps(edge.id)) {
-              edge.stale = true;
-              await kv.set(KV.graphEdges, edge.id, edge);
-              await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
-                resourceType: "GraphEdge",
-                change: "marked stale from superseded memory",
-                supersededMemoryId: data.supersededMemoryId,
-              });
-              flaggedEdges++;
-            }
-          }
+        for (const edgeId of edgeIds) {
+          const edge = await kv
+            .get<GraphEdge>(KV.graphEdges, edgeId)
+            .catch(() => null);
+          if (!edge || edge.stale) continue;
+          edge.stale = true;
+          await write(KV.graphEdges, edge.id, edge);
+          await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
+            resourceType: "GraphEdge",
+            change: "marked stale from superseded memory",
+            supersededMemoryId: data.supersededMemoryId,
+          });
+          flaggedEdges++;
         }
       }
 
@@ -105,7 +118,13 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
           siblingMemories: flaggedMemories,
         },
         total: flaggedNodes + flaggedEdges + flaggedMemories,
-        ...(graphSkipped ? { warning: "graph enumeration refused; graph rows not flagged" } : {}),
+        ...(graphUnindexed
+          ? {
+              warning:
+                "no mem:graph:obs-index entries for this memory's observations; " +
+                "graph rows not flagged. Run mem::graph-index-backfill.",
+            }
+          : {}),
       };
     },
   );
