@@ -25,6 +25,15 @@ import {
   FRAME_LIMIT_BYTES,
 } from "../state/frame-guard.js";
 import type { OversizedPayload } from "../state/frame-guard.js";
+import {
+  newIndexDelta,
+  recordEdgeAdjacency,
+  recordNodeName,
+  recordRowObservations,
+  flushIndexDelta,
+  type GraphIndexDelta,
+  type GuardedWrite,
+} from "../state/graph-store.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -514,6 +523,7 @@ type GraphWriteLedger = {
   bytes: number;
   ms: number;
   refused: number;
+  index: { adj: number; obs: number; names: number } | null;
   byScope: Record<
     string,
     {
@@ -536,6 +546,7 @@ function newWriteLedger(): GraphWriteLedger {
     bytes: 0,
     ms: 0,
     refused: 0,
+    index: null,
     byScope: {},
     inFlight: null,
     snap: null,
@@ -628,6 +639,14 @@ export async function guardedSet<T>(
       ledger.ms += ms;
     }
   }
+}
+
+// The GuardedWrite the store's helpers take. Binding it here is what makes
+// "every graph write goes through guardedSet" true for the index scopes too,
+// without graph-store importing this module back and forming a cycle.
+export function graphWriter(kv: StateKV, ledger?: GraphWriteLedger): GuardedWrite {
+  return <T>(scope: string, key: string, value: T) =>
+    guardedSet(kv, scope, key, value, ledger);
 }
 
 // Mutates `snap` to apply a +1 (or -1) degree delta for nodeId,
@@ -1063,6 +1082,11 @@ async function persistGraphDeltaMeasured(
   // failed" distinguishable, so readSnapshot's truncation does not reach it.
   truncateTopEdges(snap);
   ledger.snap = snap;
+  // U3. Index writes are collected across the whole call and flushed once, so a
+  // batch that hangs 36 edges off a handful of hubs does one write per distinct
+  // key instead of two per edge, and the 64-stub cap sees the whole batch before
+  // it evicts anything.
+  const indexDelta: GraphIndexDelta = newIndexDelta();
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
@@ -1102,6 +1126,9 @@ async function persistGraphDeltaMeasured(
       idRemap.set(node.id, existing.id);
       const merged = mergeNode(existing, node, obsIds, batchId, capturedAt);
       await guardedSet(kv, KV.graphNodes, existing.id, merged, ledger);
+      // The catalog entry is already there: name is identity, so a merge never
+      // changes it. Only the observation link is new.
+      recordRowObservations(indexDelta, obsIds, existing.id, "node");
       // Update topNodes entry if present so a stale clone isn't
       // returned from the snapshot fast path.
       const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
@@ -1113,6 +1140,8 @@ async function persistGraphDeltaMeasured(
       await guardedSet(kv, KV.graphNodes, node.id, node, ledger);
       await guardedSet(kv, KV.graphNameIndex, indexKey, node.id, ledger);
       await guardedSet(kv, KV.graphNodeDegree, node.id, 0, ledger);
+      recordNodeName(indexDelta, node);
+      recordRowObservations(indexDelta, obsIds, node.id, "node");
       snap.stats.totalNodes += 1;
       snap.stats.nodesByType[node.type] =
         (snap.stats.nodesByType[node.type] ?? 0) + 1;
@@ -1152,6 +1181,9 @@ async function persistGraphDeltaMeasured(
     if (existing) {
       const merged = mergeEdge(existing, obsIds, batchId);
       await guardedSet(kv, KV.graphEdges, existing.id, merged, ledger);
+      // mergeEdge unions provenance and never weight or endpoints, so the
+      // adjacency stub written when this edge was created still holds.
+      recordRowObservations(indexDelta, obsIds, existing.id, "edge");
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
       if (topIdx !== -1) {
@@ -1161,6 +1193,8 @@ async function persistGraphDeltaMeasured(
     } else {
       await guardedSet(kv, KV.graphEdges, edge.id, edge, ledger);
       await guardedSet(kv, KV.graphEdgeKey, eKey, edge.id, ledger);
+      recordEdgeAdjacency(indexDelta, edge);
+      recordRowObservations(indexDelta, obsIds, edge.id, "edge");
       snap.stats.totalEdges += 1;
       snap.stats.edgesByType[edge.type] =
         (snap.stats.edgesByType[edge.type] ?? 0) + 1;
@@ -1177,6 +1211,11 @@ async function persistGraphDeltaMeasured(
   for (const edge of newEdgesForTopCheck) {
     snapshotPushEdgeIfBothInTop(snap, edge);
   }
+
+  // Flushed before the snapshot write. The snapshot write is the one that has
+  // historically timed out, and an index that landed is worth more than one that
+  // was lost behind it.
+  ledger.index = await flushIndexDelta(kv, indexDelta, graphWriter(kv, ledger));
 
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
@@ -1254,6 +1293,7 @@ export async function persistGraphDelta(
       snapshotBytes: ledger.byScope[KV.graphSnapshot]?.maxBytes,
       writes: ledger.writes,
       refused: ledger.refused,
+      index: ledger.index,
       bytes: ledger.bytes,
       writeMs: ledger.ms,
       ms: Date.now() - started,

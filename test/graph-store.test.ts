@@ -15,6 +15,7 @@ import {
   recordRowObservations,
   type GraphAdjStub,
 } from "../src/state/graph-store.js";
+import { persistGraphDelta } from "../src/functions/graph.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode } from "../src/types.js";
 import { mockKV } from "./helpers/mocks.js";
@@ -164,5 +165,72 @@ describe("graph-store index invariants", () => {
     expect(
       mergeObsIndex({ nodes: ["a"], edges: ["e1"] }, ["b"], ["e1", "e2"]),
     ).toEqual({ nodes: ["a", "b"], edges: ["e1", "e2"] });
+  });
+});
+
+// The store's only production writer. These pin what persistGraphDelta puts in
+// the indexes, which is the half of U3 the read path will depend on.
+describe("persistGraphDelta index maintenance", () => {
+  it("indexes a fresh batch by catalog, adjacency, and observation", async () => {
+    const kv = mockKV();
+    const nodes = [node("gn_a", "Alpha"), node("gn_b", "Beta")];
+    const edges = [edge("ge_1", "gn_a", "gn_b", 3)];
+
+    await persistGraphDelta(kv as never, nodes, edges, ["obs_1", "obs_2"]);
+
+    expect(kv.store.get(KV.graphNames)!.get("gn_a")).toEqual({
+      id: "gn_a",
+      type: "concept",
+      name: "Alpha",
+    });
+    expect(await readAdj(kv as never, "gn_a")).toEqual([
+      { edgeId: "ge_1", neighborId: "gn_b", weight: 3 },
+    ]);
+    expect(await readAdj(kv as never, "gn_b")).toEqual([
+      { edgeId: "ge_1", neighborId: "gn_a", weight: 3 },
+    ]);
+    for (const obsId of ["obs_1", "obs_2"]) {
+      const entry = await readObsIndex(kv as never, obsId);
+      expect(entry.nodes.sort()).toEqual(["gn_a", "gn_b"]);
+      expect(entry.edges).toEqual(["ge_1"]);
+    }
+  });
+
+  it("links a merged row to the new batch's observations", async () => {
+    const kv = mockKV();
+    await persistGraphDelta(
+      kv as never,
+      [node("gn_a", "Alpha")],
+      [] as GraphEdge[],
+      ["obs_1"],
+    );
+    // Same type+name, so the name index resolves it and the row merges.
+    await persistGraphDelta(
+      kv as never,
+      [node("gn_fresh", "Alpha")],
+      [] as GraphEdge[],
+      ["obs_2"],
+    );
+
+    expect((await readObsIndex(kv as never, "obs_2")).nodes).toEqual(["gn_a"]);
+    // The catalog is keyed by the persisted id, and the merge did not mint a
+    // second entry under the fresh one.
+    expect(kv.store.get(KV.graphNames)!.has("gn_fresh")).toBe(false);
+  });
+
+  it("builds obs-index from the extraction event, not from row provenance", async () => {
+    const kv = mockKV();
+    // The row carries a long legacy provenance array. Transposing it is the
+    // 902 MiB shape KTD2 rejects; only the batch's own ids may be indexed.
+    const fat = {
+      ...node("gn_a", "Alpha"),
+      sourceObservationIds: Array.from({ length: 50 }, (_, i) => `legacy_${i}`),
+    };
+
+    await persistGraphDelta(kv as never, [fat], [] as GraphEdge[], ["obs_1"]);
+
+    expect(kv.store.get(KV.graphObsIndex)!.size).toBe(1);
+    expect(kv.store.get(KV.graphObsIndex)!.has("obs_1")).toBe(true);
+    expect(kv.store.get(KV.graphObsIndex)!.has("legacy_0")).toBe(false);
   });
 });

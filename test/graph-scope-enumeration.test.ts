@@ -5,7 +5,10 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { logger } from "../src/logger.js";
-import { registerGraphFunction } from "../src/functions/graph.js";
+import {
+  persistGraphDelta,
+  registerGraphFunction,
+} from "../src/functions/graph.js";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
 import { registerExportImportFunction } from "../src/functions/export-import.js";
@@ -914,5 +917,37 @@ describe("graph scope enumeration guard", () => {
       expect(result.legacyCorpus).toBe(false);
       expect(result.error).toContain(EDGES);
     });
+  });
+});
+
+// U3 puts three more scopes on the write path. The point of the indexes is that
+// the READ path stops enumerating; a write path that enumerates to maintain them
+// would trade one unbounded read for another, on the hot path this time.
+describe("the graph write path never enumerates", () => {
+  it("maintains the indexes with targeted reads only", async () => {
+    const kv = mockKV();
+    const nodes: GraphNode[] = Array.from({ length: 12 }, (_, i) => ({
+      id: `gn_${i}`,
+      type: "concept",
+      name: `n${i}`,
+      properties: {},
+      sourceObservationIds: [],
+      createdAt: "2026-09-01T00:00:00Z",
+    }));
+    const edges: GraphEdge[] = Array.from({ length: 11 }, (_, i) => ({
+      id: `ge_${i}`,
+      type: "related_to",
+      sourceNodeId: `gn_${i}`,
+      targetNodeId: `gn_${i + 1}`,
+      weight: 1,
+      sourceObservationIds: [],
+      createdAt: "2026-09-01T00:00:00Z",
+    }));
+
+    await persistGraphDelta(kv as never, nodes, edges, ["obs_1", "obs_2"]);
+    // A second pass exercises the merge branches, which read before they write.
+    await persistGraphDelta(kv as never, nodes, edges, ["obs_3"]);
+
+    expect(kv.listedScopes).toEqual([]);
   });
 });
