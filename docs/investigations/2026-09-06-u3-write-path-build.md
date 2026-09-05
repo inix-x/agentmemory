@@ -9,13 +9,24 @@ parent: fa2f5ef
 
 # U3 build record: the index write path and the cascade rewiring
 
-Six commits on `feat/u3-graph-index-write-path`, branched off U1's head
+Ten commits on `feat/u3-graph-index-write-path`, branched off U1's head
 `fa2f5ef` so the `guardedSet` write helper and the projected snapshot are
 present. The write half of U3 only: the read path, `graph-retrieval.ts`, is a
 separate task. Not pushed, not deployed, no sandbox run.
 
 ## Limitations, first
 
+0. **One test regressed on the branch and is a pre-existing flake, traced not
+   assumed.** `test/session-sweep.test.ts > leaves a session sitting exactly on
+   the threshold alone` failed once in a full run and passes in isolation on
+   both this branch and `dd59718`. It is a clock-boundary race in the test:
+   line 303 sets `updatedAt` to exactly `Date.now() - idleMinutes*60*1000`, the
+   sweep compares with `<=`, and any wall-clock advance before the comparison
+   makes the session a candidate. `src/functions/session-sweep.ts` imports only
+   `iii-sdk`, `types`, `schema`, `kv`, `audit`, and `logger`; the one U3 touches
+   is `schema.ts`, and U3's change there is three added constant strings. It
+   cannot reach a timestamp comparison. Worth its own one-line fix, not in this
+   unit.
 1. **`mem:graph:obs-index` is larger than the plan's "linear in observations"
    suggests, and this is Q2's answer.** Worked below under "Index sizing". The
    short form: an entry is written per observation per extract and holds every
@@ -26,7 +37,9 @@ separate task. Not pushed, not deployed, no sandbox run.
    read-path win is unaffected. The disk win is not there in this shape. A
    variant that removes the batch-size factor is proposed below; it was not
    built, because it is a design change the plan does not specify and it belongs
-   with a measurement rather than at the end of this task.
+   with a measurement rather than at the end of this task. `7b27a0b` caps an
+   entry at 512 ids, which bounds the worst case per key but does not remove the
+   corpus-wide factor.
 2. **The backfill cannot run on production today.** It enumerates, and
    production's graph is over the enumeration budget, so it refuses and says so.
    It becomes available after U2's rebuild takes the row scopes from 2,039 MiB
@@ -55,7 +68,17 @@ separate task. Not pushed, not deployed, no sandbox run.
 | `df23240` | `feat(graph): route the import path through graph-store` | `mem::import` restore and clear-all, so the one writer that bypassed the store no longer does. |
 | `f529884` | `test(graph): update two suites the index write path changed` | Two suites the full-suite run caught, not the per-commit runs. |
 
-Diff against `fa2f5ef`: 14 files, 1,325 insertions, 68 deletions.
+Four follow-up commits from the review pass. Two of them close defects, not
+tidiness.
+
+| hash | title | what it fixes |
+|---|---|---|
+| `7b27a0b` | `fix(graph): cap an obs-index entry and count a refused index write` | An obs-index entry was an unbounded array under one key, merged forever -- the shape that grew the snapshot to 16 MiB, rebuilt one scope over. Capped at 512, oldest first. `flushIndexDelta` also ignored every write result, so a refusal vanished; it counts them now. |
+| `e9a181d` | `fix(graph): coalesce the import's adjacency writes so hub stubs survive` | **A correctness bug.** Per-edge read-merge-write inside the import's `Promise.all` meant two edges sharing an endpoint both read the pre-merge value and the second write lost the first's stub. Measured: importing 40 edges onto one hub kept 2. |
+| `df582fc` | `fix(cascade): do not count a stale flag the frame guard refused` | Cascade counted a flag after a write it never checked, so a refused write would report a row stale while it stayed live. Also adds the backfill case where the nodes exhaust the row budget across more than one run. |
+| `cafa310`, and this edit | `docs(u3)` | This record. |
+
+Diff against `fa2f5ef`: 14 files, about 1,540 insertions, 80 deletions.
 
 ## Index sizing, against the 09-05 census
 
@@ -201,6 +224,10 @@ with `src/functions/export-import.ts` stashed to the parent:
 | drop the backfill's enumeration refusal | `expected true to be false` |
 | make import write the row only | the restore test dies |
 | make clear-all leave the catalog | `expected 2 to be +0` |
+| drop the obs-index entry cap | `expected [ 'gn_0', …(549) ] to have a length of 512 but got 552` |
+| make `flushIndexDelta` ignore refusals | `expected +0 to be 1` |
+| do the import's adjacency per edge inside the chunk | `expected [ …(1) ] to have a length of 40 but got 2` |
+| count a cascade flag without checking the write | `expected 1 to be +0` |
 
 The resume-cursor mutation is worth naming. It did not die at first, because
 every index write is an idempotent merge, so redoing the first run's work is
@@ -224,17 +251,21 @@ than the result, which is the only place a broken cursor shows.
   was caught by the per-commit runs, which is the argument for running the full
   gate before calling a unit done.
 - branch, after `f529884`: **3 failures / 3 files, branch-only: 0.**
-  `antigravity-connect-hooks`, `context-injection`, `copilot-plugin` — the same
-  loaded-machine flaky set `.claude/rules/pr-governance.md` records, all present
-  on the parent.
+- branch, final state after the four review fixes: **6 failures / 4 files.**
+  Five are the same loaded-machine flaky set `.claude/rules/pr-governance.md`
+  records and are present on the parent. The sixth, `session-sweep`, is the
+  boundary race traced in Limitation 0; it passes in isolation on this branch
+  and on `dd59718`, and a baseline rerun under the same load did not reproduce
+  it.
 
 ## What the sandbox proof must read
 
 U3's read path is a later task and the plan's gate belongs to it. What this half
 can be checked on:
 
-1. **`Graph delta persisted` gains an `index` field**: `{adj, obs, names}` counts
-   per extract. Read the per-extract pair rate from it and settle the sizing
+1. **`Graph delta persisted` gains an `index` field**: `{adj, obs, names,
+   refused}` counts per extract. A non-zero `refused` means an index write went
+   over the frame and was not dispatched; it should be zero. Read the per-extract pair rate from it and settle the sizing
    question in "Index sizing" with a measurement instead of the tick-12
    extrapolation. `obs` times the batch size against `adj` plus `names` is the
    ratio the batch-indirection variant would remove.
