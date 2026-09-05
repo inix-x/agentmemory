@@ -49,8 +49,10 @@ separate task. Not pushed, not deployed, no sandbox run.
    intended abandon-and-replay position and it is now loud rather than silent: a
    named warn line and a response warning naming `mem::graph-index-backfill`.
    Before the backfill runs, that is every row already on disk.
-4. **`npm test` is not green.** 3 failures, all present on the parent under the
-   same load, none in a file this branch touches. Attribution below.
+4. **`npm test` is not green.** 6 failures on the final run. Five are the known
+   loaded-machine flaky set and are present on the parent; the sixth is the
+   session-sweep boundary race traced in Limitation 0. None is in a file this
+   branch touches. Attribution below.
 5. **No sandbox measurement.** Every number here is from unit tests or from the
    09-05 census. U3's promotion gate is a sandbox sample and nothing here
    substitutes for it.
