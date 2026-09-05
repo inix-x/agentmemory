@@ -60,7 +60,8 @@ so each gets its own commit rather than an amend, per
 | `9e987d2` | `fix(graph): account a refused write in the write ledger` | `guardedSet` returned above the ledger accounting, so a refused write reported no bytes and `snapshotBytes` read `undefined` on the one call where the size is the whole story. Refusals now record bytes and a `refused` count, separate from `writes`. |
 | `0cdf000` | `fix(graph): keep the row-size stats out of the public stats shape` | `mem::graph-stats` and `mem::graph-snapshot-rebuild` spread `snap.stats`, so the two new internal fields silently widened `/graph/stats` and `/graph/build`. Both now name the four count fields. |
 
-Diff: 6 files, 555 insertions, 96 deletions.
+Diff, source and tests only: 6 files, 583 insertions, 96 deletions. Plus this
+document.
 
 ## Q5 resolved: strip-only, not lean
 
