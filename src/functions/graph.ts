@@ -513,9 +513,16 @@ type GraphWriteLedger = {
   writes: number;
   bytes: number;
   ms: number;
+  refused: number;
   byScope: Record<
     string,
-    { writes: number; bytes: number; maxBytes: number; ms: number }
+    {
+      writes: number;
+      bytes: number;
+      maxBytes: number;
+      ms: number;
+      refused?: number;
+    }
   >;
   // Set before each write, cleared when it returns; a write that throws
   // leaves itself here so the summary can name it.
@@ -524,7 +531,15 @@ type GraphWriteLedger = {
 };
 
 function newWriteLedger(): GraphWriteLedger {
-  return { writes: 0, bytes: 0, ms: 0, byScope: {}, inFlight: null, snap: null };
+  return {
+    writes: 0,
+    bytes: 0,
+    ms: 0,
+    refused: 0,
+    byScope: {},
+    inFlight: null,
+    snap: null,
+  };
 }
 
 // R1: every graph write is sized before it is dispatched, and one over
@@ -567,6 +582,25 @@ export async function guardedSet<T>(
       bytes: oversized.bytes,
       limitBytes: oversized.limitBytes,
     });
+    // A refusal is a write that never returned, the same class as the timeout
+    // dd59718 was built to keep visible, so it has to reach the ledger. The
+    // summary reads snapshotBytes off byScope[...].maxBytes, and a refusal that
+    // skipped accounting would report undefined on the one call where the size
+    // is the whole story. Counted as refused, not as a write: nothing was sent.
+    if (ledger) {
+      ledger.inFlight = { scope, key, bytes, ms: 0 };
+      const s = (ledger.byScope[scope] ??= {
+        writes: 0,
+        bytes: 0,
+        maxBytes: 0,
+        ms: 0,
+      });
+      s.bytes += bytes;
+      if (bytes > s.maxBytes) s.maxBytes = bytes;
+      s.refused = (s.refused ?? 0) + 1;
+      ledger.bytes += bytes;
+      ledger.refused += 1;
+    }
     return oversized;
   }
   const started = Date.now();
@@ -1219,6 +1253,7 @@ export async function persistGraphDelta(
       snapshotTotalNodes: ledger.snap?.stats.totalNodes,
       snapshotBytes: ledger.byScope[KV.graphSnapshot]?.maxBytes,
       writes: ledger.writes,
+      refused: ledger.refused,
       bytes: ledger.bytes,
       writeMs: ledger.ms,
       ms: Date.now() - started,

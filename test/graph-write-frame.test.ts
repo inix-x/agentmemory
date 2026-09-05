@@ -9,6 +9,7 @@ import {
   persistGraphDelta,
   SNAPSHOT_BUDGET_BYTES,
 } from "../src/functions/graph.js";
+import { logger } from "../src/logger.js";
 import { payloadByteLength } from "../src/state/frame-guard.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode, GraphSnapshot } from "../src/types.js";
@@ -131,6 +132,34 @@ describe("frame-safe graph writes", () => {
 
     expect(result).toMatchObject({ oversized: true, success: false });
     expect(kv.writes).toHaveLength(0);
+  });
+
+  it("reports a refused write in the summary the diagnostic emits", async () => {
+    const kv = recordingKV();
+    // Over SAFE_PAYLOAD_BYTES, so the guard refuses rather than dispatches.
+    // A refusal is a write that never returned, and the summary has to say so:
+    // dd59718 exists because bytes that never reach the log cannot be diagnosed.
+    const huge = node("huge", [], 16 * 1024 * 1024);
+
+    await persistGraphDelta(kv as never, [huge], [] as GraphEdge[], []);
+
+    // The node-degree counter is keyed by node id too, so match on both fields:
+    // it is the ROW write into KV.graphNodes that must not have been dispatched.
+    expect(
+      kv.writes.filter((w) => w.scope === KV.graphNodes && w.key === "huge"),
+    ).toHaveLength(0);
+    const summary = vi
+      .mocked(logger.info)
+      .mock.calls.filter(([msg]) => msg === "Graph delta persisted");
+    expect(summary).toHaveLength(1);
+    const fields = summary[0]![1] as Record<string, unknown>;
+    expect(fields.refused).toBe(1);
+    const byScope = fields.byScope as Record<
+      string,
+      { refused?: number; maxBytes: number }
+    >;
+    expect(byScope[KV.graphNodes]!.refused).toBe(1);
+    expect(byScope[KV.graphNodes]!.maxBytes).toBeGreaterThan(16 * 1024 * 1024);
   });
 
   it("never lowers the recorded row size from a batch of thin rows", async () => {
