@@ -415,6 +415,14 @@ export function getGraphBatchSize(): number {
 // deploy so the readers ship before any row depends on them.
 export type GraphProvenanceMode = "legacy" | "batch";
 
+// U3. One-time catch-up for a store whose rows predate the three indexes.
+// Off by default and read at boot only: it enumerates the graph scopes, which
+// is the read the rest of U3 exists to remove from the hot path, so it must be
+// something an operator turns on deliberately rather than a startup default.
+export function isGraphIndexBackfillEnabled(): boolean {
+  return getMergedEnv()["GRAPH_INDEX_BACKFILL"] === "true";
+}
+
 export function getGraphProvenanceMode(): GraphProvenanceMode {
   return getMergedEnv()["GRAPH_PROVENANCE_MODE"] === "batch" ? "batch" : "legacy";
 }

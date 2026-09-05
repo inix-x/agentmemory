@@ -13,6 +13,7 @@ import {
   loadTeamConfig,
   loadSnapshotConfig,
   isGraphExtractionEnabled,
+  isGraphIndexBackfillEnabled,
   isAutoCompressEnabled,
   isConsolidationEnabled,
   isContextInjectionEnabled,
@@ -68,6 +69,7 @@ import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
+import { registerGraphIndexBackfillFunction } from "./functions/graph-index-backfill.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
 import { registerGovernanceFunction } from "./functions/governance.js";
@@ -284,6 +286,20 @@ async function main() {
 
   registerGraphFunction(sdk, kv, provider);
   registerGraphImportFunction(sdk, kv);
+  registerGraphIndexBackfillFunction(sdk, kv);
+  if (isGraphIndexBackfillEnabled()) {
+    // Detached: the backfill enumerates and a large store makes that slow, and
+    // nothing at boot needs to wait for it. It resumes from its cursor, so a
+    // run cut short by a restart picks up where it stopped.
+    bootLog("Graph index backfill: GRAPH_INDEX_BACKFILL=true, starting");
+    void sdk
+      .trigger({ function_id: "mem::graph-index-backfill", payload: {} })
+      .catch((err: unknown) => {
+        bootLog(
+          `Graph index backfill failed to start: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+  }
   bootLog(
     `Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`,
   );
