@@ -501,6 +501,10 @@ describe("Graph Functions", () => {
       expect(stats.fromSnapshot).toBe(true);
       expect(stats.totalNodes).toBe(15);
       expect(stats.totalEdges).toBe(25);
+      // snap.stats also carries nodeRowBytes / edgeRowBytes, which size the
+      // enumeration guard. They are internal and must not widen this response.
+      expect(stats).not.toHaveProperty("nodeRowBytes");
+      expect(stats).not.toHaveProperty("edgeRowBytes");
     });
 
     it("graph-extract updates snapshot inline (no kv.list, dirty stays false)", async () => {

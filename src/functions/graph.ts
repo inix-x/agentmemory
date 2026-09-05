@@ -1566,8 +1566,14 @@ export function registerGraphFunction(
   sdk.registerFunction("mem::graph-stats", async () => {
     const snap = await readSnapshot(kv);
     if (snap) {
+      // Named rather than spread: stats now also carries nodeRowBytes and
+      // edgeRowBytes, which size the enumeration guard and are nobody's
+      // business at the API boundary.
       return {
-        ...snap.stats,
+        totalNodes: snap.stats.totalNodes,
+        totalEdges: snap.stats.totalEdges,
+        nodesByType: snap.stats.nodesByType,
+        edgesByType: snap.stats.edgesByType,
         fromSnapshot: true,
         updatedAt: snap.updatedAt,
         ...(snap.dirty
@@ -1760,7 +1766,10 @@ export function registerGraphFunction(
       });
       return {
         success: true,
-        ...snap.stats,
+        totalNodes: snap.stats.totalNodes,
+        totalEdges: snap.stats.totalEdges,
+        nodesByType: snap.stats.nodesByType,
+        edgesByType: snap.stats.edgesByType,
         topNodes: snap.topNodes.length,
         topEdges: snap.topEdges.length,
         updatedAt: snap.updatedAt,
