@@ -2,7 +2,7 @@
 // function result drops the worker and 404s every endpoint. Refuse the
 // payload as one clean error instead. The cap sits under the frame limit
 // to leave headroom for the SDK's framing overhead.
-const FRAME_LIMIT_BYTES = 16 * 1024 * 1024;
+export const FRAME_LIMIT_BYTES = 16 * 1024 * 1024;
 export const SAFE_PAYLOAD_BYTES = 15 * 1024 * 1024;
 
 export type OversizedPayload = {

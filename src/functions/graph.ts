@@ -17,6 +17,7 @@ import {
 import { isGraphExtractionEnabled, getGraphProvenanceMode } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { payloadByteLength, FRAME_LIMIT_BYTES } from "../state/frame-guard.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -395,6 +396,80 @@ function edgeIndexKey(
   return `${sourceNodeId}|${targetNodeId}|${type}`;
 }
 
+// Diagnostic (2026-09-05). The engine drops the worker's socket on a frame
+// over FRAME_LIMIT_BYTES (frame-guard.ts:1-5), every graph-extract death in
+// production sits within seconds of a state::set dispatch, and nothing on
+// this write path measures what it hands the SDK. Each write below is sized
+// against the exact { scope, key, value } object StateKV.set serializes; the
+// wire frame is that plus a ~200-byte invoke envelope. The warn is emitted
+// BEFORE the write so its bytes reach the log even when the write never
+// returns ("Invocation timeout after 30000ms: state::set"). One line per
+// oversized write; the per-call summary is keyed by scope, so its size is
+// bounded by the schema's graph scopes, not by the batch.
+const GRAPH_WRITE_WARN_BYTES = 8 * 1024 * 1024;
+
+type GraphWriteLedger = {
+  writes: number;
+  bytes: number;
+  ms: number;
+  byScope: Record<
+    string,
+    { writes: number; bytes: number; maxBytes: number; ms: number }
+  >;
+  // Set before each write, cleared when it returns; a write that throws
+  // leaves itself here so the summary can name it.
+  inFlight: { scope: string; key: string; bytes: number; ms?: number } | null;
+  snap: GraphSnapshot | null;
+};
+
+function newWriteLedger(): GraphWriteLedger {
+  return { writes: 0, bytes: 0, ms: 0, byScope: {}, inFlight: null, snap: null };
+}
+
+async function measuredSet<T>(
+  kv: StateKV,
+  ledger: GraphWriteLedger,
+  scope: string,
+  key: string,
+  value: T,
+  detail?: Record<string, unknown>,
+): Promise<T> {
+  const bytes = payloadByteLength({ scope, key, value });
+  if (bytes > GRAPH_WRITE_WARN_BYTES) {
+    logger.warn("Graph write over 8 MiB", {
+      scope,
+      key,
+      bytes,
+      frameLimitBytes: FRAME_LIMIT_BYTES,
+      overFrameLimit: bytes > FRAME_LIMIT_BYTES,
+      ...detail,
+    });
+  }
+  const started = Date.now();
+  ledger.inFlight = { scope, key, bytes };
+  try {
+    const result = await kv.set(scope, key, value);
+    ledger.inFlight = null;
+    return result;
+  } finally {
+    const ms = Date.now() - started;
+    if (ledger.inFlight) ledger.inFlight.ms = ms;
+    const s = (ledger.byScope[scope] ??= {
+      writes: 0,
+      bytes: 0,
+      maxBytes: 0,
+      ms: 0,
+    });
+    s.writes += 1;
+    s.bytes += bytes;
+    s.ms += ms;
+    if (bytes > s.maxBytes) s.maxBytes = bytes;
+    ledger.writes += 1;
+    ledger.bytes += bytes;
+    ledger.ms += ms;
+  }
+}
+
 // Mutates `snap` to apply a +1 (or -1) degree delta for nodeId,
 // maintaining the top-N ranking. Returns the new degree. Reads /
 // writes the per-node degree counter via targeted kv.get/set so we
@@ -405,13 +480,14 @@ function edgeIndexKey(
 //     topNodes in place)
 async function applyDegreeDelta(
   kv: StateKV,
+  ledger: GraphWriteLedger,
   snap: GraphSnapshot,
   nodeId: string,
   delta: number,
 ): Promise<number> {
   const prev = (await kv.get<number>(KV.graphNodeDegree, nodeId)) ?? 0;
   const next = Math.max(0, prev + delta);
-  await kv.set(KV.graphNodeDegree, nodeId, next);
+  await measuredSet(kv, ledger, KV.graphNodeDegree, nodeId, next);
 
   const inTop = snap.topNodes.findIndex((n) => n.id === nodeId);
   if (inTop !== -1) {
@@ -780,14 +856,15 @@ export function extractGraphHeuristics(
 // `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the list payload
 // exceeds the iii heartbeat budget and the worker dies before merge can
 // complete. Each name-index entry is a single small kv.get/set pair.
-export async function persistGraphDelta(
+async function persistGraphDeltaMeasured(
   kv: StateKV,
+  ledger: GraphWriteLedger,
   nodes: GraphNode[],
   edges: GraphEdge[],
   obsIds: string[],
   // Null means legacy provenance: merges union observation ids as they always
   // have. A batch id means merges union that id instead.
-  batchId: string | null = null,
+  batchId: string | null,
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
   // readSnapshot() collapses two different situations into null: "no
   // snapshot yet" and "the read failed" (it catches and logs). Bootstrapping
@@ -822,6 +899,7 @@ export async function persistGraphDelta(
     (snapshotReadFailed
       ? { ...emptySnapshot(), resetAt: new Date().toISOString() }
       : emptySnapshot());
+  ledger.snap = snap;
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
@@ -860,7 +938,7 @@ export async function persistGraphDelta(
     if (existing) {
       idRemap.set(node.id, existing.id);
       const merged = mergeNode(existing, node, obsIds, batchId, capturedAt);
-      await kv.set(KV.graphNodes, existing.id, merged);
+      await measuredSet(kv, ledger, KV.graphNodes, existing.id, merged);
       // Update topNodes entry if present so a stale clone isn't
       // returned from the snapshot fast path.
       const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
@@ -869,9 +947,9 @@ export async function persistGraphDelta(
         snapMutated = true;
       }
     } else {
-      await kv.set(KV.graphNodes, node.id, node);
-      await kv.set(KV.graphNameIndex, indexKey, node.id);
-      await kv.set(KV.graphNodeDegree, node.id, 0);
+      await measuredSet(kv, ledger, KV.graphNodes, node.id, node);
+      await measuredSet(kv, ledger, KV.graphNameIndex, indexKey, node.id);
+      await measuredSet(kv, ledger, KV.graphNodeDegree, node.id, 0);
       snap.stats.totalNodes += 1;
       snap.stats.nodesByType[node.type] =
         (snap.stats.nodesByType[node.type] ?? 0) + 1;
@@ -910,7 +988,7 @@ export async function persistGraphDelta(
 
     if (existing) {
       const merged = mergeEdge(existing, obsIds, batchId);
-      await kv.set(KV.graphEdges, existing.id, merged);
+      await measuredSet(kv, ledger, KV.graphEdges, existing.id, merged);
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
       if (topIdx !== -1) {
@@ -918,14 +996,14 @@ export async function persistGraphDelta(
         snapMutated = true;
       }
     } else {
-      await kv.set(KV.graphEdges, edge.id, edge);
-      await kv.set(KV.graphEdgeKey, eKey, edge.id);
+      await measuredSet(kv, ledger, KV.graphEdges, edge.id, edge);
+      await measuredSet(kv, ledger, KV.graphEdgeKey, eKey, edge.id);
       snap.stats.totalEdges += 1;
       snap.stats.edgesByType[edge.type] =
         (snap.stats.edgesByType[edge.type] ?? 0) + 1;
       newEdgeCount += 1;
-      await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1);
-      await applyDegreeDelta(kv, snap, edge.targetNodeId, +1);
+      await applyDegreeDelta(kv, ledger, snap, edge.sourceNodeId, +1);
+      await applyDegreeDelta(kv, ledger, snap, edge.targetNodeId, +1);
       newEdgesForTopCheck.push(edge);
     }
   }
@@ -940,10 +1018,64 @@ export async function persistGraphDelta(
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    await measuredSet(kv, ledger, KV.graphSnapshot, SNAPSHOT_KEY, snap, {
+      topNodes: snap.topNodes.length,
+      topEdges: snap.topEdges.length,
+    });
   }
 
   return { newNodeCount, newEdgeCount };
+}
+
+// Diagnostic wrapper (see measuredSet). One summary line per call, emitted
+// from finally so a write that times out still reports what it was carrying.
+export async function persistGraphDelta(
+  kv: StateKV,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  obsIds: string[],
+  batchId: string | null = null,
+): Promise<{ newNodeCount: number; newEdgeCount: number }> {
+  const ledger = newWriteLedger();
+  const started = Date.now();
+  let result: { newNodeCount: number; newEdgeCount: number } | undefined;
+  let error: string | undefined;
+  try {
+    result = await persistGraphDeltaMeasured(
+      kv,
+      ledger,
+      nodes,
+      edges,
+      obsIds,
+      batchId,
+    );
+    return result;
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    logger.info("Graph delta persisted", {
+      nodes: nodes.length,
+      edges: edges.length,
+      newNodes: result?.newNodeCount,
+      newEdges: result?.newEdgeCount,
+      topNodes: ledger.snap?.topNodes.length,
+      topEdges: ledger.snap?.topEdges.length,
+      // Which lineage this snapshot is: the 09-01 19:04Z failed-read
+      // bootstrap stamped resetAt, and totalNodes is what the last write
+      // that fit under the frame persisted, not what is on disk.
+      snapshotResetAt: ledger.snap?.resetAt,
+      snapshotTotalNodes: ledger.snap?.stats.totalNodes,
+      snapshotBytes: ledger.byScope[KV.graphSnapshot]?.maxBytes,
+      writes: ledger.writes,
+      bytes: ledger.bytes,
+      writeMs: ledger.ms,
+      ms: Date.now() - started,
+      byScope: ledger.byScope,
+      ...(ledger.inFlight ? { failed: ledger.inFlight } : {}),
+      ...(error ? { error } : {}),
+    });
+  }
 }
 
 export function registerGraphFunction(
@@ -1424,13 +1556,19 @@ export function registerGraphFunction(
       }
 
       const snap = buildSnapshotFromArrays(nodes, edges);
-      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+      // The other place a full snapshot is written; same measurement.
+      const rebuildLedger = newWriteLedger();
+      await measuredSet(kv, rebuildLedger, KV.graphSnapshot, SNAPSHOT_KEY, snap, {
+        topNodes: snap.topNodes.length,
+        topEdges: snap.topEdges.length,
+      });
       const tookMs = Date.now() - started;
       logger.info("Graph snapshot rebuilt", {
         totalNodes: snap.stats.totalNodes,
         totalEdges: snap.stats.totalEdges,
         topNodes: snap.topNodes.length,
         topEdges: snap.topEdges.length,
+        snapshotBytes: rebuildLedger.bytes,
         tookMs,
       });
       return {
