@@ -28,7 +28,11 @@ import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
 import { listBoundedOrSkip } from "../state/scope-size.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
-import { listGraphScopes } from "./graph.js";
+import { listGraphScopes, graphWriter } from "./graph.js";
+import {
+  putGraphEdgeRow,
+  putGraphNodeRow,
+} from "../state/graph-store.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
@@ -382,14 +386,33 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           await listBoundedOrSkip<Insight>(kv, KV.insights, "mem::export"),
           (i) => kv.delete(KV.insights, i.id),
         );
-        await runChunked(
-          await kv.list<{ id: string }>(KV.graphNodes).catch(() => []),
-          (n) => kv.delete(KV.graphNodes, n.id),
-        );
-        await runChunked(
-          await kv.list<{ id: string }>(KV.graphEdges).catch(() => []),
-          (e) => kv.delete(KV.graphEdges, e.id),
-        );
+        // Read the ids before deleting the rows: the three U3 indexes are keyed
+        // by node id and observation id, and the engine has no keys-only list,
+        // so the rows are the only place those keys can be recovered from.
+        // Leaving an index behind would point the search path and cascade at
+        // rows that no longer exist.
+        type ClearedRow = { id: string; sourceObservationIds?: string[] };
+        const clearedNodes = await kv
+          .list<ClearedRow>(KV.graphNodes)
+          .catch(() => [] as ClearedRow[]);
+        const clearedEdges = await kv
+          .list<ClearedRow>(KV.graphEdges)
+          .catch(() => [] as ClearedRow[]);
+        await runChunked(clearedNodes, (n) => kv.delete(KV.graphNodes, n.id));
+        await runChunked(clearedEdges, (e) => kv.delete(KV.graphEdges, e.id));
+        await runChunked(clearedNodes, (n) => kv.delete(KV.graphNames, n.id));
+        await runChunked(clearedNodes, (n) => kv.delete(KV.graphAdj, n.id));
+        // mem:graph:obs-index is deliberately left. Its keys are observation
+        // ids, which come from the extraction event and are not recoverable
+        // from the rows: a row written in batch mode carries a batch id, and a
+        // row written from an event carries nothing inline at all. Recovering
+        // them would mean a kv.get per row against mem:graph:batches, on the
+        // path whose whole point is not to do work per row.
+        //
+        // An orphaned entry is inert rather than wrong. It names row ids that
+        // no longer resolve, and every reader kv.gets the id and skips a miss,
+        // so the cost is bytes in a cold scope until the next backfill or
+        // extract rewrites the entry.
         await runChunked(
           await kv.list<{ id: string }>(KV.semantic).catch(() => []),
           (s) => kv.delete(KV.semantic, s.id),
@@ -482,13 +505,21 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         stats.summaries++;
       });
 
+      // Restored rows go in through graph-store so the catalog and the
+      // adjacency stubs land with them. An import that wrote rows only would
+      // leave a store the search path cannot see and cascade cannot flag, which
+      // is the state mem::graph-index-backfill exists to repair -- no reason to
+      // create it here when the row itself carries everything both indexes
+      // need. obs-index is the exception and stays the backfill's job: a
+      // restored row has no extraction event behind it.
+      const graphWrite = graphWriter(kv);
       if (importData.graphNodes) {
         await runChunked(importData.graphNodes, async (node) => {
           if (strategy === "skip") {
             const existing = await kv.get(KV.graphNodes, node.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await kv.set(KV.graphNodes, node.id, node);
+          await putGraphNodeRow(node, graphWrite);
         });
       }
       if (importData.graphEdges) {
@@ -497,7 +528,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             const existing = await kv.get(KV.graphEdges, edge.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await kv.set(KV.graphEdges, edge.id, edge);
+          await putGraphEdgeRow(kv, edge, graphWrite);
         });
       }
       // A batch-mode row imported without its batch resolves to no

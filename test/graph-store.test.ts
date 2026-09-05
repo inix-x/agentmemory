@@ -16,6 +16,8 @@ import {
   type GraphAdjStub,
 } from "../src/state/graph-store.js";
 import { persistGraphDelta } from "../src/functions/graph.js";
+import { registerExportImportFunction } from "../src/functions/export-import.js";
+import { mockSdk } from "./helpers/mocks.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode } from "../src/types.js";
 import { mockKV } from "./helpers/mocks.js";
@@ -232,5 +234,82 @@ describe("persistGraphDelta index maintenance", () => {
     expect(kv.store.get(KV.graphObsIndex)!.size).toBe(1);
     expect(kv.store.get(KV.graphObsIndex)!.has("obs_1")).toBe(true);
     expect(kv.store.get(KV.graphObsIndex)!.has("legacy_0")).toBe(false);
+  });
+});
+
+// graph-store owns the row-plus-index invariants and every writer routes through
+// it. Import writes rows verbatim, so without this it is the one writer that
+// leaves a store the search path cannot see -- rows present, indexes absent,
+// which is exactly the state the backfill exists to repair.
+describe("export-import keeps the indexes with the rows", () => {
+  it("indexes a restored graph by catalog and adjacency", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    registerExportImportFunction(sdk as never, kv as never);
+
+    const imported = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.29",
+        exportedAt: "2026-09-01T00:00:00Z",
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+        graphNodes: [node("gn_a", "Alpha"), node("gn_b", "Beta")],
+        graphEdges: [edge("ge_1", "gn_a", "gn_b", 4)],
+      },
+      strategy: "merge",
+    })) as { success: boolean; error?: string };
+    expect(imported.error).toBeUndefined();
+    expect(imported.success).toBe(true);
+
+    expect(kv.store.get(KV.graphNames)!.get("gn_a")).toEqual({
+      id: "gn_a",
+      type: "concept",
+      name: "Alpha",
+    });
+    expect(await readAdj(kv as never, "gn_b")).toEqual([
+      { edgeId: "ge_1", neighborId: "gn_a", weight: 4 },
+    ]);
+  });
+
+  it("clears the indexes when it clears the rows", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    registerExportImportFunction(sdk as never, kv as never);
+    await persistGraphDelta(
+      kv as never,
+      [node("gn_a", "Alpha"), node("gn_b", "Beta")],
+      [edge("ge_1", "gn_a", "gn_b", 1)],
+      ["obs_1"],
+    );
+    expect(kv.store.get(KV.graphNames)!.size).toBe(2);
+
+    const cleared = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.29",
+        exportedAt: "2026-09-01T00:00:00Z",
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      },
+      strategy: "replace",
+    })) as { success: boolean; error?: string };
+    expect(cleared.success).toBe(true);
+
+    // A catalog or adjacency entry left behind a clear-all points the search
+    // path at rows that are gone. Both are keyed by node id, which the rows
+    // carry, so both are cleared exactly.
+    expect(kv.store.get(KV.graphNames)!.size).toBe(0);
+    expect(await readAdj(kv as never, "gn_a")).toEqual([]);
+    // obs-index is keyed by observation id, which the rows do not carry, so it
+    // is left. The entry is inert: cascade kv.gets each row id and skips the
+    // miss. Pinned so the asymmetry is a decision rather than an oversight.
+    expect((await readObsIndex(kv as never, "obs_1")).nodes).toEqual([
+      "gn_a",
+      "gn_b",
+    ]);
+    expect(kv.store.get(KV.graphNodes)!.size).toBe(0);
   });
 });
