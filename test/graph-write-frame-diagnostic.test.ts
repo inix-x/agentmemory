@@ -28,23 +28,22 @@ const node = (id: string): GraphNode => ({
   createdAt: "2026-09-01T00:00:00Z",
 });
 
-// One top node carrying 9 MiB stands in for production's 500 top nodes whose
-// unioned sourceObservationIds add up to the same order of magnitude.
-function bigSnapshot(): GraphSnapshot {
-  const hub: GraphNode = {
+// A 9 MiB row. It used to be a 9 MiB snapshot, which the byte bound now shrinks
+// before the write, so the oversized write has to come from a row instead. Rows
+// are unbounded by design: production's largest node on disk is 572,956 bytes
+// and nothing stops one growing further, which is why the guard covers them.
+function fatNode(): GraphNode {
+  return {
     ...node("hub"),
     properties: { blob: "x".repeat(9 * 1024 * 1024) },
   };
-  return {
-    version: 1,
-    topNodes: [hub],
-    topEdges: [],
-    topDegrees: { hub: 0 },
-    stats: { totalNodes: 1, totalEdges: 0, nodesByType: { concept: 1 }, edgesByType: {} },
-    updatedAt: "2026-09-01T00:00:00Z",
-    dirty: false,
-  };
 }
+
+const nodePayload = (kv: ReturnType<typeof mockKV>, id: string) => ({
+  scope: KV.graphNodes,
+  key: id,
+  value: kv.store.get(KV.graphNodes)!.get(id),
+});
 
 const snapshotPayload = (kv: ReturnType<typeof mockKV>) => ({
   scope: KV.graphSnapshot,
@@ -61,25 +60,25 @@ beforeEach(() => {
 });
 
 describe("graph write frame diagnostic", () => {
-  it("warns once, with the bytes state::set is handed, when the snapshot write crosses 8 MiB", async () => {
+  it("warns once, with the bytes state::set is handed, when a write crosses 8 MiB", async () => {
     const kv = mockKV();
-    const existing = bigSnapshot();
-    await kv.set(KV.graphSnapshot, "current", existing);
-    // The fixture must actually cross the line, or the test is a no-op.
-    expect(payloadByteLength(snapshotPayload(kv))).toBeGreaterThan(WARN_BYTES);
 
-    await persistGraphDelta(kv as never, [node("n1")], [] as GraphEdge[], ["obs_1"]);
+    await persistGraphDelta(kv as never, [fatNode()], [] as GraphEdge[], ["obs_1"]);
 
     const oversized = warnCalls().filter(([msg]) => msg === "Graph write over 8 MiB");
     expect(oversized).toHaveLength(1);
     const fields = oversized[0]![1] as Record<string, unknown>;
-    expect(fields.scope).toBe(KV.graphSnapshot);
-    expect(fields.key).toBe("current");
+    expect(fields.scope).toBe(KV.graphNodes);
+    expect(fields.key).toBe("hub");
     // Read the written value back and re-measure it: the logged number must
     // be the payload that went to the SDK, not an estimate.
-    expect(fields.bytes).toBe(payloadByteLength(snapshotPayload(kv)));
+    expect(fields.bytes).toBe(payloadByteLength(nodePayload(kv, "hub")));
     expect(fields.bytes as number).toBeGreaterThan(WARN_BYTES);
-    expect(fields.topNodes).toBe(2);
+    expect(fields.overFrameLimit).toBe(false);
+    // The row is 9 MiB and the snapshot that cached it is not: the byte bound
+    // dropped it before the snapshot write.
+    const snap = kv.store.get(KV.graphSnapshot)!.get("current");
+    expect(payloadByteLength(snap)).toBeLessThan(WARN_BYTES);
   });
 
   it("stays silent under 8 MiB and reports one bounded summary per call", async () => {
@@ -108,19 +107,18 @@ describe("graph write frame diagnostic", () => {
 
   it("logs the failing write's bytes even when state::set never returns", async () => {
     const kv = mockKV();
-    await kv.set(KV.graphSnapshot, "current", bigSnapshot());
     const realSet = kv.set;
     // The production shape: the socket drops under the frame and the SDK
     // reports the invocation timeout 30 s later. The write itself is lost.
     kv.set = async (scope, key, value) => {
-      if (scope === KV.graphSnapshot) {
+      if (scope === KV.graphNodes) {
         throw new Error("Invocation timeout after 30000ms: state::set");
       }
       return realSet(scope, key, value);
     };
 
     await expect(
-      persistGraphDelta(kv as never, [node("n1")], [] as GraphEdge[], ["obs_1"]),
+      persistGraphDelta(kv as never, [fatNode()], [] as GraphEdge[], ["obs_1"]),
     ).rejects.toThrow("Invocation timeout after 30000ms: state::set");
 
     const oversized = warnCalls().filter(([msg]) => msg === "Graph write over 8 MiB");
@@ -134,9 +132,10 @@ describe("graph write frame diagnostic", () => {
     const fields = summaries[0]![1] as Record<string, unknown>;
     expect(fields.error).toBe("Invocation timeout after 30000ms: state::set");
     const failed = fields.failed as Record<string, unknown>;
-    expect(failed.scope).toBe(KV.graphSnapshot);
+    expect(failed.scope).toBe(KV.graphNodes);
     expect(failed.bytes as number).toBeGreaterThan(WARN_BYTES);
-    // The three row writes before the snapshot still landed and are counted.
-    expect(fields.writes).toBe(4);
+    // The row write is the first one this batch attempts, and it is the one
+    // that threw, so it is the only one counted.
+    expect(fields.writes).toBe(1);
   });
 });

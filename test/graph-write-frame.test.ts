@@ -4,7 +4,11 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { guardedSet, persistGraphDelta } from "../src/functions/graph.js";
+import {
+  guardedSet,
+  persistGraphDelta,
+  SNAPSHOT_BUDGET_BYTES,
+} from "../src/functions/graph.js";
 import { payloadByteLength } from "../src/state/frame-guard.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode, GraphSnapshot } from "../src/types.js";
@@ -68,6 +72,33 @@ beforeEach(() => {
 });
 
 describe("frame-safe graph writes", () => {
+  it("keeps the snapshot write under the budget on a corpus that overflows the row caps", async () => {
+    const kv = recordingKV();
+    // 520 nodes so topNodes fills its 500 cap with 20 left over, each carrying
+    // provenance AND 12 KB of properties. Provenance is what the projection
+    // drops; properties survive it, so only the byte bound can bring the cached
+    // 500 under 4 MiB. Production's shape at a size a unit test can run.
+    const obsIds = Array.from({ length: 200 }, (_, i) => `obs_${i}`);
+    const nodes = Array.from({ length: 520 }, (_, i) =>
+      node(`n${i}`, obsIds, 12_000),
+    );
+    const edges = Array.from({ length: 60 }, (_, i) =>
+      edge(`e${i}`, `n${i}`, `n${i + 1}`, obsIds),
+    );
+
+    await persistGraphDelta(kv as never, nodes, edges, obsIds);
+
+    const snapWrites = kv.writes.filter((w) => w.scope === KV.graphSnapshot);
+    expect(snapWrites.length).toBeGreaterThan(0);
+    // The literal is the oracle, not the imported constant. Asserting against
+    // the import would make the budget its own test: raising it to 64 MiB would
+    // raise the assertion with it and the test could never fail.
+    expect(SNAPSHOT_BUDGET_BYTES).toBe(4 * 1024 * 1024);
+    for (const w of snapWrites) {
+      expect(w.bytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    }
+  });
+
   it("caches snapshot rows that carry no observation ids", async () => {
     const kv = recordingKV();
     const obsIds = Array.from({ length: 50 }, (_, i) => `obs_${i}`);

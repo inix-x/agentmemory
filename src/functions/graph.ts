@@ -50,6 +50,67 @@ const SNAPSHOT_TOP_EDGES = DEFAULT_GRAPH_QUERY_LIMIT * 2;
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
 const SNAPSHOT_KEY = "current";
 
+// R2: the snapshot is bounded by bytes, not only by row counts. Row caps did not
+// hold it: 500 topNodes reached 14.2 MB because a row's size is unbounded, and
+// the write went over the engine frame. 4 MiB sits well under SAFE_PAYLOAD_BYTES
+// (15 MiB) because persistGraphDelta also reads the snapshot inbound and
+// StateKV.set echoes the value back, so a successful write pays its bytes twice.
+export const SNAPSHOT_BUDGET_BYTES = 4 * 1024 * 1024;
+
+// SNAPSHOT_TOP_EDGES caps pushes, and snapshotPushEdgeIfBothInTop only evicts one
+// to push one, so an array that grew past the cap under an earlier build keeps
+// its length forever on the incremental path. Bring it down wherever a snapshot
+// is loaded or built, by weight, which is the same key the eviction uses.
+function truncateTopEdges(snap: GraphSnapshot): GraphSnapshot {
+  if (snap.topEdges.length > SNAPSHOT_TOP_EDGES) {
+    snap.topEdges = [...snap.topEdges]
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, SNAPSHOT_TOP_EDGES);
+  }
+  return snap;
+}
+
+// Drops the lowest-degree node and the lowest-weight edge until the serialized
+// snapshot fits. topNodes is held sorted by degree descending, so its tail is the
+// cheapest node to lose. Returns the final size.
+//
+// ponytail: re-serializes the whole snapshot per pass. At the measured projected
+// size (about 380 KB against a 4 MiB budget) the loop does not run at all; it
+// exists so the bound still holds at 20x this corpus. Proportional dropping
+// keeps it to a handful of passes. Make it incremental only if a profile ever
+// shows it running hot.
+function shrinkSnapshotToBudget(snap: GraphSnapshot): number {
+  let bytes = payloadByteLength(snap);
+  while (
+    bytes > SNAPSHOT_BUDGET_BYTES &&
+    (snap.topNodes.length > 0 || snap.topEdges.length > 0)
+  ) {
+    // Drop in proportion to the overshoot rather than one row at a time. The
+    // measurement re-serializes the whole snapshot, so one-at-a-time is
+    // O(rows x bytes) and costs seconds inside the extract on the corpus that
+    // actually needs it. At least one row goes per pass, so this terminates.
+    const keep = SNAPSHOT_BUDGET_BYTES / bytes;
+    const dropNodes = Math.max(
+      1,
+      snap.topNodes.length - Math.floor(snap.topNodes.length * keep),
+    );
+    const dropEdges = Math.max(
+      1,
+      snap.topEdges.length - Math.floor(snap.topEdges.length * keep),
+    );
+    for (let i = 0; i < dropNodes && snap.topNodes.length > 0; i++) {
+      const dropped = snap.topNodes.pop();
+      if (dropped) delete snap.topDegrees[dropped.id];
+    }
+    if (snap.topEdges.length > 0) {
+      snap.topEdges.sort((a, b) => b.weight - a.weight);
+      snap.topEdges.length = Math.max(0, snap.topEdges.length - dropEdges);
+    }
+    bytes = payloadByteLength(snap);
+  }
+  return bytes;
+}
+
 // `state::list` over a 75K-node scope can exceed the iii invocation
 // timeout. The query handler races the enumeration against this budget
 // and falls back to the snapshot (or a warning envelope) when the live
@@ -97,7 +158,7 @@ async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
   try {
     const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
     if (snap && typeof snap === "object" && snap.version === 1) {
-      return snap;
+      return truncateTopEdges(snap);
     }
     return null;
   } catch (err) {
@@ -141,7 +202,7 @@ function buildSnapshotFromArrays(
   for (const e of liveEdges) {
     edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
   }
-  return {
+  const snap: GraphSnapshot = {
     version: 1,
     topNodes: ranked.map(snapshotNode),
     topEdges: topEdges.map(snapshotEdge),
@@ -157,6 +218,11 @@ function buildSnapshotFromArrays(
     updatedAt: new Date().toISOString(),
     dirty: false,
   };
+  // The rebuild path filters topEdges straight out of liveEdges with no cap, so
+  // it is where an over-cap array comes from in the first place.
+  truncateTopEdges(snap);
+  shrinkSnapshotToBudget(snap);
+  return snap;
 }
 
 function paginateFromSnapshot(
@@ -959,6 +1025,9 @@ async function persistGraphDeltaMeasured(
     (snapshotReadFailed
       ? { ...emptySnapshot(), resetAt: new Date().toISOString() }
       : emptySnapshot());
+  // persistGraphDelta deliberately reads raw above, to keep "absent" and "read
+  // failed" distinguishable, so readSnapshot's truncation does not reach it.
+  truncateTopEdges(snap);
   ledger.snap = snap;
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
@@ -1088,6 +1157,7 @@ async function persistGraphDeltaMeasured(
     if (edgeScope && edgeScope.writes > 0) {
       snap.stats.edgeRowBytes = Math.round(edgeScope.bytes / edgeScope.writes);
     }
+    shrinkSnapshotToBudget(snap);
     await guardedSet(kv, KV.graphSnapshot, SNAPSHOT_KEY, snap, ledger, {
       topNodes: snap.topNodes.length,
       topEdges: snap.topEdges.length,
