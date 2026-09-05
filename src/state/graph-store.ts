@@ -33,6 +33,16 @@ import type { GraphEdge, GraphNode } from "../types.js";
 // edge still uses its fresh weight for traversal cost.
 export const GRAPH_ADJ_CAP = 64;
 
+// The obs-index entry ceiling, and it exists for the same reason U1's snapshot
+// bound does. An entry accumulates every row an extraction linked to that
+// observation, and re-extraction unions more in forever: an unbounded array
+// under one key, merged on every write, which is exactly the shape that grew
+// mem:graph:snapshot to 16 MiB and closed the engine's socket. An extract
+// touches about 71 rows, so 512 is generous against the typical entry while
+// holding a ceiling near 13 KB. Oldest ids go first, matching the convention
+// KTD2 sets for sourceBatchIds.
+export const GRAPH_OBS_INDEX_CAP = 512;
+
 export type GraphAdjStub = {
   edgeId: string;
   neighborId: string;
@@ -70,14 +80,21 @@ export function mergeAdj(
     .slice(0, GRAPH_ADJ_CAP);
 }
 
+function capOldest(ids: Iterable<string>): string[] {
+  const deduped = [...new Set(ids)];
+  return deduped.length > GRAPH_OBS_INDEX_CAP
+    ? deduped.slice(deduped.length - GRAPH_OBS_INDEX_CAP)
+    : deduped;
+}
+
 export function mergeObsIndex(
   existing: GraphObsIndexEntry | null,
   nodes: Iterable<string>,
   edges: Iterable<string>,
 ): GraphObsIndexEntry {
   return {
-    nodes: [...new Set([...(existing?.nodes ?? []), ...nodes])],
-    edges: [...new Set([...(existing?.edges ?? []), ...edges])],
+    nodes: capOldest([...(existing?.nodes ?? []), ...nodes]),
+    edges: capOldest([...(existing?.edges ?? []), ...edges]),
   };
 }
 
@@ -145,35 +162,54 @@ export type GraphIndexFlushCounts = {
   adj: number;
   obs: number;
   names: number;
+  // guardedSet refuses an oversized value and returns rather than throws, so a
+  // flush that ignored the result would drop an index write silently. Counted
+  // here and reported in the per-call summary.
+  refused: number;
 };
+
+function wasRefused(result: unknown): boolean {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    (result as { oversized?: unknown }).oversized === true
+  );
+}
 
 export async function flushIndexDelta(
   kv: StateKV,
   delta: GraphIndexDelta,
   write: GuardedWrite,
 ): Promise<GraphIndexFlushCounts> {
+  let refused = 0;
+  const record = (result: unknown) => {
+    if (wasRefused(result)) refused++;
+  };
   for (const [nodeId, stubs] of delta.adj) {
     const existing =
       (await kv.get<GraphAdjStub[]>(KV.graphAdj, nodeId).catch(() => null)) ?? [];
-    await write(KV.graphAdj, nodeId, mergeAdj(existing, stubs));
+    record(await write(KV.graphAdj, nodeId, mergeAdj(existing, stubs)));
   }
   for (const [obsId, slot] of delta.obs) {
     const existing = await kv
       .get<GraphObsIndexEntry>(KV.graphObsIndex, obsId)
       .catch(() => null);
-    await write(
-      KV.graphObsIndex,
-      obsId,
-      mergeObsIndex(existing, slot.nodes, slot.edges),
+    record(
+      await write(
+        KV.graphObsIndex,
+        obsId,
+        mergeObsIndex(existing, slot.nodes, slot.edges),
+      ),
     );
   }
   for (const [nodeId, entry] of delta.names) {
-    await write(KV.graphNames, nodeId, entry);
+    record(await write(KV.graphNames, nodeId, entry));
   }
   return {
     adj: delta.adj.size,
     obs: delta.obs.size,
     names: delta.names.size,
+    refused,
   };
 }
 

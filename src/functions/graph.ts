@@ -523,7 +523,7 @@ type GraphWriteLedger = {
   bytes: number;
   ms: number;
   refused: number;
-  index: { adj: number; obs: number; names: number } | null;
+  index: { adj: number; obs: number; names: number; refused: number } | null;
   byScope: Record<
     string,
     {

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   GRAPH_ADJ_CAP,
+  GRAPH_OBS_INDEX_CAP,
   flushIndexDelta,
   mergeAdj,
   mergeObsIndex,
@@ -151,6 +152,49 @@ describe("graph-store index invariants", () => {
     // A restore has no extraction event behind it, so obs-index stays the
     // backfill's job rather than a transpose of the row's provenance.
     expect(kv.store.get(KV.graphObsIndex)).toBeUndefined();
+  });
+
+  it("caps an obs-index entry, keeping the newest ids", async () => {
+    const kv = mockKV();
+    const { write } = writerFor(kv);
+    // An entry accumulates every row an extraction linked to the observation,
+    // and re-extraction unions more forever. Unbounded array under one key,
+    // merged on every write, is the shape that grew the snapshot to 16 MiB.
+    const delta = newIndexDelta();
+    const overCap = GRAPH_OBS_INDEX_CAP + 40;
+    for (let i = 0; i < overCap; i++) {
+      recordRowObservations(delta, ["obs_1"], `gn_${i}`, "node");
+    }
+
+    await flushIndexDelta(kv as never, delta, write);
+
+    const entry = await readObsIndex(kv as never, "obs_1");
+    expect(entry.nodes).toHaveLength(GRAPH_OBS_INDEX_CAP);
+    expect(entry.nodes).not.toContain("gn_0");
+    expect(entry.nodes).toContain(`gn_${overCap - 1}`);
+  });
+
+  it("counts an index write the guard refused rather than dropping it", async () => {
+    const kv = mockKV();
+    const writes: string[] = [];
+    // guardedSet returns the OversizedPayload rather than throwing, so a flush
+    // that ignored the result would lose an index write with no trace.
+    const refusingWrite = async <T>(scope: string, key: string, value: T) => {
+      if (scope === KV.graphNames) {
+        return { success: false, oversized: true, bytes: 1, limitBytes: 0 };
+      }
+      writes.push(scope);
+      return kv.set(scope, key, value);
+    };
+    const delta = newIndexDelta();
+    recordNodeName(delta, node("gn_a"));
+    recordRowObservations(delta, ["obs_1"], "gn_a", "node");
+
+    const counts = await flushIndexDelta(kv as never, delta, refusingWrite);
+
+    expect(counts.refused).toBe(1);
+    expect(counts.names).toBe(1);
+    expect(writes).toEqual([KV.graphObsIndex]);
   });
 
   it("merges by edge id so a stub is replaced, not duplicated", () => {
