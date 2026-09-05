@@ -42,6 +42,22 @@ export const KV = {
   // a graph row can carry the batch id instead of the whole list. Linear in
   // observations where the per-row arrays were N times M.
   graphBatches: "mem:graph:batches",
+  // U3: the three append-only indexes that keep the search path off kv.list.
+  // Retrieval loads the whole corpus today and the scope guard refuses it, so
+  // graph retrieval returns nothing. Maintained inside persistGraphDelta and
+  // owned by src/state/graph-store.ts.
+  // - graphAdj: nodeId -> [{edgeId, neighborId, weight}], capped at 64 stubs
+  //   by weight. Serves Dijkstra frontier expansion.
+  // - graphObsIndex: obsId -> {nodes, edges} row ids, built from the extraction
+  //   event rather than by transposing a row's sourceObservationIds (the
+  //   transpose is 33,767,235 pairs, about 902 MiB). Serves expandFromChunks
+  //   and mem::cascade-update stale-marking.
+  // - graphNames: nodeId -> {id, type, name}. The compact catalog substring
+  //   matching and temporalQuery read instead of the node scope; about 2.8 MiB
+  //   at 37,039 reachable nodes against a 15 MiB listBounded ceiling.
+  graphAdj: "mem:graph:adj",
+  graphObsIndex: "mem:graph:obs-index",
+  graphNames: "mem:graph:names",
   // Byte cost of the last successful kv.list per scope, so a read can be
   // refused before it is paid for. graph.ts sizes itself from the
   // snapshot's totalNodes; every other scope has no count, and an
