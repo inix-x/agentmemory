@@ -5,6 +5,8 @@ import type {
   GraphBatch,
   GraphQueryResult,
   GraphSnapshot,
+  GraphSnapshotNode,
+  GraphSnapshotEdge,
   CompressedObservation,
   MemoryProvider,
 } from "../types.js";
@@ -141,14 +143,16 @@ function buildSnapshotFromArrays(
   }
   return {
     version: 1,
-    topNodes: ranked,
-    topEdges,
+    topNodes: ranked.map(snapshotNode),
+    topEdges: topEdges.map(snapshotEdge),
     topDegrees,
     stats: {
       totalNodes: liveNodes.length,
       totalEdges: liveEdges.length,
       nodesByType,
       edgesByType,
+      nodeRowBytes: meanRowBytes(liveNodes.slice(0, ROW_BYTE_SAMPLE)),
+      edgeRowBytes: meanRowBytes(liveEdges.slice(0, ROW_BYTE_SAMPLE)),
     },
     updatedAt: new Date().toISOString(),
     dirty: false,
@@ -198,6 +202,9 @@ const GRAPH_LIST_FRAME_CAP_BYTES = 104_857_600;
 const SAFE_ENUMERATION_FRAME_FRACTION = 0.5;
 const SAFE_ENUMERATION_BYTE_BUDGET =
   GRAPH_LIST_FRAME_CAP_BYTES * SAFE_ENUMERATION_FRAME_FRACTION;
+// Bounded sample: mean row size over the first N rows, not over the whole
+// corpus, so measuring the corpus never costs a pass over the corpus.
+const ROW_BYTE_SAMPLE = 200;
 const CALIBRATED_BYTES_PER_NODE = 4481;
 const CALIBRATED_BYTES_PER_EDGE = 3036;
 
@@ -217,19 +224,17 @@ function hasOrphanRows(snap: GraphSnapshot): boolean {
   return typeof snap.resetAt === "string" && Date.parse(snap.resetAt) > 0;
 }
 
+// The per-row size comes from the snapshot's recorded measurement of a STORED
+// row, never from topNodes / topEdges. Those became provenance-free projections
+// in U1, so sampling them reads a ~250-byte row where the scope holds a ~28 KB
+// one, and the guard would wave through the enumeration it exists to refuse.
 function estimateScopeBytes(
   total: number | null,
-  sample: unknown[],
+  measuredPerRow: number | undefined,
   calibratedFloor: number,
 ): number | null {
   if (total === null || !Number.isFinite(total) || total < 0) return null;
-  const perRow =
-    sample.length > 0
-      ? Math.max(
-          Buffer.byteLength(JSON.stringify(sample)) / sample.length,
-          calibratedFloor,
-        )
-      : calibratedFloor;
+  const perRow = Math.max(measuredPerRow ?? 0, calibratedFloor);
   return total * perRow;
 }
 
@@ -248,12 +253,12 @@ async function checkGraphEnumerable(
   const orphaned = snap ? hasOrphanRows(snap) : false;
   const nodeBytes = estimateScopeBytes(
     totalNodes,
-    snap?.topNodes ?? [],
+    snap?.stats.nodeRowBytes,
     CALIBRATED_BYTES_PER_NODE,
   );
   const edgeBytes = estimateScopeBytes(
     totalEdges,
-    snap?.topEdges ?? [],
+    snap?.stats.edgeRowBytes,
     CALIBRATED_BYTES_PER_EDGE,
   );
   const nodesFit =
@@ -387,6 +392,31 @@ export async function listGraphScopes(
   ]);
   if (failed) return { nodes: [], edges: [], enumerated: false };
   return { nodes, edges, enumerated: true };
+}
+
+// R3: what a row looks like once it is cached. Identity, display, and rank
+// survive; provenance does not. One helper each so every push site uses the same
+// shape -- the two push sites build from full rows, which a reader-only audit of
+// snap.topNodes misses.
+function snapshotNode(node: GraphNode): GraphSnapshotNode {
+  const { sourceObservationIds, sourceBatchIds, ...cached } = node;
+  void sourceObservationIds;
+  void sourceBatchIds;
+  return cached;
+}
+
+function snapshotEdge(edge: GraphEdge): GraphSnapshotEdge {
+  const { sourceObservationIds, sourceBatchIds, ...cached } = edge;
+  void sourceObservationIds;
+  void sourceBatchIds;
+  return cached;
+}
+
+// Mean serialized bytes over a sample of STORED rows, for the enumeration
+// guard. Undefined when the sample is empty, which leaves the calibrated floor.
+function meanRowBytes(rows: unknown[]): number | undefined {
+  if (rows.length === 0) return undefined;
+  return Math.round(payloadByteLength(rows) / rows.length);
 }
 
 function nameIndexKey(type: string, name: string): string {
@@ -536,7 +566,7 @@ async function applyDegreeDelta(
     // Capacity available — fetch + promote.
     const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
     if (node && !node.stale) {
-      snap.topNodes.push(node);
+      snap.topNodes.push(snapshotNode(node));
       snap.topDegrees[node.id] = next;
       snap.topNodes.sort(
         (a, b) =>
@@ -555,7 +585,7 @@ async function applyDegreeDelta(
     if (node && !node.stale) {
       const evicted = snap.topNodes.pop();
       if (evicted) delete snap.topDegrees[evicted.id];
-      snap.topNodes.push(node);
+      snap.topNodes.push(snapshotNode(node));
       snap.topDegrees[node.id] = next;
       snap.topNodes.sort(
         (a, b) =>
@@ -584,7 +614,7 @@ function snapshotPushEdgeIfBothInTop(
       if (snap.topEdges[minIdx]!.weight >= edge.weight) return;
       snap.topEdges.splice(minIdx, 1);
     }
-    snap.topEdges.push(edge);
+    snap.topEdges.push(snapshotEdge(edge));
   }
 }
 
@@ -973,7 +1003,7 @@ async function persistGraphDeltaMeasured(
       // returned from the snapshot fast path.
       const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
       if (topIdx !== -1) {
-        snap.topNodes[topIdx] = merged;
+        snap.topNodes[topIdx] = snapshotNode(merged);
         snapMutated = true;
       }
     } else {
@@ -987,7 +1017,7 @@ async function persistGraphDeltaMeasured(
       if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
         // Degree 0 still beats an empty slot — sit at the tail
         // until edges arrive and promote.
-        snap.topNodes.push(node);
+        snap.topNodes.push(snapshotNode(node));
         snap.topDegrees[node.id] = 0;
       }
     }
@@ -1022,7 +1052,7 @@ async function persistGraphDeltaMeasured(
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
       if (topIdx !== -1) {
-        snap.topEdges[topIdx] = merged;
+        snap.topEdges[topIdx] = snapshotEdge(merged);
         snapMutated = true;
       }
     } else {
@@ -1048,6 +1078,16 @@ async function persistGraphDeltaMeasured(
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
+    // Free: the ledger already sized every row this call wrote. Latest
+    // measurement wins, so the enumeration guard tracks the corpus as it grows.
+    const nodeScope = ledger.byScope[KV.graphNodes];
+    if (nodeScope && nodeScope.writes > 0) {
+      snap.stats.nodeRowBytes = Math.round(nodeScope.bytes / nodeScope.writes);
+    }
+    const edgeScope = ledger.byScope[KV.graphEdges];
+    if (edgeScope && edgeScope.writes > 0) {
+      snap.stats.edgeRowBytes = Math.round(edgeScope.bytes / edgeScope.writes);
+    }
     await guardedSet(kv, KV.graphSnapshot, SNAPSHOT_KEY, snap, ledger, {
       topNodes: snap.topNodes.length,
       topEdges: snap.topEdges.length,

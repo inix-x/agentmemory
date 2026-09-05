@@ -659,6 +659,7 @@ describe("graph scope enumeration guard", () => {
       topNodes?: GraphNode[];
       topEdges?: GraphEdge[];
       resetAt?: string;
+      nodeRowBytes?: number;
     }): GraphSnapshot {
       return {
         version: 1,
@@ -670,6 +671,7 @@ describe("graph scope enumeration guard", () => {
           totalEdges: opts.totalEdges,
           nodesByType: { concept: opts.totalNodes },
           edgesByType: { related_to: opts.totalEdges },
+          ...(opts.nodeRowBytes ? { nodeRowBytes: opts.nodeRowBytes } : {}),
         },
         updatedAt: "2026-08-27T00:00:00Z",
         dirty: false,
@@ -744,7 +746,33 @@ describe("graph scope enumeration guard", () => {
       expect(refusalFields()).toMatchObject({ blockedScope: EDGES });
     });
 
-    it("refuses a corpus whose sampled rows are fat enough to blow the budget under the calibrated floor", async () => {
+    it("refuses a corpus whose measured row size blows the budget under the calibrated floor", async () => {
+      await kv.set(
+        SNAPSHOT,
+        "current",
+        sizedSnapshot({
+          totalNodes: 5_000,
+          totalEdges: 1,
+          nodeRowBytes: 20_000,
+        }),
+      );
+      await seedRetrievalGraph(kv, ["alpha", "beta"]);
+
+      await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
+
+      expect(5_000 * BYTES_PER_NODE).toBeLessThan(BYTE_BUDGET);
+      expect(graphScopesListed(kv)).toEqual([]);
+      const fields = refusalFields();
+      expect(fields.blockedScope).toBe(NODES);
+      expect(fields.estimatedNodeBytes).toBe(5_000 * 20_000);
+      expect(fields.estimatedNodeBytes as number).toBeGreaterThan(BYTE_BUDGET);
+    });
+
+    // The regression this pins: topNodes rows are provenance-free projections
+    // since U1, so a fat cached row is not evidence that the stored row is fat.
+    // Sizing the scope from them read a 240 MB corpus as 38 MB and let the
+    // enumeration through. Only stats.nodeRowBytes may size the scope.
+    it("does not size a scope from the rows cached in the snapshot", async () => {
       const topNodes = [0, 1, 2, 3, 4].map(fatNode);
       await kv.set(
         SNAPSHOT,
@@ -755,11 +783,12 @@ describe("graph scope enumeration guard", () => {
 
       await new GraphRetrieval(kv as never).searchByEntities(["alpha"]);
 
+      // 20 KB per cached row would have blown the budget; the calibrated floor
+      // is what applies, and it fits, so the enumeration runs.
+      expect(5_000 * 20_000).toBeGreaterThan(BYTE_BUDGET);
       expect(5_000 * BYTES_PER_NODE).toBeLessThan(BYTE_BUDGET);
-      expect(graphScopesListed(kv)).toEqual([]);
-      const fields = refusalFields();
-      expect(fields.blockedScope).toBe(NODES);
-      expect(fields.estimatedNodeBytes as number).toBeGreaterThan(BYTE_BUDGET);
+      expect(graphScopesListed(kv)).not.toEqual([]);
+      expect(warnCallsFor("Graph scope enumeration refused")).toEqual([]);
     });
 
     it("still enumerates a corpus whose node and edge scopes both fit the budget", async () => {

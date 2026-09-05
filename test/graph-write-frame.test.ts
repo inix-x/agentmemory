@@ -4,9 +4,10 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { guardedSet } from "../src/functions/graph.js";
+import { guardedSet, persistGraphDelta } from "../src/functions/graph.js";
 import { payloadByteLength } from "../src/state/frame-guard.js";
 import { KV } from "../src/state/schema.js";
+import type { GraphEdge, GraphNode, GraphSnapshot } from "../src/types.js";
 import { mockKV } from "./helpers/mocks.js";
 
 // Production wrote a 20,575,104-byte snapshot against a 16,777,216-byte frame,
@@ -38,11 +39,59 @@ function recordingKV(): KVMock & {
   return Object.assign(kv, { writes });
 }
 
+const node = (id: string, obsIds: string[], blobChars: number): GraphNode => ({
+  id,
+  type: "concept",
+  name: id,
+  properties: { blob: "x".repeat(blobChars) },
+  sourceObservationIds: obsIds,
+  createdAt: "2026-09-01T00:00:00Z",
+});
+
+const edge = (
+  id: string,
+  source: string,
+  target: string,
+  obsIds: string[],
+): GraphEdge => ({
+  id,
+  type: "related_to",
+  sourceNodeId: source,
+  targetNodeId: target,
+  weight: 1,
+  sourceObservationIds: obsIds,
+  createdAt: "2026-09-01T00:00:00Z",
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
 describe("frame-safe graph writes", () => {
+  it("caches snapshot rows that carry no observation ids", async () => {
+    const kv = recordingKV();
+    const obsIds = Array.from({ length: 50 }, (_, i) => `obs_${i}`);
+    const nodes = [node("a", obsIds, 0), node("b", obsIds, 0)];
+    const edges = [edge("e1", "a", "b", obsIds)];
+
+    await persistGraphDelta(kv as never, nodes, edges, obsIds);
+
+    const snap = kv.store.get(KV.graphSnapshot)!.get("current") as GraphSnapshot;
+    expect(snap.topNodes.length).toBeGreaterThan(0);
+    expect(snap.topEdges.length).toBeGreaterThan(0);
+    for (const n of snap.topNodes) {
+      expect(n).not.toHaveProperty("sourceObservationIds");
+      expect(n).not.toHaveProperty("sourceBatchIds");
+    }
+    for (const e of snap.topEdges) {
+      expect(e).not.toHaveProperty("sourceObservationIds");
+      expect(e).not.toHaveProperty("sourceBatchIds");
+    }
+    // The stored rows keep theirs: R3 bounds the cache, not the corpus.
+    const storedNode = kv.store.get(KV.graphNodes)!.get("a") as GraphNode;
+    expect(storedNode.sourceObservationIds).toEqual(obsIds);
+  });
+
   it("refuses an oversized value instead of dispatching it", async () => {
     const kv = recordingKV();
     const value = { blob: "x".repeat(20 * 1024 * 1024) };

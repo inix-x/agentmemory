@@ -478,9 +478,28 @@ export interface EdgeContext {
   confidence?: number;
 }
 
+// U1/R3: a cached snapshot row is a display and ranking copy, not a provenance
+// record. Production's 500 topNodes carried 501,709 observation ids and 84.6% of
+// a 16.0 MiB snapshot, which is the write that closed the engine's socket. The
+// provenance fields stay declared but optional rather than removed outright, so
+// a full GraphNode is still assignable wherever a cached one is expected -- the
+// live query path returns stored rows unprojected and must keep type-checking.
+// Absence in a cached row is asserted at runtime by test/graph-write-frame.
+export type GraphSnapshotNode = Omit<
+  GraphNode,
+  "sourceObservationIds" | "sourceBatchIds"
+> &
+  Partial<Pick<GraphNode, "sourceObservationIds" | "sourceBatchIds">>;
+
+export type GraphSnapshotEdge = Omit<
+  GraphEdge,
+  "sourceObservationIds" | "sourceBatchIds"
+> &
+  Partial<Pick<GraphEdge, "sourceObservationIds" | "sourceBatchIds">>;
+
 export interface GraphQueryResult {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+  nodes: GraphSnapshotNode[];
+  edges: GraphSnapshotEdge[];
   depth: number;
   // #753: pagination + truncation signals for large graphs. `total*`
   // counts reflect the full unbounded result for the given filter so
@@ -511,8 +530,8 @@ export interface GraphQueryResult {
 // rebuild completes.
 export interface GraphSnapshot {
   version: 1;
-  topNodes: GraphNode[];
-  topEdges: GraphEdge[];
+  topNodes: GraphSnapshotNode[];
+  topEdges: GraphSnapshotEdge[];
   // Synchronous degree lookup keyed by nodeId. Maintained alongside
   // topNodes so re-ranking after an edge write doesn't require an
   // async kv.get for every top-N entry inside the sort comparator.
@@ -524,6 +543,15 @@ export interface GraphSnapshot {
     totalEdges: number;
     nodesByType: Record<string, number>;
     edgesByType: Record<string, number>;
+    // Mean serialized bytes of a STORED row, measured at write time.
+    // checkGraphEnumerable used to size mem:graph:nodes / mem:graph:edges by
+    // sampling topNodes / topEdges, which stopped being a stored-row sample the
+    // moment those rows became projections: the sample fell from ~28 KB to
+    // ~250 B per node and the guard would have read a 240 MB scope as 38 MB and
+    // let the enumeration through. Absent on a pre-U1 snapshot; the calibrated
+    // floors cover that until the next write lands.
+    nodeRowBytes?: number;
+    edgeRowBytes?: number;
   };
   updatedAt: string;
   dirty: boolean;
