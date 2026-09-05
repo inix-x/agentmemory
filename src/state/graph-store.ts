@@ -253,14 +253,18 @@ export async function putGraphNodeRow(
   });
 }
 
-export async function putGraphEdgeRow(
+// Rows first, then one adjacency pass over all of them. Per-edge would put a
+// get-then-set on both endpoints inside the caller's concurrent chunk, and two
+// edges sharing a hub in one chunk would each read the pre-merge value and the
+// second write would lose the first's stub. Same coalescing persistGraphDelta
+// does, and here it is a correctness fix rather than a write-count one.
+export async function putGraphEdgeRows(
   kv: StateKV,
-  edge: GraphEdge,
+  edges: readonly GraphEdge[],
   write: GuardedWrite,
 ): Promise<void> {
-  await write(KV.graphEdges, edge.id, edge);
   const delta = newIndexDelta();
-  recordEdgeAdjacency(delta, edge);
+  for (const edge of edges) recordEdgeAdjacency(delta, edge);
   for (const [nodeId, stubs] of delta.adj) {
     const existing = await readAdj(kv, nodeId);
     await write(KV.graphAdj, nodeId, mergeAdj(existing, stubs));

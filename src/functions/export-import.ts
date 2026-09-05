@@ -22,6 +22,7 @@ import type {
   ExportPagination,
   AccessLogExport,
   GraphBatch,
+  GraphEdge,
 } from "../types.js";
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
@@ -30,7 +31,7 @@ import { listBoundedOrSkip } from "../state/scope-size.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { listGraphScopes, graphWriter } from "./graph.js";
 import {
-  putGraphEdgeRow,
+  putGraphEdgeRows,
   putGraphNodeRow,
 } from "../state/graph-store.js";
 import { StateKV } from "../state/kv.js";
@@ -523,13 +524,19 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         });
       }
       if (importData.graphEdges) {
+        const adjacencyPending: GraphEdge[] = [];
         await runChunked(importData.graphEdges, async (edge) => {
           if (strategy === "skip") {
             const existing = await kv.get(KV.graphEdges, edge.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await putGraphEdgeRow(kv, edge, graphWrite);
+          await graphWrite(KV.graphEdges, edge.id, edge);
+          adjacencyPending.push(edge);
         });
+        // One pass after the rows, not one per edge inside the chunk: two edges
+        // sharing an endpoint in the same Promise.all would both read the
+        // pre-merge adjacency and the second write would lose the first's stub.
+        await putGraphEdgeRows(kv, adjacencyPending, graphWrite);
       }
       // A batch-mode row imported without its batch resolves to no
       // observations, so batches travel with the graph.

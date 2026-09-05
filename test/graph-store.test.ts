@@ -7,7 +7,7 @@ import {
   mergeAdj,
   mergeObsIndex,
   newIndexDelta,
-  putGraphEdgeRow,
+  putGraphEdgeRows,
   putGraphNodeRow,
   readAdj,
   readObsIndex,
@@ -138,7 +138,7 @@ describe("graph-store index invariants", () => {
     const { write } = writerFor(kv);
 
     await putGraphNodeRow(node("gn_a", "Alpha"), write);
-    await putGraphEdgeRow(kv as never, edge("ge_1", "gn_a", "gn_b", 2), write);
+    await putGraphEdgeRows(kv as never, [edge("ge_1", "gn_a", "gn_b", 2)], write);
 
     expect(kv.store.get(KV.graphNodes)!.get("gn_a")).toBeTruthy();
     expect(kv.store.get(KV.graphNames)!.get("gn_a")).toEqual({
@@ -315,6 +315,35 @@ describe("export-import keeps the indexes with the rows", () => {
     expect(await readAdj(kv as never, "gn_b")).toEqual([
       { edgeId: "ge_1", neighborId: "gn_a", weight: 4 },
     ]);
+  });
+
+  it("keeps every stub when a restored hub takes edges in one chunk", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    registerExportImportFunction(sdk as never, kv as never);
+    // 40 edges onto one hub, past the import chunk size, so they land in the
+    // same Promise.all. A per-edge read-merge-write would have each read the
+    // pre-merge adjacency and the last write would keep one stub.
+    const edges = Array.from({ length: 40 }, (_, i) =>
+      edge(`ge_${i}`, "gn_hub", `gn_${i}`, 1),
+    );
+
+    const imported = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.29",
+        exportedAt: "2026-09-01T00:00:00Z",
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+        graphNodes: [node("gn_hub", "Hub")],
+        graphEdges: edges,
+      },
+      strategy: "merge",
+    })) as { success: boolean };
+    expect(imported.success).toBe(true);
+
+    expect(await readAdj(kv as never, "gn_hub")).toHaveLength(40);
   });
 
   it("clears the indexes when it clears the rows", async () => {
