@@ -1051,8 +1051,6 @@ were lost with the scratchpad worktree when the host rebooted on 2026-09-06.
 | commit | lens | what |
 |---|---|---|
 | `ea76542` | A Fix A (P3-1, P3-2) | the retire-region range at three sites, and the as-of marker's stale-bullet count |
-| `95c1021` | A Fix B (P3-3, P3-4) | landed in round 5: a `date` stub so the batch stamp is a call count, and one test for a manifest that names no generation |
-| `7ee0d10` | A Fix C (P3-5, P3-6) | landed in round 5: the vector-test comment un-inverted, and the per-family fail-open disclosed in both docs |
 
 ### The two findings of Fix A
 
