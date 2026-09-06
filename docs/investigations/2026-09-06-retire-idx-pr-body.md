@@ -235,10 +235,10 @@ green**, 182 files and 1993 tests, so nothing anywhere pinned that line; the
 same mutation now fails one test.
 
 Four rows above moved without a new mutation being written for them. The trailer
-test and the two idempotent assertions now also die under the live filter, the
-shared helper, the scattered destination, and the per-call stamp, which is why
-those rows read 5, 5, 2, and 2 rather than the 3, 3, 1, and 1 an earlier round
-measured.
+test and the newly anchored idempotent test both die under the live filter and
+under the shared helper, which takes those two rows from 3 to 5. The idempotent
+test's directory-count assertion also catches the scattered destination and the
+per-call stamp, which takes those two rows from 1 to 2.
 
 The delimiter row is worth calling out. The live test is an exact-element test against
 a pipe-delimited list, and until this branch nothing pinned the delimiters:
