@@ -209,8 +209,7 @@ retire_nonlive_index_generations() {
     for _gf in "$1"/mem%3Aindex%3Abm25%3A*%3Aidx_*%3A*.bin; do
         if [ -f "$_gf" ]; then
             _gname=${_gf##*/}
-            _gbase=${_gname%.bin}
-            _gshardless=${_gbase%$_sep*}
+            _gshardless=${_gname%$_sep*}
             _gen=${_gshardless##*$_sep}
             case "$_live" in
                 *"|$_gen|"*) continue ;;
