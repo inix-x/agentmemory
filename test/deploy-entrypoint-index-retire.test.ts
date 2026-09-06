@@ -254,6 +254,12 @@ describe("entrypoint retires index generations the manifest does not name", { ti
 
     expect(out).not.toContain("index shard(s)");
     expect(retiredFiles()).toEqual(after);
+    // Anchor the run this one is idempotent against: without it "no worse than
+    // run one" also holds when run one moved nothing. The directory count is the
+    // other half, because retiredFiles() flat-maps stamps to files and an empty
+    // stamp directory contributes nothing to it.
+    expect(after).toEqual(deadFiles().sort());
+    expect(readdirSync(retiredRoot())).toHaveLength(1);
   });
 
   // Fail closed. Without a manifest nothing on disk can be told live from dead,
