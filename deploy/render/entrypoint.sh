@@ -98,11 +98,7 @@ retire_matching_file() {
     _f="$_dir/$_name"
     [ -f "$_f" ] || return 0
 
-    if [ -n "${_retire_dest:-}" ]; then
-        _dest="$_retire_dest"
-    else
-        _dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
-    fi
+    _dest="${_retire_dest:-$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)}"
     mkdir -p "$_dest" || return 0
     _size=$(wc -c < "$_f" 2>/dev/null || echo 0)
     if mv "$_f" "$_dest/" 2>/dev/null; then
