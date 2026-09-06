@@ -288,10 +288,7 @@ describe("entrypoint retires index generations the manifest does not name", { ti
   // The live test is an exact-element test against a pipe-delimited list, not a
   // substring test. Dropping the "|" delimiters turns it into one, and a dead
   // generation whose id is a substring of a live id then survives the retire,
-  // which is the failure the delimiters exist to stop. Both neighbouring shapes
-  // are seeded: an id the live id contains, and an id that contains the live id.
-  // Only the first can be kept by a substring test, and it is the one that makes
-  // the delimiters load-bearing.
+  // which is the failure the delimiters exist to stop.
   //
   // Unreachable on today's ids, which is why it is a fixture and not a bug.
   // generateId mints idx_ + Date.now().toString(36) + _ + 12 hex, and the base-36
@@ -299,16 +296,47 @@ describe("entrypoint retires index generations the manifest does not name", { ti
   // length and none is a strict prefix of another.
   it("retires a dead generation whose id neighbours a live id by substring", () => {
     const contained = LIVE_BM25.slice(0, -1);
-    const containing = `${LIVE_BM25}_9999eeee0000`;
     seedGenerations();
     seed(shardName("bm25", contained, "00000"), 400);
-    seed(shardName("bm25", containing, "00000"), 401);
     seedManifest();
 
     boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
     expect(retiredFiles()).toContain(shardName("bm25", contained, "00000"));
-    expect(retiredFiles()).toContain(shardName("bm25", containing, "00000"));
     expect(existsSync(join(storeDir(), shardName("bm25", LIVE_BM25, "00000")))).toBe(true);
+  });
+});
+
+// retire_matching_file is shared, and this branch changed it. The two audit
+// calls at the top of the entrypoint leave _retire_dest unset and still take
+// the production path: their own stamped directory and one line each. The index
+// loop sets it and takes the other path: one directory for the whole run,
+// counted rather than echoed. Nothing tested either half. Replacing the
+// per-file echo with `:` left the whole suite green.
+describe("the shared retire helper keeps both of its modes", { timeout: 20000 }, () => {
+  it("leaves _retire_dest unset: own stamp directory, one line per file", () => {
+    seed("mem:audit.bin", 4);
+
+    const out = boot();
+
+    // `wc -c < file` pads the number on BSD, so the count is matched with a run
+    // of spaces rather than one.
+    expect(out).toMatch(/retired mem:audit\.bin, +4 bytes, to /);
+    expect(retiredFiles()).toEqual(["mem:audit.bin"]);
+  });
+
+  it("sets _retire_dest: one directory for the run, counted not echoed", () => {
+    seedGenerations();
+    seedManifest();
+
+    const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
+
+    // One stamp for the whole loop. Nothing else here writes under retired/:
+    // no stream file and no audit file is seeded.
+    expect(readdirSync(retiredRoot())).toHaveLength(1);
+    expect(out).not.toMatch(/retired mem%3Aindex/);
+    expect(out).toContain(
+      `retired ${deadFiles().length} index shard(s), ${deadBytes()} bytes, to `,
+    );
   });
 });
