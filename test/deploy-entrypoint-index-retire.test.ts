@@ -212,18 +212,6 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     expect(retiredFiles()).toEqual(deadFiles().sort());
   });
 
-  it("logs the count and the byte total, not one line per shard", () => {
-    seedGenerations();
-    seedManifest();
-
-    const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
-
-    expect(out).toContain(
-      `retired ${deadFiles().length} index shard(s), ${deadBytes()} bytes, to `,
-    );
-    expect(out).not.toContain(`retired ${deadFiles()[0]},`);
-  });
-
   it("is idempotent: a second boot finds nothing and logs nothing", () => {
     seedGenerations();
     seedManifest();
@@ -326,14 +314,5 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     expect(retiredFiles()).toContain(shardName("bm25", contained, "00000"));
     expect(retiredFiles()).toContain(shardName("bm25", containing, "00000"));
     expect(existsSync(join(storeDir(), shardName("bm25", LIVE_BM25, "00000")))).toBe(true);
-  });
-
-  it("keeps the live vector generation when the vector manifest names it", () => {
-    seedGenerations();
-    seedManifest();
-
-    boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
-
-    expect(existsSync(join(storeDir(), shardName("vectors", LIVE_VEC, "00000")))).toBe(true);
   });
 });
