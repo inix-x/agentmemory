@@ -173,21 +173,33 @@ function seedManifest(
   );
 }
 
+const genSize = (i: number) => 300 + i;
+
 function seedGenerations() {
-  [...deadFiles(), ...liveFiles()].forEach((f, i) => seed(f, 300 + i));
+  [...deadFiles(), ...liveFiles()].forEach((f, i) => seed(f, genSize(i)));
   seed("mem%3Amemories.bin", 8);
 }
+
+// The dead shards are the leading entries of the array seedGenerations walks, so
+// their sizes are the first deadFiles().length values of genSize. Derived rather
+// than written out, so changing the fixture cannot leave the total stale.
+const deadBytes = () => deadFiles().reduce((n, _f, i) => n + genSize(i), 0);
 
 describe("entrypoint retires index generations the manifest does not name", { timeout: 20000 }, () => {
   it("moves the five dead generations and leaves the live one", () => {
     seedGenerations();
     seedManifest();
 
-    boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
+    const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
     expect(retiredFiles()).toEqual(deadFiles().sort());
     expect(readdirSync(storeDir()).sort()).toEqual(
       [...liveFiles(), MANIFEST_FILE, "mem%3Amemories.bin"].sort(),
+    );
+    // One summary line for the whole retire, the shape retire_stream_files uses.
+    // A per-file line does not survive a 148-shard retire in a log tail.
+    expect(out).toContain(
+      `retired ${deadFiles().length} index shard(s), ${deadBytes()} bytes, to `,
     );
   });
 
@@ -200,16 +212,16 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     expect(retiredFiles()).toEqual(deadFiles().sort());
   });
 
-  it("logs each move with its size", () => {
+  it("logs the count and the byte total, not one line per shard", () => {
     seedGenerations();
     seedManifest();
 
     const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
-    deadFiles().forEach((f, i) => {
-      const name = f.replace(/[.%]/g, "\\$&");
-      expect(out).toMatch(new RegExp(`retired ${name}, +${300 + i} bytes, to `));
-    });
+    expect(out).toContain(
+      `retired ${deadFiles().length} index shard(s), ${deadBytes()} bytes, to `,
+    );
+    expect(out).not.toContain(`retired ${deadFiles()[0]},`);
   });
 
   it("is idempotent: a second boot finds nothing and logs nothing", () => {
@@ -220,7 +232,7 @@ describe("entrypoint retires index generations the manifest does not name", { ti
 
     const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
-    expect(out).not.toContain("retired mem%3Aindex%3Abm25%3Abm25");
+    expect(out).not.toContain("index shard(s)");
     expect(retiredFiles()).toEqual(after);
   });
 
@@ -262,9 +274,9 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     const unset = boot();
     const other = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "1" });
 
-    expect(unset).not.toContain("retired mem%3Aindex");
+    expect(unset).not.toContain("index shard(s)");
     expect(unset).not.toContain("index generation retire skipped");
-    expect(other).not.toContain("retired mem%3Aindex");
+    expect(other).not.toContain("index shard(s)");
     expect(existsSync(retiredRoot())).toBe(false);
   });
 

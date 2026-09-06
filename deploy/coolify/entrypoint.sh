@@ -85,18 +85,34 @@ retire_stream_files "$DATA_DIR/stream_store"
 # runs before the engine, every boot here is a stop-then-start so the engine
 # never sees the file mid-move, and any retirement is undone by moving it back.
 # Flagless on purpose -- a flag needs a second deploy to unset.
+#
+# A caller retiring one named file leaves _retire_dest empty and gets its own
+# stamped directory and one log line, which is what the audit and graph retires
+# above want. A caller retiring many files at once sets _retire_dest to a single
+# stamp and reads _retire_count and _retire_bytes after its loop: the files land
+# in one directory whatever the clock does mid-loop, and the log gets one
+# summary line instead of one line per file.
 retire_matching_file() {
     _dir="$1"
     _name="$2"
     _f="$_dir/$_name"
     [ -f "$_f" ] || return 0
 
-    _dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -n "${_retire_dest:-}" ]; then
+        _dest="$_retire_dest"
+    else
+        _dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
     mkdir -p "$_dest" || return 0
     _size=$(wc -c < "$_f" 2>/dev/null || echo 0)
     if mv "$_f" "$_dest/" 2>/dev/null; then
         chown -R "$RUN_AS" "$_dest" 2>/dev/null || true
-        echo "agentmemory: retired $_name, $_size bytes, to $_dest"
+        if [ -n "${_retire_dest:-}" ]; then
+            _retire_count=$((_retire_count + 1))
+            _retire_bytes=$((_retire_bytes + _size))
+        else
+            echo "agentmemory: retired $_name, $_size bytes, to $_dest"
+        fi
     fi
 }
 
@@ -162,9 +178,20 @@ retire_nonlive_index_generations() {
         return 0
     fi
 
-    # No subprocess per shard. A leaked store is hundreds of files and this runs
-    # on the boot path, so the id comes out by parameter expansion and the live
-    # test is a case against the pipe-delimited list.
+    # No subprocess in the examine path. A leaked store is hundreds of files and
+    # this runs on the boot path, so the id comes out by parameter expansion and
+    # the live test is a case against the pipe-delimited list. The files that are
+    # actually retired do cost the five processes retire_matching_file spawns,
+    # but the loop examines many and retires few.
+    #
+    # One stamp for the whole run, computed here rather than per call, so a loop
+    # that crosses a second boundary still puts a generation's shards in one
+    # directory and putting one back stays a single mv. One summary line, the
+    # same shape as retire_stream_files, because a leaked store is 148 shards and
+    # a per-file line scrolls out of the log tail before an operator reads it.
+    _retire_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    _retire_count=0
+    _retire_bytes=0
     _sep="%3A"
     for _gf in "$1"/mem%3Aindex%3Abm25%3A*%3Aidx_*%3A*.bin; do
         if [ -f "$_gf" ]; then
@@ -178,6 +205,13 @@ retire_nonlive_index_generations() {
             retire_matching_file "$1" "$_gname"
         fi
     done
+
+    # Idempotent: a boot with nothing to move creates no directory and logs
+    # nothing, so this is silent on every deploy after the first.
+    if [ "$_retire_count" -gt 0 ]; then
+        echo "agentmemory: retired $_retire_count index shard(s), $_retire_bytes bytes, to $_retire_dest"
+    fi
+    unset _retire_dest
 }
 
 # The literal "true", the same shape as GRAPH_SCOPES_RETIRE_AT_BOOT, so a stray
