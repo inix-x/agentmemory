@@ -34,27 +34,8 @@ const dataDir = () => join(dir, "data");
 const storeDir = () => join(dataDir(), "state_store.db");
 const retiredRoot = () => join(dataDir(), "retired");
 
-function stub(name: string) {
-  writeFileSync(join(dir, "bin", name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-}
-
-// `date` counts its calls instead of reading the clock, so a retire stamp is
-// the number of times the script asked for one. A helper that stamps per call
-// then puts every file in its own directory on every run, and the one-stamp
-// assertion below fails it every time, not only when the loop straddles a
-// second boundary.
-function stubDate() {
-  writeFileSync(
-    join(dir, "bin", "date"),
-    [
-      "#!/bin/sh",
-      'n=$(($(cat "$HOME/.date-calls" 2>/dev/null || echo 0) + 1))',
-      'echo "$n" > "$HOME/.date-calls"',
-      'printf "20260906T%06dZ\\n" "$n"',
-      "",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+function stub(name: string, body = "exit 0") {
+  writeFileSync(join(dir, "bin", name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
 }
 
 function boot(extra: Record<string, string> = {}): string {
@@ -93,7 +74,16 @@ beforeEach(() => {
   mkdirSync(storeDir(), { recursive: true });
   stub("chown");
   stub("gosu");
-  stubDate();
+  // `date` counts its calls instead of reading the clock, so a retire stamp is
+  // the number of times the script asked for one. A helper that stamps per call
+  // then puts every file in its own directory on every run, and the one-stamp
+  // assertion below fails it every time, not only when the loop straddles a
+  // second boundary.
+  stub("date", [
+    'n=$(($(cat "$HOME/.date-calls" 2>/dev/null || echo 0) + 1))',
+    'echo "$n" > "$HOME/.date-calls"',
+    'printf "20260906T%06dZ\\n" "$n"',
+  ].join("\n"));
 });
 
 afterEach(() => {
