@@ -576,9 +576,11 @@ Nothing was deployed and nothing was set. That is the operator's step.
 
 ### Limitations
 
-_The bullets below are as of `1d6891d`, the commit this section records._ Three of
-them read as durable claims about the code and are not. `270a42f` made the skip log
-distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
+_The bullets below are as of `1d6891d`, the commit this section records._ Four of
+them read as durable claims about the code and are not. The reader has since been
+run against a real engine-written scope file, by the 02:58:06Z sandbox deployment
+the PR body records, which retired five dead BM25 generations and kept the live
+one. `270a42f` made the skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
 at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
 disjoint from the helper's, and `git grep _gbase` at head returns only the bullet
 below. `npm test` is green at head: 182 files and 1996 tests pass, with one file and
@@ -814,8 +816,8 @@ after the earlier run at `cdf6b46`, and agreed. The documentation commits after
 `bcdb75b` cannot move them, because the only test that reads anything under
 `docs/` reads a path and not a file's contents.
 
-The four entrypoints are byte-identical over the whole retire region, lines 95 to
-225, `shasum` `13cb38b03420` on each.
+The four entrypoints are byte-identical over the whole retire region, lines 93 to
+225, `shasum` `9e1e9bd1bb4d` on each.
 
 ### The three cross-references, and what each became
 
@@ -952,13 +954,15 @@ point-in-time number belongs.
 **P3-3, the rebase doc's own two errors.** The `### Limitations` block still
 listed `_gbase`, which `f527c4d` deleted. `git grep _gbase` at head returns
 exactly that one line. The block is a point-in-time record of `1d6891d`, so it
-keeps its bullets and gains an as-of marker naming three that read as durable
-claims about the code and are not.
+keeps its bullets and gains an as-of marker naming those that read as durable
+claims about the code and are not. `f67bec4` named three, and round 4 found a
+fourth.
 
 The byte-identity sentence paired `shasum` `9e1e9bd1bb4d` with lines 95 to 228.
 That hash is lines 95 to 227 at `66e5996`, and 228 was `cat > "$III_CONFIG"`,
 outside the retire region. Cut 1 moved the region up two lines, so the sentence
-now reads lines 95 to 225 at `13cb38b03420`.
+now reads lines 93 to 225 at `9e1e9bd1bb4d`. `f67bec4` moved only the end line,
+and round 4 moved the start.
 
 ### What the cuts moved, and was re-trued
 
@@ -1013,7 +1017,7 @@ documentation, and the only test that reads anything under `docs/` reads a path
 and not a file's contents.
 
 The four entrypoints are byte-identical over the whole retire region after cut 1,
-measured on each of the four rather than on one and inferred: lines 95 to 225,
-`shasum` `13cb38b03420` on railway, fly, render, and coolify. The helper's
-comment block plus the retire region, lines 89 to 224, agrees the same way at
-`e6957b99a290`.
+measured on each of the four rather than on one and inferred: lines 93 to 225,
+`shasum` `9e1e9bd1bb4d` on railway, fly, render, and coolify. The helper's
+comment block plus the retire region, lines 89 to 225, agrees the same way at
+`5d9bb326252f`.
