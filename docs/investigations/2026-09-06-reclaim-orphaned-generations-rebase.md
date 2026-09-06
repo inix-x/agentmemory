@@ -1669,8 +1669,8 @@ has been at zero for four rounds.
 
 **R10-1 (P2).** Three live sites named a store-diagnostics JSON as the source
 of the production figures, and it is reachable from neither this branch nor any
-pushed remote. The round-2 record states that a citation to an uncommitted file
-is not a citation, and round 2 deleted one on that ground.
+pushed remote. Round 2 deleted a different citation on the ground that the file
+was committed on no branch.
 
 **R10-2 (P3).** The bullet `279adfd` added placed `test/copilot-plugin.test.ts`
 under `plugin/`. The file is under `test/`.
