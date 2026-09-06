@@ -1,8 +1,7 @@
 # Draft PR body
 
 Branch: `perf/retire-orphaned-index-generations`, off `origin/production`
-(`878174f`). Code and tests are final at `cdf6b46`; the commits after it are
-documentation only. Not pushed.
+(`878174f`). Not pushed.
 
 ## Title
 

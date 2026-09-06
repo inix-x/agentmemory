@@ -695,8 +695,10 @@ are not re-opened. This section records what landed.
 | `6b710cd` | `docs(retire)` trim the two-message comment; correct the process count (lens B cut 3 + lens A P3-3) |
 | `cdf6b46` | `docs(retire)` repair the three cross-references (lens A P3-2) |
 | `e85f68c` | `docs(retire)` PR body: disclose the shared-helper change, name the deployed commit (lens A P2-1) |
+| `bcdb75b` | `docs(retire)` say what the doc-pointer assertion needs from a new pointer (comment only) |
 
-Code and tests are final at `cdf6b46`. The commits after it are documentation.
+`bcdb75b` is the last commit that touches a file under `deploy/` or `test/`, and
+it changes a comment. Everything after it is documentation.
 
 ### The destination collapse does not spawn a date in batch mode
 
@@ -790,18 +792,19 @@ FAIL  test/deploy-entrypoint-index-retire.test.ts > the shared retire helper
       Tests  1 failed | 1995 passed | 1 skipped (1997)
 ```
 
-### Gates, measured at `cdf6b46` in the branch worktree
+### Gates, measured at `bcdb75b` in the branch worktree
 
 | gate | result |
 |---|---|
-| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. Duration 14.41 s. Exit 0. |
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. Duration 12.12 s. Exit 0. |
 | `npx tsc --noEmit` | 29 errors on both sides. `diff` of the two sorted error lists against a detached `878174f` worktree is **empty**. Exit 2 on both, which is the pre-existing baseline. |
-| `npm run build` | Exit 0. 20 files, 3.17 MB, 3971 ms. |
+| `npm run build` | Exit 0. 20 files, 3.17 MB, 4108 ms. |
 
 `npm test` and not bare `vitest run`, so `test/integration.test.ts` stays
-excluded. No flake appeared on this host. The two commits after `cdf6b46` are
-documentation, so they cannot move these numbers; `npm test` was re-run at the
-final head to confirm, and `tsc` and `build` were not.
+excluded. No flake appeared on this host. All three were run again at `bcdb75b`
+after the earlier run at `cdf6b46`, and agreed. The documentation commits after
+`bcdb75b` cannot move them, because the only test that reads anything under
+`docs/` reads a path and not a file's contents.
 
 The four entrypoints are byte-identical over the whole retire region, lines 95 to
 228, `shasum` `9e1e9bd1bb4d` on each.
@@ -847,10 +850,13 @@ The four entrypoints are byte-identical over the whole retire region, lines 95 t
   `git ls-tree` transcript whose output is `(empty)`. Their absence is the point.
 - **`test/deploy-entrypoint-scope-retire.test.ts` in the fail-first record** is
   the name the test file had when that run was made.
-- **The `containing` fixture is gone and is not worth restoring.** Lens B's
-  optional swap (the live id minus its *first* character, which would cover the
-  trailing-delimiter mutation) was not taken. It is a swap, not a cut, and it was
-  offered as optional.
+- **The `containing` fixture is gone, and one delimiter spelling stays
+  unpinned.** `contained` kills the both-delimiters-dropped and
+  leading-delimiter-dropped mutations. Dropping only the *trailing* delimiter
+  (`*"$_gen|"*`) is killed by neither fixture, before this change or after it, as
+  lens B's own table shows. Lens B offered a swap that would close it, the live
+  id minus its *first* character, explicitly as optional. It is a swap rather
+  than a cut, so it was not taken.
 - **The two diagnostics JSON files this document cites** are under
   `docs/investigations/`, which is excluded from git here, so they resolve
   locally and not for a reader of the branch. That is pre-existing, it applies to
