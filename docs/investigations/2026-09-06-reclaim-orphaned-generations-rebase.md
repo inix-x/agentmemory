@@ -1021,3 +1021,72 @@ measured on each of the four rather than on one and inferred: lines 93 to 225,
 `shasum` `9e1e9bd1bb4d` on railway, fly, render, and coolify. The helper's
 comment block plus the retire region, lines 89 to 225, agrees the same way at
 `5d9bb326252f`.
+
+## review round 4 fixes
+
+Round 4 ran two lenses over `06e0f98`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 2 P3, both of them numbers in this doc and both regressions from
+`f67bec4`. Lens B (ponytail) returned SHIP AFTER 1 CUT, worth -12 lines, and the
+cut was declined. Both reports are untracked, as the round-1, round-2, and
+round-3 reports are:
+`docs/investigations/2026-09-06-retire-idx-code-review-r4.md` and
+`-ponytail-review-r4.md`.
+
+### Commits
+
+| commit | lens | what |
+|---|---|---|
+| `ea76542` | A P3-1, P3-2 | the retire-region range at three sites, and the as-of marker's stale-bullet count |
+
+### The two findings
+
+**P3-1, the retire-region range.** `f67bec4` re-trued the byte-identity sentence
+after cut 1 by moving the end line from 227 to 225 and leaving the start at 95.
+Cut 1 moved both ends. Measured at `06e0f98` on all four entrypoint copies rather
+than on one and inferred: `retire_matching_file() {` opens at line 93, the blank
+line that closes the region is 225, and `cat > "$III_CONFIG" <<'EOF'` is 226.
+
+| span | `shasum` | what it is |
+|---|---|---|
+| 93 to 225 | `9e1e9bd1bb4d` | the retire region, identical on all four copies |
+| 95 to 225 | `13cb38b03420` | the span this doc documented, real but starting two statements into the helper body |
+| 89 to 225 | `5d9bb326252f` | the helper's comment block plus the region, identical on all four copies |
+| 89 to 224 | `e6957b99a290` | the superset this doc documented, ending one line before its own subset ended |
+
+Every error across the four rounds was in the span label and none was in the
+measurement. `9e1e9bd1bb4d` is and always was the region's hash, which is why the
+round-3 record above carries it against "lines 95 to 228" and the corrected sites
+now carry it against 93 to 225.
+
+**P3-2, the as-of marker's count.** Round 3's P3-3 named three bullets that read
+as durable claims about the code and are not: the reader, the skip log, and
+`npm test`. The marker `f67bec4` wrote enumerates the skip log, `_gbase`, and
+`npm test`, substituting `_gbase` for the reader while holding the total at
+three. The union of the two lists is four. The reader bullet is the fourth, and
+the 02:58:06Z sandbox deployment answers it. Retiring five dead BM25 generations
+while keeping the live one is only possible if the reader parsed a real
+engine-written manifest and resolved live from dead correctly.
+
+### The cut priced and declined
+
+Lens B priced `test/deploy-entrypoint-index-retire.test.ts:103-114` at -12 lines,
+the third carrier of the on-disk filename paragraph. Round 1's cut 4 (`cf1c7ff`)
+kept that paragraph in all five carriers "because the glob is unreadable without
+it". The test file has no glob, so the stated reason does not reach it, and the
+lens called this a judgment call overriding a reasoned keep rather than a defect.
+It was declined. `cf1c7ff`'s ruling stands, and the file builds the same names
+through `shardName` at `:127-128` whether or not the prose sits above it.
+
+### Gates
+
+Both findings are documentation-only and no code changed, so round 4's own
+measurements at `06e0f98` stand: `npm test` at 182 files and 1996 tests passing
+with one of each skipped, exit 0. `npx tsc --noEmit` at 29 errors on head and 29
+on a pristine `878174f`, the two sorted lists identical, exit 2 on both as the
+pre-existing baseline. `npm run build` exit 0. All seven mutations die, and
+fail-first reproduces 7 of 11.
+
+`ea76542` was re-checked against the two entrypoint test files,
+`deploy-entrypoint-index-retire` and `deploy-entrypoint-drift`: **17 tests, 2
+files, all green** in 4.37 s. The four copies still hash `9e1e9bd1bb4d` over
+lines 93 to 225 after the commit, so the documentation change moved no code.
