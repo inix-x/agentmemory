@@ -95,13 +95,11 @@ describe("the harness reaches the retire steps", () => {
   });
 });
 
-// Lever b' of the memory-reduction loop, generalised. Index persistence mints a
-// generation per boot and the manifest-driven GC does not reclaim the prior one,
-// so a sandbox with 20 redeploys in a day carried six BM25 generations totalling
-// 1,104 MiB with one live at ~257 MiB: ~847 MiB of dead index, larger than any
-// single lever in the composition table (21:32Z census, experiment log).
-// Retiring a named list does not keep up with a per-boot growth term, so the
-// selector is "every generation the manifest does not name as live".
+// Lever b' of the memory-reduction loop, generalised: every index generation the
+// manifest does not name as live is retired at boot. Why the manifest is the
+// selector, and where the on-disk format below comes from, are in "Why the
+// manifest, not a list" in
+// docs/investigations/2026-09-06-reclaim-orphaned-generations-rebase.md.
 //
 // The names matter more here than anywhere else in this file. A generation's
 // shards are one scope each and the engine writes one file per scope:
@@ -136,12 +134,10 @@ const liveFiles = () => [
   shardName("vectors", LIVE_VEC, "00000"),
 ];
 
-// The engine writes a scope as rkyv::to_bytes(KeyStorage(serde_json::to_string(
-// scope_map))): the scope's JSON object as raw bytes from offset 0, then a short
-// rkyv trailer, so the JSON body is data[0 .. rfind("}") + 1]
-// (docs/plans/2026-09-06-001-graph-memory-redesign-plan.md Appendix, verified
-// against both graph scope files to within one byte). The trailer is seeded here
-// so the reader is exercised against the real shape and not against clean JSON.
+// The engine writes a scope as its JSON object from offset 0 followed by a short
+// rkyv trailer, so the JSON body is data[0 .. rfind("}") + 1]. The trailer is
+// seeded here so the reader is exercised against the real shape and not against
+// clean JSON.
 function seedManifest(
   live: Record<string, string> = { "data:manifest": LIVE_BM25, "vectors:manifest": LIVE_VEC },
   { encodeValues = false, trailer = true } = {},

@@ -124,32 +124,31 @@ retire_matching_file "$DATA_DIR/state_store.db" "mem_audit.bin"
 
 # Lever b' of the memory-reduction loop, generalised. Index persistence mints a
 # generation per boot and the manifest-driven GC does not reclaim the prior one,
-# so a sandbox with 20 redeploys in a day carried six BM25 generations totalling
-# 1,104 MiB with one live at ~257 MiB: ~847 MiB of dead index, larger than any
-# single lever in the composition table (21:32Z census, 2026-09-06). Retiring a
-# named list cannot keep up with a per-boot growth term, so the selector is
-# "every generation the manifest does not name as live".
+# so the store grows by about one whole index per redeploy. The selector is
+# "every generation the manifest does not name as live", because a list written
+# ahead of a boot cannot keep up with a per-boot growth term. The census that
+# measured the backlog, the derivation of the on-disk format read below, and the
+# deployed result are in "Why the manifest, not a list" in
+# docs/investigations/2026-09-06-reclaim-orphaned-generations-rebase.md.
 #
 # A generation's shards are one scope each and the engine writes one file per
 # scope, so the names on disk are
 #   mem%3Aindex%3Abm25%3A<family>%3Aidx_<id>_<hex>%3A<NNNNN>.bin
-# with <family> bm25 or vectors and <hex> minted with the id. retire_scope
-# cannot spell that: it encodes a literal scope name, and neither the hex suffix
-# nor the shard number is known before the glob runs.
+# with <family> bm25 or vectors and <hex> minted with the id. That is why the
+# loop below calls retire_matching_file, which takes a filename: neither the hex
+# suffix nor the shard number is known before the glob runs.
 #
 # The live ids are read from the two manifest keys BY NAME, never by grepping
 # the file for an id. src/state/index-persistence.ts stores the gc ledger under
 # "${manifestKey}:gc" in the manifest's own scope, so mem%3Aindex%3Abm25.bin
 # holds the manifest AND both ledgers and names every orphan alongside the live
-# one. A grep would refuse exactly what this flag exists to move.
+# one. A grep would refuse exactly what this flag exists to move. A value is read
+# as an object or as a JSON-encoded string, because which one the engine writes
+# is not pinned by a type in this repo.
 #
-# The engine writes a scope as rkyv::to_bytes(KeyStorage(serde_json::to_string(
-# scope_map))): the scope's JSON object as raw bytes from offset 0 then a short
-# rkyv trailer, so the JSON body ends at the last "}"
-# (docs/plans/2026-09-06-001-graph-memory-redesign-plan.md Appendix, verified on
-# both graph scope files to within one byte). Values are taken either as objects
-# or as JSON-encoded strings, because which one the engine writes is not pinned
-# anywhere in this repo and both cost one line here.
+# ponytail: reads the engine's on-disk scope format directly, pinned by no type
+# in this repo. An engine change to the trailer breaks this closed, so it retires
+# nothing. Move to a real reader if the engine ever exposes one.
 index_live_generations() {
     node -e '
 const fs = require("fs");
@@ -205,6 +204,8 @@ retire_nonlive_index_generations() {
     _retire_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
     _retire_count=0
     _retire_bytes=0
+    # A variable, not the literal: ${_gname%%3A*} parses as the greedy %%
+    # operator followed by "3A*", not as % followed by a literal "%3A".
     _sep="%3A"
     for _gf in "$1"/mem%3Aindex%3Abm25%3A*%3Aidx_*%3A*.bin; do
         if [ -f "$_gf" ]; then
