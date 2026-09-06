@@ -301,6 +301,33 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     expect(retiredFiles()).toContain(shardName("vectors", LIVE_VEC, "00000"));
   });
 
+  // The live test is an exact-element test against a pipe-delimited list, not a
+  // substring test. Dropping the "|" delimiters turns it into one, and a dead
+  // generation whose id is a substring of a live id then survives the retire,
+  // which is the failure the delimiters exist to stop. Both neighbouring shapes
+  // are seeded: an id the live id contains, and an id that contains the live id.
+  // Only the first can be kept by a substring test, and it is the one that makes
+  // the delimiters load-bearing.
+  //
+  // Unreachable on today's ids, which is why it is a fixture and not a bug.
+  // generateId mints idx_ + Date.now().toString(36) + _ + 12 hex, and the base-36
+  // timestamp is a fixed 9 characters until roughly 2059, so every id is the same
+  // length and none is a strict prefix of another.
+  it("retires a dead generation whose id neighbours a live id by substring", () => {
+    const contained = LIVE_BM25.slice(0, -1);
+    const containing = `${LIVE_BM25}_9999eeee0000`;
+    seedGenerations();
+    seed(shardName("bm25", contained, "00000"), 400);
+    seed(shardName("bm25", containing, "00000"), 401);
+    seedManifest();
+
+    boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
+
+    expect(retiredFiles()).toContain(shardName("bm25", contained, "00000"));
+    expect(retiredFiles()).toContain(shardName("bm25", containing, "00000"));
+    expect(existsSync(join(storeDir(), shardName("bm25", LIVE_BM25, "00000")))).toBe(true);
+  });
+
   it("keeps the live vector generation when the vector manifest names it", () => {
     seedGenerations();
     seedManifest();
