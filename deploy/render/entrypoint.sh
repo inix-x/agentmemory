@@ -151,7 +151,6 @@ retire_matching_file "$DATA_DIR/state_store.db" "mem_audit.bin"
 # or as JSON-encoded strings, because which one the engine writes is not pinned
 # anywhere in this repo and both cost one line here.
 index_live_generations() {
-    [ -f "$1" ] || return 1
     node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(process.argv[1]);
@@ -171,10 +170,24 @@ process.stdout.write("|" + out.join("|") + "|");
 # Fail closed. With no readable manifest nothing on disk can be told live from
 # dead, and retiring the live index costs a full-corpus rebuild, so an absent or
 # unparseable manifest moves nothing and says so once.
+#
+# The two cases get distinct messages because they mean different things and the
+# log line is their only production signal. An absent file is a store with no
+# index yet, which is expected on a fresh volume. A file that is present and
+# yields nothing means the reader's assumption about the engine's on-disk shape
+# did not hold, which is the one unpinned assumption in this change. The reader's
+# stderr stays dropped, so the caller does the [ -f ] test rather than folding
+# both outcomes into one non-zero exit.
 retire_nonlive_index_generations() {
-    _live=$(index_live_generations "$1/mem%3Aindex%3Abm25.bin" || true)
+    _manifest="$1/mem%3Aindex%3Abm25.bin"
+    if [ ! -f "$_manifest" ]; then
+        echo "agentmemory: index generation retire skipped, no mem%3Aindex%3Abm25.bin on disk"
+        return 0
+    fi
+
+    _live=$(index_live_generations "$_manifest" || true)
     if [ -z "$_live" ]; then
-        echo "agentmemory: index generation retire skipped, no live generation in mem%3Aindex%3Abm25.bin"
+        echo "agentmemory: index generation retire skipped, no live generation read from mem%3Aindex%3Abm25.bin"
         return 0
     fi
 

@@ -245,7 +245,11 @@ describe("entrypoint retires index generations the manifest does not name", { ti
 
     const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
-    expect(out).toContain("index generation retire skipped");
+    // The absent case names the absence. A fresh volume has no index yet, and an
+    // operator reading this line needs to tell that from a read that failed.
+    expect(out).toContain(
+      "index generation retire skipped, no mem%3Aindex%3Abm25.bin on disk",
+    );
     expect(out.match(/index generation retire skipped/g)).toHaveLength(1);
     expect(existsSync(retiredRoot())).toBe(false);
     expect(readdirSync(storeDir()).sort()).toEqual(
@@ -259,7 +263,13 @@ describe("entrypoint retires index generations the manifest does not name", { ti
 
     const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
 
-    expect(out).toContain("index generation retire skipped");
+    // A present-but-unreadable manifest is the signal that the reader's
+    // assumption about the engine's on-disk shape stopped holding, so it must
+    // not read the same as an absent one.
+    expect(out).toContain(
+      "index generation retire skipped, no live generation read from mem%3Aindex%3Abm25.bin",
+    );
+    expect(out).not.toContain("no mem%3Aindex%3Abm25.bin on disk");
     expect(existsSync(retiredRoot())).toBe(false);
   });
 
