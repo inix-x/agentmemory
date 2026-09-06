@@ -166,6 +166,22 @@ describe("mem::graph-rows-load", () => {
     expect(result.success).toBe(false);
     expect(kv.store.get(KV.graphNodes)).toBeUndefined();
   });
+
+  it("refuses a directory that has the nodes stream but not the edges stream", async () => {
+    // The case a fallback to [] would have made silent: 37,039 nodes loaded,
+    // no edges, every node-degree recomputed to zero, success reported. This
+    // runs after the entrypoint retired the originals, so there is nothing left
+    // on disk to retry from.
+    const out = emit();
+    rmSync(join(out, "edges.rows.json"));
+
+    const result = (await sdk.trigger("mem::graph-rows-load", {
+      dir: out,
+    })) as { success: boolean };
+
+    expect(result.success).toBe(false);
+    expect(kv.store.get(KV.graphNodes)).toBeUndefined();
+  });
 });
 
 describe("the boot swap flag", () => {

@@ -60,31 +60,38 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
       let nodeRows: Stream<GraphNode>;
       let edgeRows: Stream<GraphEdge>;
       try {
+        // Both streams are required, not one required and one optional. This
+        // runs after the entrypoint retired the six originals, so a run that
+        // loaded 37,039 nodes and no edges would report success on a store with
+        // every degree at zero and no traversable graph, with nothing left on
+        // disk to retry from. The emitter always writes both files; a missing
+        // one means a truncated or wrong directory, and that is a refusal.
         nodeRows = readStream<Stream<GraphNode>>(dir, "nodes.rows.json");
-        edgeRows = readOptional<Stream<GraphEdge>>(dir, "edges.rows.json", []);
+        edgeRows = readStream<Stream<GraphEdge>>(dir, "edges.rows.json");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error("Graph rows load failed to read its input", { dir, message });
         return { success: false, error: message };
       }
 
-      // Rows first, so nothing that references them resolves to a miss. Each
-      // goes through graph-store, which lands the catalog entry and the
-      // adjacency stubs with the row (U3), so the search path can see the
-      // rewritten corpus without a second pass.
+      // Rows first, then the adjacency in one pass. putGraphNodeRow writes the
+      // row and its catalog entry together; putGraphEdgeRows writes adjacency
+      // only, because two edges sharing an endpoint inside one concurrent chunk
+      // would each read the pre-merge stub list and the second write would lose
+      // the first's stub (the reason export-import coalesces it the same way).
       for (const { value } of nodeRows) {
         await putGraphNodeRow(value, write);
         stats.nodes++;
+      }
+      for (const { key, value } of edgeRows) {
+        await write(KV.graphEdges, key, value);
+        stats.edges++;
       }
       await putGraphEdgeRows(
         kv,
         edgeRows.map((r) => r.value),
         write,
       );
-      for (const { key, value } of edgeRows) {
-        await write(KV.graphEdges, key, value);
-        stats.edges++;
-      }
 
       // The two scopes emit obs-index separately and an observation is cited by
       // both, so the streams are merged before they are written. Writing them in
