@@ -1571,3 +1571,90 @@ reached red twice. Proven equivalent, not proven absent.
 The six code and test files are identical between `53f3b8c` and head, so the m1 to
 m13 mutation set and the 10-of-13 fail-first number carry forward on identical
 bytes rather than on the record's word. Neither was re-run.
+
+## review round 9 fixes
+
+Round 9 ran one lens over `1324017`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 0 P3, collapsing to one fix, which was accepted. Lens B did not run:
+the delta since `53f3b8c` is docs-only, and lens B passed `53f3b8c` SHIP AS-IS.
+The six code and test files were hashed against `53f3b8c` rather than inherited
+from the record, and they are identical, so nothing shipped moved.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `279adfd` | A R9-1, Fix A | the gate claim at PR body `:250` and at `:589-590`, plus one PR body Limitations bullet naming the load-sensitive test |
+| this commit | the record | this section |
+
+### The finding
+
+**R9-1.** Both sites said `npm test` passes and neither named a head, so both
+are live claims under the discriminator at `:1296-1298`. Measured at `1324017`
+on an idle machine, the gate returned exit 1 twice out of two, failing only
+`test/copilot-plugin.test.ts`. The counts inside the two sentences are correct
+for a green run, so the fix is a condition clause and not a different number.
+
+It became raisable at this head because `1324017` is the commit that made it a
+contradiction. That commit landed the round-8 gates record at `:1557-1563`,
+which reports the same gate returning exit 1 twice at `6b476c4`, a head whose
+code tree is byte-identical to this one. That record is anchored and keeps its
+numbers, so the two unanchored sentences are what had to move. Rounds 6, 7, and
+8 each re-measured the integer inside `:589` and none examined its verb, and PR
+body `:250` had been examined by no round at all.
+
+### `test/copilot-plugin.test.ts`, eight runs
+
+| run | worktree | files | load | result |
+|---|---|---|---|---|
+| 1 | `1324017` | 1, isolation | none | 16 of 16 pass |
+| 2 | `878174f` | 1, isolation | none | 16 of 16 pass |
+| 3 | `1324017` | 183, full | none added | exit 1 |
+| 4 | `1324017` | 183, full | none added | exit 1 |
+| 5 | `878174f` | 182, full | none added | exit 0 |
+| 6 | `878174f` | 182, full | none added | exit 0 |
+| 7 | `1324017` | 182, the branch's index test file excluded | none added | exit 0, n=1 |
+| 8 | `878174f` | 182, full | five concurrent runs of that same test file | **exit 1**, same assertion |
+
+Run 8 settles it: the unmodified base, with no branch code in its tree, fails
+the same file with the same assertion once an equivalent load runs beside it.
+The cause is `postWithRetry` in `plugin/scripts/notification.mjs` and
+`plugin/scripts/post-tool-failure.mjs`, which allows each POST 400 ms per
+attempt and returns silently on expiry, so the hook never posts and the
+assertion sees `undefined`. The branch's contribution is scheduling only, and it
+changes no file under `plugin/` or `src/`. The file is not on the known-flaky
+list in `.claude/rules/pr-governance.md`, which is why the PR body now names it
+rather than leaving a maintainer to self-serve the explanation.
+
+### The docs-truth pass, at `1324017`
+
+Every live claim in the PR body and in the Limitations block was re-run rather
+than inherited, including the 10-of-13 fail-first number that round 8 carried on
+identical bytes. All are true except PR body `:250`, which is R9-1. The
+scope-file-read grep at `:695` was measured independently and holds. Every claim
+in the round-8 record checked true, `:1514` to `:1569`, and its count-free
+`_gbase` replacement is still true even though the count it declined to state
+has moved from 6 to 9.
+
+### Gates, measured at `1324017`
+
+The delta since `6b476c4` is this document alone, so the gate is the two
+entrypoint test files. They return **19 of 19 pass**, exit 0. Both retire region
+hashes match the record's pair on all four copies. `npx tsc --noEmit` is 29
+errors at head and 29 at `878174f`, with a 0-byte diff of the two sorted lists.
+`npm run build` exits 0, 20 files, 3.17 MB.
+
+Two instrument notes. `tsc --noEmit` is incremental in this repo, so a second
+consecutive run in the same worktree emits nothing and reads as a false clean;
+both lists were captured with `--incremental false`. And `git diff --stat
+origin/production..HEAD` returned empty output under rtk compaction while the
+same command against the literal SHA returned the eight files, so the round's
+diffs and greps were re-run through `rtk proxy` or with `awk`.
+
+### The lines this round moved
+
+`279adfd` added six lines at PR body `:74`, above every PR-body citation in this
+document, and nine more at its Gates paragraph. It added four lines here, above
+`:629` and `:695`. The citations in the round-6, round-7, and round-8 records
+each name a head, so they are point-in-time and keep their numbers. The two
+sites R9-1 names are as they stood at `1324017`.
