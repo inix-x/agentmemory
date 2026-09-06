@@ -1659,3 +1659,29 @@ document, and nine more at its Gates paragraph. It added four lines here, above
 `:629` and `:695`. The citations in the round-6, round-7, and round-8 records
 each name a head, so they are point-in-time and keep their numbers. The two
 sites R9-1 names are as they stood at `1324017`.
+
+## review round 10 fixes
+
+Round 10 ran one lens over `e92bd34`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 2 P3, all docs, fixed in one commit, `587c00d`. The six code and test
+files are byte-identical to `53f3b8c`, hashed rather than inherited, so the code
+has been at zero for four rounds.
+
+**R10-1 (P2).** Three live sites named a store-diagnostics JSON as the source
+of the production figures, and it is reachable from neither this branch nor any
+pushed remote. The round-2 record states that a citation to an uncommitted file
+is not a citation, and round 2 deleted one on that ground.
+
+**R10-2 (P3).** The bullet `279adfd` added placed `test/copilot-plugin.test.ts`
+under `plugin/`. The file is under `test/`.
+
+**R10-3 (P3).** The round-9 record said PR body `:250` had been examined by no
+round. `b3ded01` rewrote its two integers in round 6.
+
+R9-1 is verified fixed: both gate sentences name a head.
+
+Gates at `e92bd34`. The two entrypoint test files return **19 of 19 pass**, exit
+0. Both retire region hashes match on all four copies, `f23ea18a0733` for 93 to
+234 and `be42b04fd45f` for 89 to 234. `npx tsc --noEmit` is 29 errors at head
+and 29 at `878174f`, with a 0-byte diff of the two sorted lists. `npm run build`
+exits 0.
