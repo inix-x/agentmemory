@@ -943,6 +943,10 @@ const MAX_HEURISTIC_EDGES_PER_OBS = 12;
 
 export function extractGraphHeuristics(
   observations: CompressedObservation[],
+  // Batch mode stamps a heuristic row the same way it stamps an LLM one: one
+  // batch id instead of the observation ids inline. Optional and defaulted so
+  // every direct caller keeps the legacy shape it asserts on.
+  batchId: string | null = null,
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const now = new Date().toISOString();
   const nodes: GraphNode[] = [];
@@ -965,12 +969,14 @@ export function extractGraphHeuristics(
         type,
         name: trimmed,
         properties: {},
-        sourceObservationIds: [obsId],
+        ...(batchId
+          ? { sourceObservationIds: [] as string[], sourceBatchIds: [batchId] }
+          : { sourceObservationIds: [obsId] }),
         createdAt: now,
       };
       nodeByKey.set(key, node);
       nodes.push(node);
-    } else if (!node.sourceObservationIds.includes(obsId)) {
+    } else if (!batchId && !node.sourceObservationIds.includes(obsId)) {
       node.sourceObservationIds.push(obsId);
     }
     return node;
@@ -983,7 +989,7 @@ export function extractGraphHeuristics(
       const pair = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`;
       const existing = edgeByPair.get(pair);
       if (existing) {
-        if (!existing.sourceObservationIds.includes(obs.id)) {
+        if (!batchId && !existing.sourceObservationIds.includes(obs.id)) {
           existing.sourceObservationIds.push(obs.id);
         }
         return;
@@ -996,7 +1002,9 @@ export function extractGraphHeuristics(
         sourceNodeId: a.id,
         targetNodeId: b.id,
         weight: HEURISTIC_EDGE_WEIGHT,
-        sourceObservationIds: [obs.id],
+        ...(batchId
+          ? { sourceObservationIds: [] as string[], sourceBatchIds: [batchId] }
+          : { sourceObservationIds: [obs.id] }),
         createdAt: now,
       };
       edgeByPair.set(pair, edge);
@@ -1319,10 +1327,22 @@ export function registerGraphFunction(
 
       // Heuristic rows keep per-observation ids: those are precise and already
       // linear. Only the LLM path stamps the whole batch, so only it batches.
+      // Read per call so a flag flip takes effect without a redeploy (KTD6).
+      // No longer gated on llmEnabled: heuristic extraction runs regardless of
+      // GRAPH_EXTRACTION_ENABLED, and that coupling is why the census found
+      // sourceBatchIds empty on all 424,339 production records while the batch
+      // machinery sat wired end to end.
+      const batchMode = getGraphProvenanceMode() === "batch";
+      // Minted here because both extractors stamp rows with it. The row itself
+      // is written just before persist, so an extract that produces nothing
+      // leaves no orphan batch behind. The invariant is unchanged: the row
+      // lands before anything referencing it is persisted.
+      const batchId = batchMode ? generateId("gb") : null;
+
       let nodes: GraphNode[] = [];
       let edges: GraphEdge[] = [];
       try {
-        const heuristic = extractGraphHeuristics(data.observations);
+        const heuristic = extractGraphHeuristics(data.observations, batchId);
         nodes = heuristic.nodes;
         edges = heuristic.edges;
       } catch (err) {
@@ -1333,22 +1353,8 @@ export function registerGraphFunction(
 
       const llmEnabled =
         isGraphExtractionEnabled() && !provider.name.includes("noop");
-      // Read per call so a flag flip takes effect without a redeploy (KTD6).
-      const batchMode = llmEnabled && getGraphProvenanceMode() === "batch";
-      let batchId: string | null = null;
       let llmError: string | undefined;
       if (llmEnabled) {
-        if (batchMode) {
-          // The batch row lands before any node references it, so a reader
-          // never resolves a batch id that has no row behind it.
-          const batch: GraphBatch = {
-            id: generateId("gb"),
-            observationIds: obsIds,
-            createdAt: new Date().toISOString(),
-          };
-          await guardedSet(kv, KV.graphBatches, batch.id, batch);
-          batchId = batch.id;
-        }
         const prompt = buildGraphExtractionPrompt(
           data.observations.map((o) => ({
             title: o.title,
@@ -1376,6 +1382,18 @@ export function registerGraphFunction(
         return llmError
           ? { success: false, error: llmError }
           : { success: true, nodesAdded: 0, edgesAdded: 0 };
+      }
+
+      // Only now, with rows to persist. A reader never resolves a batch id
+      // that has no row behind it, because this lands before persistGraphDelta
+      // writes the first row carrying it.
+      if (batchId) {
+        const batch: GraphBatch = {
+          id: batchId,
+          observationIds: obsIds,
+          createdAt: new Date().toISOString(),
+        };
+        await guardedSet(kv, KV.graphBatches, batch.id, batch);
       }
 
       try {

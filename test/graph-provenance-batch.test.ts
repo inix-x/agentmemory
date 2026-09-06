@@ -89,6 +89,68 @@ afterEach(() => {
 
 const rows = async <T extends Row>(scope: string) => kv.list<T>(scope);
 
+// U2. The census found sourceBatchIds empty on all 424,339 production records
+// while every part of the batch machinery sat wired end to end. One line was
+// why: batchMode required llmEnabled, production runs with
+// GRAPH_EXTRACTION_ENABLED off, and heuristic extraction runs regardless.
+const structuredObs = (id: string, file: string): CompressedObservation => ({
+  ...obs(id),
+  files: [file],
+  concepts: ["alpha"],
+});
+
+const noLlm = () => delete process.env["GRAPH_EXTRACTION_ENABLED"];
+
+describe("batch provenance is not gated on the LLM flag", () => {
+  it("heuristic-only extraction writes batch provenance when the mode is batch", async () => {
+    noLlm();
+    setMode("batch");
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [structuredObs("o1", "src/a.ts")],
+    });
+
+    const batches = await rows<GraphBatch & Row>("mem:graph:batches");
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.observationIds).toEqual(["o1"]);
+
+    const nodes = await rows<GraphNode>("mem:graph:nodes");
+    expect(nodes.length).toBeGreaterThan(0);
+    for (const n of nodes) {
+      expect(n.sourceBatchIds).toEqual([batches[0]!.id]);
+      expect(n.sourceObservationIds).toEqual([]);
+    }
+  });
+
+  it("leaves the legacy shape alone when the mode is legacy", async () => {
+    noLlm();
+    setMode("legacy");
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [structuredObs("o1", "src/a.ts")],
+    });
+
+    expect(await rows("mem:graph:batches")).toHaveLength(0);
+    const nodes = await rows<GraphNode>("mem:graph:nodes");
+    expect(nodes.length).toBeGreaterThan(0);
+    for (const n of nodes) {
+      expect(n.sourceBatchIds).toBeUndefined();
+      expect(n.sourceObservationIds).toEqual(["o1"]);
+    }
+  });
+
+  it("writes no batch row for an extraction that produces nothing", async () => {
+    noLlm();
+    setMode("batch");
+
+    // obs() leaves the structured fields empty, so the heuristic pass yields no
+    // rows and the LLM pass is off. A batch row here would be an orphan.
+    await sdk.trigger("mem::graph-extract", { observations: [obs("o1")] });
+
+    expect(await rows("mem:graph:batches")).toHaveLength(0);
+  });
+});
+
 describe("writers under GRAPH_PROVENANCE_MODE", () => {
   it("batch: one batch row per extraction, rows carry the id and no observation ids", async () => {
     setMode("batch");
@@ -148,7 +210,11 @@ describe("writers under GRAPH_PROVENANCE_MODE", () => {
     expect(await rows("mem:graph:batches")).toEqual([]);
   });
 
-  it("the heuristic path keeps per-observation ids in batch mode", async () => {
+  // Was "the heuristic path keeps per-observation ids in batch mode". U2 makes
+  // the mode govern both extractors: the split existed because batchMode was
+  // gated on llmEnabled, not because heuristic rows wanted a different shape,
+  // and that gate is what kept sourceBatchIds empty across the whole corpus.
+  it("the heuristic path batches too when the mode is batch", async () => {
     setMode("batch");
     const withFiles: CompressedObservation = {
       ...obs("o9"),
@@ -157,13 +223,17 @@ describe("writers under GRAPH_PROVENANCE_MODE", () => {
     };
     await sdk.trigger("mem::graph-extract", { observations: [withFiles] });
 
+    const batches = await rows<GraphBatch & Row>("mem:graph:batches");
+    expect(batches).toHaveLength(1);
     const heuristic = (await rows<GraphNode>("mem:graph:nodes")).filter(
       (n) => n.name === "src/z.ts" || n.name === "zed",
     );
     expect(heuristic.length).toBeGreaterThan(0);
     for (const n of heuristic) {
-      expect(n.sourceObservationIds).toEqual(["o9"]);
-      expect(n.sourceBatchIds).toBeUndefined();
+      expect(n.sourceObservationIds).toEqual([]);
+      expect(n.sourceBatchIds).toEqual([batches[0]!.id]);
+      // The reader cannot tell, which is the R10 property the split broke.
+      expect(await resolveObservationIds(kv as never, n)).toEqual(["o9"]);
     }
   });
 });
