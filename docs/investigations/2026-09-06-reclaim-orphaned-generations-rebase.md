@@ -441,7 +441,7 @@ one log line per file with its byte count. Putting a generation back is one `mv`
 
 ### What it would move
 
-**2026-09-05 07:05:57Z production store** (`2026-09-05-phaseA-close-store-diagnostics.json`):
+**2026-09-05 07:05:57Z production store**, from the diagnostics endpoint:
 
 | Action | Family | Generation | Files | Bytes | MiB |
 |---|---|---|---|---|---|
@@ -650,7 +650,7 @@ six BM25 generations totalling 1,104 MiB, one of them live at ~257 MiB. That is
 ~847 MiB of dead index, larger than any single lever in the composition table.
 
 Those are the census's own rounded MiB figures. The byte-exact production figures
-come from `docs/investigations/2026-09-05-phaseA-close-store-diagnostics.json`.
+come from the diagnostics endpoint's 2026-09-05 07:05:57Z read of production.
 
 ### Why a list of ids cannot be the selector
 
@@ -1601,7 +1601,8 @@ which reports the same gate returning exit 1 twice at `6b476c4`, a head whose
 code tree is byte-identical to this one. That record is anchored and keeps its
 numbers, so the two unanchored sentences are what had to move. Rounds 6, 7, and
 8 each re-measured the integer inside `:589` and none examined its verb, and PR
-body `:250` had been examined by no round at all.
+body `:250` was examined for its counts by round 6 and for greenness by no
+round.
 
 ### `test/copilot-plugin.test.ts`, eight runs
 

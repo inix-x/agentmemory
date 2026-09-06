@@ -75,9 +75,9 @@ nothing else from the sandbox experiment stack it was developed on: no
 - **`test/copilot-plugin.test.ts` is load-sensitive, and this branch adds
   load.** It fails intermittently under a full parallel run on this branch and
   on unmodified `878174f`, and passes 16 of 16 in isolation on both. The Tests
-  section below traces the cause. The file and the hook scripts behind it live
-  under `plugin/`, which this PR does not touch, so fixing it is a separate
-  change against `origin/production`.
+  section below traces the cause. The hook scripts behind it live under
+  `plugin/`, which this PR does not touch, so fixing it is a separate change
+  against `origin/production`.
 
 ## Why the live id is read from the manifest, not from a list
 
@@ -161,9 +161,9 @@ Peak is down 25% and idle down 15% against that floor, both far past the 5%
 discard rule the harness uses. The idle gate still fails by 305 MiB with the
 graph off; closing that is other levers' work, not this one's.
 
-**Production, computed and not measured.** From
-`docs/investigations/2026-09-05-phaseA-close-store-diagnostics.json`, grouping
-`stores.state.byScope` entries under `mem%3Aindex%3Abm25%3A*`:
+**Production, computed and not measured.** From the diagnostics endpoint's
+2026-09-05 07:05:57Z read of production, grouping `stores.state.byScope`
+entries under `mem%3Aindex%3Abm25%3A*`:
 
 | action | family | generation | files | bytes |
 |---|---|---|---|---|
