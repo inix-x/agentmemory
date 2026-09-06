@@ -14,6 +14,7 @@ import {
   loadSnapshotConfig,
   isGraphExtractionEnabled,
   isGraphIndexBackfillEnabled,
+  getGraphRowsRewriteDir,
   isAutoCompressEnabled,
   isConsolidationEnabled,
   isContextInjectionEnabled,
@@ -70,6 +71,7 @@ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerGraphIndexBackfillFunction } from "./functions/graph-index-backfill.js";
+import { registerGraphRowsLoadFunction } from "./functions/graph-rows-load.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
 import { registerGovernanceFunction } from "./functions/governance.js";
@@ -287,6 +289,24 @@ async function main() {
   registerGraphFunction(sdk, kv, provider);
   registerGraphImportFunction(sdk, kv);
   registerGraphIndexBackfillFunction(sdk, kv);
+  registerGraphRowsLoadFunction(sdk, kv);
+  const rewriteDir = getGraphRowsRewriteDir();
+  if (rewriteDir) {
+    // The entrypoint already retired the six originals, so the engine came up
+    // with the graph scopes absent. Detached: the load is one kv.set per row
+    // and nothing at boot waits on it.
+    bootLog(`Graph rows rewrite: loading from ${rewriteDir}`);
+    void sdk
+      .trigger({
+        function_id: "mem::graph-rows-load",
+        payload: { dir: rewriteDir },
+      })
+      .catch((err: unknown) => {
+        bootLog(
+          `Graph rows rewrite failed to start: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+  }
   if (isGraphIndexBackfillEnabled()) {
     // Detached: the backfill enumerates and a large store makes that slow, and
     // nothing at boot needs to wait for it. It resumes from its cursor, so a

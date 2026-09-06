@@ -419,6 +419,15 @@ export type GraphProvenanceMode = "legacy" | "batch";
 // Off by default and read at boot only: it enumerates the graph scopes, which
 // is the read the rest of U3 exists to remove from the hot path, so it must be
 // something an operator turns on deliberately rather than a startup default.
+// U2. The directory scripts/graph-rewrite/rewrite.py emitted. The entrypoint
+// reads the same variable to retire the six originals before the engine starts;
+// this half loads the rewritten rows once it is up. One flag, two consumers,
+// because the two halves have to happen on opposite sides of engine boot.
+export function getGraphRowsRewriteDir(): string | null {
+  const dir = getMergedEnv()["GRAPH_ROWS_REWRITE_AT_BOOT"];
+  return dir && dir.length > 0 ? dir : null;
+}
+
 export function isGraphIndexBackfillEnabled(): boolean {
   return getMergedEnv()["GRAPH_INDEX_BACKFILL"] === "true";
 }

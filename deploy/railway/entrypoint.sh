@@ -106,6 +106,40 @@ retire_matching_file() {
 retire_matching_file "$DATA_DIR/state_store.db" "mem:audit.bin"
 retire_matching_file "$DATA_DIR/state_store.db" "mem_audit.bin"
 
+# U2. The rewrite swaps the six graph scope files for rows the offline emitter
+# produced, and the ordering is the whole of it. The engine loads a scope file
+# when the file is there, so the originals have to be gone BEFORE it starts;
+# the rewritten rows have to go in AFTER it is up, because they go through the
+# verbatim row importer and the engine writes its own format (KTD3). One flag
+# drives both halves: this retires, and mem::graph-rows-load reads the same
+# path once the process is running.
+#
+# Writing to a retired scope is the cold-start path, not a new one: an empty
+# boot creates state_store.db with three files, and every one of production's
+# other 2,722 scope files was minted by its own first write.
+#
+# retire_scope is also defined on feat/retire-orphaned-index-generations, which
+# retires the same six on its own flag. The guard is so the two can merge in
+# either order; whichever lands second should drop its copy.
+if ! command -v retire_scope >/dev/null 2>&1; then
+    retire_scope() {
+        retire_matching_file "$1" "$(printf '%s' "$2" | sed 's/:/%3A/g').bin"
+    }
+fi
+
+if [ -n "${GRAPH_ROWS_REWRITE_AT_BOOT:-}" ]; then
+    for _scope in \
+        mem:graph:nodes \
+        mem:graph:edges \
+        mem:graph:snapshot \
+        mem:graph:name-index \
+        mem:graph:edge-key \
+        mem:graph:node-degree
+    do
+        retire_scope "$DATA_DIR/state_store.db" "$_scope"
+    done
+fi
+
 cat > "$III_CONFIG" <<'EOF'
 workers:
   - name: iii-http
