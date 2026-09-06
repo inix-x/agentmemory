@@ -72,6 +72,12 @@ nothing else from the sandbox experiment stack it was developed on: no
   index retire block stays byte-identical to the branch it was developed and
   measured on. Worth a follow-up word change, not worth diverging the two copies
   for.
+- **`test/copilot-plugin.test.ts` is load-sensitive, and this branch adds
+  load.** It fails intermittently under a full parallel run on this branch and
+  on unmodified `878174f`, and passes 16 of 16 in isolation on both. The Tests
+  section below traces the cause. The file and the hook scripts behind it live
+  under `plugin/`, which this PR does not touch, so fixing it is a separate
+  change against `origin/production`.
 
 ## Why the live id is read from the manifest, not from a list
 
@@ -247,8 +253,17 @@ longer does. The failure is unreachable on today's ids, because `generateId`
 mints a fixed-length id until roughly 2059, so this is a fixture and not a bug
 report.
 
-Gates: `npm test` exit 0 (183 files: 182 passed, 1 skipped; 1999 tests: 1998
-passed, 1 skipped). `npx tsc --noEmit` at the pre-existing 29-error baseline,
+Gates: `npm test` was green at `53f3b8c` on 2026-09-06, one run, exit 0 (183
+files: 182 passed, 1 skipped; 1999 tests: 1998 passed, 1 skipped). At `1324017`
+two full runs returned exit 1, failing only `test/copilot-plugin.test.ts`. That
+file passes 16 of 16 in isolation at `1324017` and at the unmodified base
+`878174f`, and unmodified `878174f` fails it too once an equivalent parallel
+load runs beside it. The cause is the 400 ms per-attempt fetch budget in
+`postWithRetry` in `plugin/scripts/notification.mjs` and
+`plugin/scripts/post-tool-failure.mjs`, which returns silently when the budget
+expires. This branch changes no file under `plugin/` or `src/`, and the load it
+adds is its own 13-test entrypoint test file.
+`npx tsc --noEmit` at the pre-existing 29-error baseline,
 verified by running tsc on a detached worktree at `878174f` and diffing the
 sorted error lists rather than the counts: the diff is empty. `npm run build`
 exit 0.

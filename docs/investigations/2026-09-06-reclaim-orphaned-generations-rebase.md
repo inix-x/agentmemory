@@ -586,8 +586,12 @@ holds, and the PR body says only the object form has been. `270a42f` made the
 skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
 at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
 disjoint from the helper's. No code carries `_gbase` at head; the remaining
-mentions are this document's own records. `npm test` is green at head: 182 files
-and 1998 tests pass, with one file and one test skipped.
+mentions are this document's own records. `npm test` was green at `53f3b8c`,
+one run: 182 files and 1998 tests pass, with one file and one test skipped. It
+returned exit 1 twice at `1324017`, failing only `test/copilot-plugin.test.ts`,
+which is load-sensitive rather than a branch regression: it passes 16 of 16 in
+isolation at `1324017` and at `878174f`, and unmodified `878174f` fails it
+under an equivalent parallel load.
 
 - **This does not fix the leak.** `index-persistence.ts` still strands a
   generation per boot. This moves them off the eagerly-loaded store after the
