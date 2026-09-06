@@ -676,3 +676,182 @@ raw scope-file read returns this change and nothing else. An engine upgrade that
 changes the trailer breaks the reader in the fail-closed direction, so the cost
 is a skipped retire and not a lost index. The entrypoint carries a `ponytail:`
 marker naming that ceiling.
+
+---
+
+## review round 2 fixes
+
+Two round-2 reviews ran against `cf1c7ff`: a code review (lens A) and a ponytail
+review (lens B). Neither found a P0 or a P1. Lens A raised one P2 (a PR-body
+defect) and three P3. Lens B named three cuts. Both keep lists were settled and
+are not re-opened. This section records what landed.
+
+### The commits
+
+| commit | what |
+|---|---|
+| `7f2c10a` | `refactor(retire)` collapse the destination branch to a default expansion (lens B cut 1) |
+| `2e0335f` | `test(retire)` drop the `containing` fixture; pin the helper's own behaviour (lens B cut 2 + lens A P3-1) |
+| `6b710cd` | `docs(retire)` trim the two-message comment; correct the process count (lens B cut 3 + lens A P3-3) |
+| `cdf6b46` | `docs(retire)` repair the three cross-references (lens A P3-2) |
+| `e85f68c` | `docs(retire)` PR body: disclose the shared-helper change, name the deployed commit (lens A P2-1) |
+
+Code and tests are final at `cdf6b46`. The commits after it are documentation.
+
+### The destination collapse does not spawn a date in batch mode
+
+Lens B's cut 1 replaces a five-line `if` with
+`_dest="${_retire_dest:-$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)}"`. The
+doubt worth measuring is whether `$(date)` still stays unspawned when the caller
+sets a destination. A counting stub on `PATH` appended a line per spawn. Both
+forms, three states, three shells, 18 rows, all agreeing:
+
+```
+form=old mode=batch dest=/preset                        date_spawns=0
+form=new mode=batch dest=/preset                        date_spawns=0
+form=old mode=empty dest=/data/retired/20260906T000000Z date_spawns=1
+form=new mode=empty dest=/data/retired/20260906T000000Z date_spawns=1
+form=old mode=solo  dest=/data/retired/20260906T000000Z date_spawns=1
+form=new mode=solo  dest=/data/retired/20260906T000000Z date_spawns=1
+```
+
+Identical under `/bin/sh`, `/bin/dash`, and `/bin/bash`. The `empty` row is the
+one that could have differed: `:-` treats null and unset alike, and so did the
+`[ -n "${_retire_dest:-}" ]` test it replaces. The solo rows are the positive
+control; without them a broken counter reads the same as a proven claim, which
+is what the first run of this stub did.
+
+### Fail-first for the new helper test
+
+Lens A's P3-1 is that nothing on this branch tested what `1bd6aee` did to
+`retire_matching_file`. The two new tests run against `a12dbdc` (`cf1c7ff~6`),
+where the helper has no batch branch. The batch-mode test dies there:
+
+```
+ FAIL  test/deploy-entrypoint-index-retire.test.ts > the shared retire helper
+       keeps both of its modes > sets _retire_dest: one directory for the run,
+       counted not echoed
+AssertionError: expected 'agentmemory: retired mem%3Aindex%3Abm…' not to match
+                /retired mem%3Aindex/
+
++ Received:
+"agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtj0pzb2_73ee689c0219%3A00000.bin,      300 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtlwdg4b_4d6f0fb52cfe%3A00000.bin,      301 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtnp1c9s_3698dd9cd6e0%3A00000.bin,      304 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtohwasy_5555cccc6666%3A00000.bin,      302 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtorf55a_7777dddd8888%3A00000.bin,      303 bytes, to …/retired/20260906T071726Z
+"
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 9 skipped (11)
+```
+
+Read the destination on those five lines. They share one stamp, so the
+`toHaveLength(1)` assertion passes at `a12dbdc` too: that loop did not cross a
+second, and a single destination was incidental there rather than guaranteed.
+The echo assertion is the discriminating one. The pair is what pins the if/else.
+
+The unset-mode test passes at `a12dbdc`, and at `878174f`, on purpose. It pins
+the shipped path the two audit callers take, which this branch must not change,
+so its evidence is a mutation and not a fail-first.
+
+Whole file against unmodified `878174f`: **7 of 11 fail**. The four that pass are
+the positive control, the two guard tests (vacuously, nothing moves), and the
+unset-mode helper test.
+
+### Mutations
+
+Baseline is 17 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation was applied to all four
+entrypoint copies unless noted.
+
+| mutation | round 1 | round 2 review | after these fixes |
+|---|---|---|---|
+| live filter never matches | 3 fail | 3 fail | **4 fail** |
+| both fail-closed guards removed | 2 fail | 2 fail | 2 fail |
+| shared helper clobbers `_sep` | 3 fail | 3 fail | **4 fail** |
+| `\|` delimiters removed | 0, survived | 1 fail | 1 fail |
+| per-file log `echo` replaced with `:` | not run | **0 fail, full suite green** | **1 fail** |
+| batch destination scattered one file per directory | not run | **0 fail** | **1 fail** |
+| doc pointer rewritten to a path that does not exist | not run | **0 fail, 5 drift green** | **1 fail of 6 drift** |
+
+The delimiter row is the one that could have regressed. Dropping the `containing`
+fixture did not weaken it: `contained` carried that mutation on its own, which is
+why `containing` was cut.
+
+The echo row is the strongest number here, because it is a before and after on
+one measurement. Lens A ran that mutation against the **entire suite** and got
+182 files and 1993 tests green. Re-run against the entire suite now:
+
+```
+FAIL  test/deploy-entrypoint-index-retire.test.ts > the shared retire helper
+      keeps both of its modes > leaves _retire_dest unset: own stamp directory,
+      one line per file
+ Test Files  1 failed | 181 passed | 1 skipped (183)
+      Tests  1 failed | 1995 passed | 1 skipped (1997)
+```
+
+### Gates, measured at `cdf6b46` in the branch worktree
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. Duration 14.41 s. Exit 0. |
+| `npx tsc --noEmit` | 29 errors on both sides. `diff` of the two sorted error lists against a detached `878174f` worktree is **empty**. Exit 2 on both, which is the pre-existing baseline. |
+| `npm run build` | Exit 0. 20 files, 3.17 MB, 3971 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays
+excluded. No flake appeared on this host. The two commits after `cdf6b46` are
+documentation, so they cannot move these numbers; `npm test` was re-run at the
+final head to confirm, and `tsc` and `build` were not.
+
+The four entrypoints are byte-identical over the whole retire region, lines 95 to
+228, `shasum` `9e1e9bd1bb4d` on each.
+
+### The three cross-references, and what each became
+
+- **Rewritten.** `test/deploy-entrypoint-index-retire.test.ts` named
+  `retire_scope`, which is the experiment branches' helper and does not exist
+  here. It now names `retire_matching_file`, matching the entrypoint paragraph
+  that was already corrected in round 1.
+- **Removed.** The citation of
+  `docs/plans/2026-09-06-001-graph-memory-redesign-plan.md` at the on-disk format
+  derivation. That file is committed on no branch. The byte check it carried is
+  now stated in place as the measurement it is. This makes the section consistent
+  with what "The on-disk scope format the reader assumes" already says further
+  down: a citation to an uncommitted file is not a citation.
+- **Kept and guarded.** The entrypoints' pointer to this document resolves, and
+  nothing kept it resolving, because `deploy-entrypoint-drift` normalises through
+  `code()` and drops every `#` line. One assertion there now sweeps every
+  `docs/**.md` path in all four copies and fails on any that does not resolve. It
+  reports the path it lost rather than a bare `false`.
+
+### Left alone, so a round 3 does not re-raise them
+
+- **The `ponytail:` marker at `deploy/*/entrypoint.sh` ships.** Round 1's PR gate
+  asked for confirmation that none did. One does, added on the round-1 ponytail
+  review's own recommendation, and it names a real ceiling. `src/functions/session-sweep.ts`
+  carries one and is already on `origin/production`, so it matches the target
+  branch's convention. This holds because the PR targets `origin/production`. For
+  an upstream maintainer the persona label would mean nothing and the same
+  content should be plain prose.
+- **The recursive ownership call is still one per moved file** inside the loop,
+  where `retire_stream_files` makes the same call once after its loop. Lens B
+  measured the cost: about 148 forks and roughly 11,000 inode touches, once, on
+  the boot that drains the backlog. It is not a regression, because the per-call
+  date stamp already shared a directory in the common case. It is a separate
+  logical change and is not in this branch.
+- **`GRAPH_SCOPES_RETIRE_AT_BOOT` in the gate comment** names a flag this branch
+  does not have. Kept deliberately so the block stays byte-identical with the
+  branch it was measured on, and disclosed in the PR body's limitations. After
+  the `retire_scope` fix above, the body's count of "one comment" is exact.
+- **Three `src/` paths at "What the rebase had to change"** sit inside a
+  `git ls-tree` transcript whose output is `(empty)`. Their absence is the point.
+- **`test/deploy-entrypoint-scope-retire.test.ts` in the fail-first record** is
+  the name the test file had when that run was made.
+- **The `containing` fixture is gone and is not worth restoring.** Lens B's
+  optional swap (the live id minus its *first* character, which would cover the
+  trailing-delimiter mutation) was not taken. It is a swap, not a cut, and it was
+  offered as optional.
+- **The two diagnostics JSON files this document cites** are under
+  `docs/investigations/`, which is excluded from git here, so they resolve
+  locally and not for a reader of the branch. That is pre-existing, it applies to
+  the PR body as well, and neither round-2 lens raised it.
