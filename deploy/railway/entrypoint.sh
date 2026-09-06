@@ -166,13 +166,9 @@ process.stdout.write("|" + out.join("|") + "|");
 # dead, and retiring the live index costs a full-corpus rebuild, so an absent or
 # unparseable manifest moves nothing and says so once.
 #
-# The two cases get distinct messages because they mean different things and the
-# log line is their only production signal. An absent file is a store with no
-# index yet, which is expected on a fresh volume. A file that is present and
-# yields nothing means the reader's assumption about the engine's on-disk shape
-# did not hold, which is the one unpinned assumption in this change. The reader's
-# stderr stays dropped, so the caller does the [ -f ] test rather than folding
-# both outcomes into one non-zero exit.
+# The two messages differ because the log line is the only signal: absent means a
+# fresh volume, present-but-unreadable means the on-disk shape assumption broke.
+# The reader drops stderr, so the caller does the [ -f ] test, not an exit code.
 retire_nonlive_index_generations() {
     _manifest="$1/mem%3Aindex%3Abm25.bin"
     if [ ! -f "$_manifest" ]; then
@@ -189,7 +185,7 @@ retire_nonlive_index_generations() {
     # No subprocess in the examine path. A leaked store is hundreds of files and
     # this runs on the boot path, so the id comes out by parameter expansion and
     # the live test is a case against the pipe-delimited list. The files that are
-    # actually retired do cost the five processes retire_matching_file spawns,
+    # actually retired do cost the four processes retire_matching_file spawns,
     # but the loop examines many and retires few.
     #
     # One stamp for the whole run, computed here rather than per call, so a loop
