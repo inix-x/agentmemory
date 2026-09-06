@@ -1,0 +1,1687 @@
+# Rebasing `fix/1115-reclaim-orphaned-index-generations` onto `origin/production`
+
+Date: 2026-09-06
+Task: T14. Rebase the branch and evaluate it as the next memory lever after the
+graph units.
+Worktree: `/private/tmp/claude-501/-Users-ogerardo-src-agentmemory/d60174a6-eeba-4749-9672-507865d9fd3c/scratchpad/wt-reclaim`
+Branch: `fix/reclaim-orphaned-index-generations-rebased`
+Base: `origin/production` = `878174fb4a21ca4f9318c89c9e4ab2d247e9d4d5`
+Not pushed. Not deployed. No tracked file in the main tree was modified.
+This document is a new **untracked** file in the main tree. `docs/` is excluded
+at `.git/info/exclude:20`, so it does not appear in `git status` and needs
+`git add -f` to commit.
+
+## Headline
+
+**The reclaim already shipped. This branch is not a memory lever.**
+
+The commit the lever was named for, `bbb49d3`, is byte-identical to
+`6a27bca` on `origin/production` and has been there since 2026-08-26. What
+remains unlanded is nine lines of save coalescing that touch nothing in the
+reclaim path. On the 2026-09-05 store this branch reclaims **0 MiB**.
+
+The 306.8 MiB is still worth taking. It needs a different change, sized at the
+end of this document.
+
+## 1. Commits kept and dropped
+
+`origin/production..origin/fix/1115-reclaim-orphaned-index-generations` is four
+commits, not the three the task named.
+
+| Commit | Subject | Decision |
+|---|---|---|
+| `e04ba88` | `fix(cli): make fresh installs portable and persistent (#892)` | **dropped** |
+| `bbb49d3` | `fix(state): reclaim index generations the manifest can no longer name` | **dropped** |
+| `c6851e7` | `fix(state): coalesce onto a queued save so a delete does not wait out the line` | kept, now `9f66ac1` |
+| `81127a6` | `refactor(state): name the coalescing field for the invariant it holds` | kept, now `73a1883` |
+
+### `e04ba88` dropped: upstream drift production never took
+
+Authored by Rohit Ghumare, 2026-08-23, upstream PR #892. It is the parent of
+`bbb49d3`, so the branch inherited it rather than choosing it. Production does
+not have it and does not have its files:
+
+```
+$ git ls-tree origin/production -- src/cli/engine-launch.ts src/cli/engine-config.ts src/runtime-paths.ts
+(empty)
+$ git merge-base --is-ancestor e04ba88 origin/production
+NO
+```
+
+Replaying it would reintroduce 2,651 lines across 28 files, a whole CLI
+launch subsystem production has diverged from. It is not our change and it is
+not in scope for a reclaim branch.
+
+### `bbb49d3` dropped: already in production, byte for byte
+
+```
+$ git merge-base --is-ancestor 6a27bca origin/production
+YES
+$ git diff --quiet bbb49d3 6a27bca -- src/state/index-persistence.ts test/index-persistence.test.ts
+IDENTICAL: bbb49d3 and 6a27bca trees match on both files
+```
+
+`6a27bca` carries the same subject line and the same content for both files it
+touches. Production also carries the follow-up `20b1a24`, `docs(state): drop
+the review marker from the gc ledger append`. Replaying `bbb49d3` would be a
+no-op at best and a conflict at worst.
+
+This is why the composition doc's line 99, "`fix/1115-reclaim-orphaned-index-generations`
+exists as a branch and is not on `production`", is true of the branch ref and
+false of the code on it. The branch ref never landed. Its reclaim commit did.
+
+### `c6851e7` and `81127a6` kept
+
+These are the only unlanded work. `git rebase --onto origin/production bbb49d3`
+replayed both with **no conflicts**.
+
+`81127a6` came through as `73a1883` at `-19/+4` instead of its original
+`-24/+4`. Production's `20b1a24` had already removed five lines of the same
+comment block, independently. That is the expected outcome, not a mis-resolve.
+
+## 2. Net change against production
+
+One file, nine insertions, one deletion, in `save()`:
+
+```ts
+  private unstartedSave: Promise<void> | null = null;
+  ...
+  async save(): Promise<void> {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.unstartedSave) return this.unstartedSave;
+
+    const pending = this.enqueue(() => {
+      if (this.unstartedSave === pending) this.unstartedSave = null;
+      return this.runSave();
+    });
+    this.unstartedSave = pending;
+    return pending;
+  }
+```
+
+It touches `save()` and nothing else. `reclaimGenerations`, `recordGeneration`,
+`trackGeneration`, `untrackGeneration`, and `readLedger` are unchanged from
+production. **The branch cannot change which generations get discovered or
+reclaimed.** That is a structural fact about the diff and does not depend on
+resolving anything about the store.
+
+One caveat a reviewer would find, so it is stated here. Discovery logic is
+untouched, but `reclaimGenerations` has two call sites and one of them is in
+the save path:
+
+```
+356:      await this.reclaimGenerations(manifestKey, generation);      // saveShardedIndex, after publish
+723:        .enqueue(() => this.reclaimGenerations(manifestKey, live))  // load path
+```
+
+Every save cycle carries a reclaim attempt, so collapsing six flushes into one
+running plus one queued lowers the number of reclaim retries per unit time. If
+the non-convergence in section 3 turns out to be retry starvation on stranded
+shards, this commit points the wrong way for the problem the branch was named
+for. It does not change the 0 MiB verdict, which rests on discovery being
+unchanged, and the coalescing is still correct on its own terms: a queued save
+that has not started will serialise the index as it stands when it runs.
+
+## 3. What this code would reclaim on the 2026-09-05 store
+
+### The generations on disk
+
+From `docs/investigations/2026-09-05-phaseA-close-store-diagnostics.json`
+(`at` 2026-09-05T07:05:57Z, `/data/state_store.db`, 3,680,744,036 bytes total).
+Generation ids are base36 milliseconds, decoded below.
+
+| Generation | Minted (UTC) | Files on disk | Bytes | MiB | Role |
+|---|---|---|---|---|---|
+| `idx_mtnp1c9s_3698dd9cd6e0` (bm25) | 2026-09-05 01:17:52.864 | 227 | 497,323,484 | 474.3 | **live**, this boot |
+| `idx_mtj0pzb2_73ee689c0219` (bm25) | 2026-09-01 18:46:07.358 | 76 | 165,425,164 | 157.8 | orphan |
+| `idx_mtlwdg4b_4d6f0fb52cfe` (bm25) | 2026-09-03 19:07:42.683 | 72 | 156,302,108 | 149.1 | orphan |
+| `idx_mtnp1k57_...` (vectors) | 2026-09-05 01:18:03.067 | 29 | 57,311,888 | 54.7 | **live**, this boot |
+
+Orphan total: **321,727,272 bytes, 306.8 MiB, 148 files.** That reproduces the
+composition doc's 307 MiB across 148 files exactly.
+
+`docs/investigations/2026-09-05-sandbox-store-diagnostics.json` (2026-09-05
+11:47Z) reports the same four generations at the same byte counts, which is the
+expected result for a byte-faithful copy.
+
+### The answer
+
+**The rebased code reclaims nothing it is not already reclaiming, so 0 MiB.**
+The two orphans survived under production's own reclaim code, and the retained
+delta does not touch discovery.
+
+The code keeps the live generation named by the manifest, `idx_mtnp1c9s_...`
+at 474.3 MiB, plus the live vector generation at 54.7 MiB.
+
+### Why the orphans survived, as far as the disk can say
+
+The reclaim mechanism is not dark on this store. Three things are on the record.
+
+**One. The deployed image had the ledger at the 2026-09-05 boot.** The
+composition doc reports a `generation_reclaim` audit row evicting 29 files at
+01:18:04Z. That action string exists only in the ledger code. Behavior, not a
+commit date, proves the deployment.
+
+**Two. That sweep was the vector index, not BM25.** 29 files is exactly the
+shard count of the live vector generation `idx_mtnp1k57_...`, minted 01:18:03Z,
+one second earlier. A vector reclaim that evicted its predecessor and left one
+live generation fits. `reclaimGenerations` emits no audit row when it reclaims
+nothing, so a BM25 sweep that found nothing would be silent. The audit row
+carries `manifestKey` and would settle this outright; no raw rows are committed
+to this repo, so the shard-count match is a strong argument and not a proof.
+
+**Three. Both BM25 orphans are partially reclaimed remnants, not untouched
+generations.** `largestFiles` names the surviving shards individually. Highest
+surviving shard index against surviving file count:
+
+| Generation | Highest index seen in the `largestFiles` top-50 sample | Files surviving | Shards gone (at least) |
+|---|---|---|---|
+| `idx_mtnp1c9s_...` (live) | 222 | 227 | 0, the set is complete |
+| `idx_mtlwdg4b_...` | 220 | 72 | ~149 |
+| `idx_mtj0pzb2_...` | 165 | 76 | ~90 |
+
+The index column is sampled, not exhaustive: `largestFiles` holds the 50 biggest
+files, so the true maximum is at or above what is shown, and "shards gone" is a
+floor. That is why the live row reads 222 against 227 files.
+
+A generation that was written with at least 221 shards and holds 72 lost the
+rest to a bulk delete. The live generation shows the contrast: 227 files with a highest
+index of 222, a complete set. So something deleted most of both orphans and
+stopped. This is the composition doc's "reclaim runs but does not finish",
+confirmed from the file names rather than from the count.
+
+**What the disk cannot say.** Whether the deleter was `reclaimGenerations` or
+the `shard_write_rollback` path is not distinguishable from file names alone.
+Both leave the ledger entry in place holding the stranded shards, and both are
+retried on the next save and the next load. The open question is not "can the
+code name these" but "why does its retry not converge across boots". The
+`failed` field on the reclaim audit row answers it. That field is not in this
+repo.
+
+**The asymmetry is the finding.** In one boot, reclaim worked on the vector
+manifest and left one live generation. On the BM25 manifest it left 306.8 MiB
+of half-deleted remnants. The mechanism works; the BM25 side specifically is
+not converging. Whoever writes the follow-up gets a targeted problem instead of
+a speculative one.
+
+### Resident cost
+
+306.8 MiB on disk, at exp-001 sample 1's k of 2.86, is **~878 MiB resident**.
+The composition doc's ~1.5 GB uses the whole-store k of 4.8 from the production
+read. Both are in the docs; they differ because k is a whole-store average and
+the two reads are of different stores.
+
+## 4. Fail-first, pass, mutation
+
+### `9f66ac1` (`c6851e7`), fail-first against its parent
+
+The commit adds one test. Parent is `origin/production`. Running the new test
+with `src/state/index-persistence.ts` reverted to production:
+
+```
+ FAIL  test/index-persistence.test.ts > IndexPersistence save coalescing > does not queue a second identical save behind one that has not started
+AssertionError: expected 6 to be less than or equal to 2
+ ❯ test/index-persistence.test.ts:1219:28
+    1219|     expect(manifestWrites).toBeLessThanOrEqual(2);
+       |                            ^
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 39 skipped (40)
+```
+
+Six serialised saves, which is the regression the test names. With the commit's
+source restored:
+
+```
+ Test Files  1 passed (1)
+      Tests  40 passed (40)
+```
+
+### `73a1883` (`81127a6`), no fail-first
+
+A pure rename of one field with no test changes. There is no behavior to fail
+first on, so none was manufactured. It is covered by the same 40 tests.
+
+### Mutation check on the reclaim assertion
+
+The reclaim commit is dropped, so this checks **production's shipped
+mechanism**, which is what this document reports on. Making
+`reclaimGenerations` return before reading the ledger:
+
+```
+     × reclaims the previous generation when the previous manifest read fails (#1115)
+     × reclaims a generation stranded by a failed cleanup on the next load (#1115)
+     × reclaims the previous vector generation when the vector manifest read fails (#1115)
+     × reclaims a pre-ledger manifest that carries no generation (#1115)
+     × still reclaims when the gc ledger holds a malformed entry (#1115)
+      Tests  5 failed | 35 passed (40)
+```
+
+Five tests die. The assertions are load-bearing. Source restored via
+`git checkout HEAD --` afterwards.
+
+## 5. Gates
+
+### `npm test`
+
+`npm test`, not bare `vitest run`, so `test/integration.test.ts` stays excluded.
+
+| Run | Result |
+|---|---|
+| branch, run 1 | 18 failed, 1967 passed, 1 skipped (1986) |
+| `origin/production`, run 1 | 18 failed, 1966 passed, 1 skipped (1985) |
+| branch, run 2 | 19 failed, 1966 passed, 1 skipped (1986) |
+
+The +1 total on the branch is the new coalescing test.
+
+The failure sets differ between runs in both directions, and every failure is a
+5,000 ms timeout in a file unrelated to this change. `test/index-persistence.test.ts`
+did not fail in any of the three runs.
+
+Pre-existing status was proven rather than assumed. Four files failed on the
+branch but not on production's run: `auto-forget`, `hook-project`,
+`search-index`, `session-end-transcript`. Running that identical four-file set
+on each worktree back to back:
+
+```
+production:  Test Files  4 passed (4)   Tests  39 passed (39)
+branch:      Test Files  4 passed (4)   Tests  39 passed (39)
+```
+
+Both pass under the same conditions, so the asymmetry is machine load and not
+the change. `hook-project` is on the known-flaky list in
+`.claude/rules/pr-governance.md`. Two files, `evict` and `retention`, failed on
+production and not on the branch, which is the same effect in the other
+direction.
+
+### `npx tsc --noEmit`
+
+Baseline measured by running it on `origin/production` in a separate worktree
+rather than assuming the number.
+
+```
+production: 29 errors
+branch:     29 errors
+diff of the two error lists: empty
+```
+
+### `npm run build`
+
+```
+✔ Build complete in 142725ms
+20 files, total: 3.17 MB
+BUILD EXIT=0
+```
+
+## 6. Safety: the shipped reclaim deletes, it does not move
+
+The task's bar is that reclaim moves to `/data/retired/<stamp>/` and never
+deletes, as exp-001's `retire_scope` does. **The existing mechanism is not
+equivalent.**
+
+`reclaimGenerations` calls `this.kv.delete(shard.scope, shard.key)` in-process
+at runtime. The delete is real and irreversible. exp-001's helper
+(`exp/001-graph-off-retire`, `6851311`, `deploy/*/entrypoint.sh`) does this
+instead:
+
+```sh
+_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$_dest" || return 0
+if mv "$_f" "$_dest/" 2>/dev/null; then ...
+```
+
+It runs before the engine starts, so the engine never sees a file mid-move, and
+every retirement is undone with one `mv` back.
+
+Two things follow, and they matter in this order.
+
+**This gap is in shipped production code, not in the rebase delta.** The
+delete landed on 2026-08-26 with `6a27bca`. The two commits kept here add no
+delete. Converting reclaim from delete to move is a separate change against
+production, on its own branch, with its own review.
+
+**It was not built here.** It cannot be tested against this store locally, and
+it is outside a rebase task's scope. It is filed as a recommendation.
+
+## 7. Sandbox environment changes
+
+None. Nothing was deployed, nothing was pushed, no sandbox variable was
+touched, and the main tree's checkout was not modified. All work happened in
+two scratch worktrees with `node_modules` symlinked to the main checkout.
+
+## 8. What would actually take the 306.8 MiB
+
+Not built. Sized only, so the decision stays with whoever plans the next unit.
+
+The engine writes one file per scope and percent-encodes the colons, which is
+what makes the boot-time retire path work at all. The orphan shards are named
+on disk today:
+
+```
+mem%3Aindex%3Abm25%3Abm25%3Aidx_mtj0pzb2_73ee689c0219%3A00000.bin ... (76 files)
+mem%3Aindex%3Abm25%3Abm25%3Aidx_mtlwdg4b_4d6f0fb52cfe%3A00000.bin ... (72 files)
+```
+
+Adding those two generation prefixes to `retire_matching_file` in
+`deploy/*/entrypoint.sh` moves 148 files, 306.8 MiB, into
+`/data/retired/<stamp>/` at boot. It is reversible with one `mv` per file, it
+runs before the engine starts, and it needs no engine change. The generation
+ids are pinned to this store, so it is a one-shot, which is what
+`bbb49d3`'s own commit message called for: "The ledger cannot discover
+generations orphaned before it existed; those need a one-time reclaim."
+
+The durable fix is separate and is the real question this investigation
+surfaced: make the BM25 reclaim retry converge. Start from the `failed` count on
+the `generation_reclaim` audit row in production.
+
+## 9. Limitations
+
+- **The ledger contents were never read.** The diagnostics JSON reports bytes
+  per scope. The gc ledger lives inside `mem:index:bm25` (44,092 bytes, one
+  file) alongside the manifests, and its contents are not in this repo. Every
+  claim here about which generations the ledger names is inference from disk
+  shape, and is labelled as such.
+- **No `generation_reclaim` audit row is committed to this repo.** Only the
+  composition doc's summary of one. Its `manifestKey`, `liveGeneration`, and
+  `failed` fields would settle the BM25-versus-vector question and the
+  non-convergence question directly.
+- **The ledger's deployment date is not established.** The audit row proves the
+  code was deployed at the 2026-09-05 boot. Whether it was deployed before the
+  orphans were minted on 09-01 and 09-03 is not proven from anything committed
+  here. The partial-deletion evidence in section 3 makes it likely, since
+  something deleted most of both, but "likely" is the right word.
+- **`shard_write_rollback` versus `reclaimGenerations`** cannot be told apart
+  from file names.
+- **The k factors are whole-store averages.** 878 MiB (k 2.86) and 1.5 GB
+  (k 4.8) bracket the resident saving. The ±15% caveat in the composition doc
+  applies.
+- **`npm test` is not green on either side.** 18 to 19 timeout failures in
+  unrelated files on both the branch and production. Proven equivalent, not
+  proven absent.
+- **Nothing was deployed.** The 0 MiB verdict is from the code diff and the
+  committed store reads, not from a boot of the rebased branch.
+
+---
+
+## boot-time index generation retire
+
+Commit `1d6891d`, `feat(retire): retire index generations the manifest does not
+name as live`, on `feat/retire-orphaned-index-generations`, branched from
+`exp/001b-retire-writer-on` (`229ee30`).
+Worktree: `/private/tmp/claude-501/-Users-ogerardo-src-agentmemory/d60174a6-eeba-4749-9672-507865d9fd3c/scratchpad/wt-retire-idx`
+Not pushed. Not deployed. No tracked file in the main tree was modified; this
+section is appended to an untracked file (`docs/` is excluded at
+`.git/info/exclude:20`, and it was not `git add`ed).
+
+### The task changed shape mid-build, and the census is why
+
+This started as "retire the two named orphans". A sandbox generation census at
+21:32Z on 2026-09-06, after 20 redeploys in a day, found **six BM25 generations
+totalling 1,104 MiB with one live at ~257 MiB**. Index persistence mints a
+generation per boot and the manifest-driven GC does not reclaim the prior one,
+so the leak is a per-boot growth term rather than a fixed pair of orphans. A
+list of ids written before a boot cannot keep up with that.
+
+So the selector is the manifest: retire every BM25 and vector generation whose
+id neither manifest names as live. The two orphans this document opened with are
+now two of five.
+
+### The flag
+
+`INDEX_GENERATIONS_RETIRE_AT_BOOT=true`
+
+The literal `true`, matching `GRAPH_SCOPES_RETIRE_AT_BOOT` next to it, so a
+stray value is not read as consent to move an index. The flag no longer carries
+a list; that is the one place where the shape of the original packet could not
+survive the respec, because the selector replaced the list.
+
+Files move to `$DATA_DIR/retired/<stamp>/` through the entrypoint's existing
+`retire_matching_file`: rename and never delete, silent when absent, idempotent,
+one log line per file with its byte count. Putting a generation back is one `mv`.
+
+### What it would move
+
+**2026-09-05 07:05:57Z production store**, from the diagnostics endpoint:
+
+| Action | Family | Generation | Files | Bytes | MiB |
+|---|---|---|---|---|---|
+| keep | bm25 | `idx_mtnp1c9s_3698dd9cd6e0` | 227 | 497,323,484 | 474.3 |
+| **retire** | bm25 | `idx_mtj0pzb2_73ee689c0219` | 76 | 165,425,164 | 157.8 |
+| **retire** | bm25 | `idx_mtlwdg4b_4d6f0fb52cfe` | 72 | 156,302,108 | 149.1 |
+| keep | vectors | `idx_mtnp1k57_...` | 29 | 57,311,888 | 54.7 |
+
+**148 files, 321,727,272 bytes, 306.8 MiB.** That is the same pair section 3 of
+this document found, reached by a mechanism that does not need them named.
+
+**2026-09-06 21:32Z sandbox census** (experiment log, lines 981 to 990):
+
+| Action | Generation | MiB |
+|---|---|---|
+| keep | `mtow4iaa` | ~257 |
+| **retire** | `mtorf55a` | ~258 |
+| **retire** | `mtow62p9` | ~169 |
+| **retire** | `mtj0pzb2` | ~158 |
+| **retire** | `mtlwdg4b` | ~149 |
+| **retire** | `mtohwasy` | ~113 |
+
+**~847 MiB of 1,104 MiB.** At the census's own k of 2.4 to 2.9 that is ~2.0 to
+2.4 GB resident, larger than any single lever in the composition table.
+
+### The filename correction
+
+The on-disk name of a shard is
+
+```
+mem%3Aindex%3Abm25%3A<family>%3Aidx_<id>_<hex>%3A<NNNNN>.bin
+```
+
+for example `mem%3Aindex%3Abm25%3Abm25%3Aidx_mtnp1c9s_3698dd9cd6e0%3A00222.bin`.
+The task packet's example, `mem%3Aindex%3Abm25%3Abm25%3Aidx%3Amtj0pzb2*`, is the
+diagnostics endpoint's `byScope` grouping key, which splits those names on
+`[:_]`. It is not a filename and matches nothing on disk. `retire_scope` cannot
+spell these either: it encodes a literal scope name, and neither the hex suffix
+nor the shard number is known before the glob runs.
+
+### Why the live id is read from the manifest keys by name
+
+`src/state/index-persistence.ts` stores the gc ledger under
+`` `${manifestKey}:gc` `` in `KV.bm25Index`, which is the manifest's own scope.
+The engine writes one file per scope. So `mem%3Aindex%3Abm25.bin` (44,092 bytes
+on the 09-05 store) holds the BM25 manifest, the vector manifest, and both
+ledgers, and the ledgers name every orphan alongside the live one. **A grep of
+that file for a generation id refuses exactly the generations this flag exists
+to move.** The reader takes `data:manifest` and `vectors:manifest` by key name
+and reads `generation` from each.
+
+The file format was read off the scope files themselves: the engine writes a
+scope as `rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`, so the
+JSON body runs from offset 0 to the last `}`. That shape was checked against both
+graph scope files and matched to within one byte. Values are read as
+either objects or JSON-encoded strings, because which the engine writes is not
+pinned by a type in this repo and handling both costs one line.
+
+### Fail closed
+
+An absent or unparseable manifest moves nothing and logs once. Without a
+manifest nothing on disk can be told live from dead, and retiring the live index
+costs a full-corpus rebuild.
+
+### Fail-first, pass, mutation
+
+Nine tests added to `test/deploy-entrypoint-scope-retire.test.ts`, run against
+the real Railway entrypoint. Against the parent (`229ee30`), six fail:
+
+```
+× moves the five dead generations and leaves the live one
+× reads a manifest whose values are JSON-encoded strings
+× logs each move with its size
+× moves nothing and logs once when the manifest file is absent
+× moves nothing when the manifest is present but unparseable
+× retires the vector generation when only the BM25 manifest names one
+      Tests  6 failed | 13 passed (19)
+```
+
+The count reads 19 because the file already held 10 tests and this adds 9. All
+10 originals pass on the parent, and so do three of the nine new ones
+(idempotent, flag unset, live vector kept): they are guard tests, and on the
+parent nothing moves at all. The six above are the discriminating ones. With the
+commit applied, all pass alongside the drift guard:
+
+```
+ Test Files  2 passed (2)
+      Tests  24 passed (24)
+```
+
+Two mutations, both fatal:
+
+| Mutation | Result |
+|---|---|
+| live filter never matches (`*"\|__mutation__\|"*`) | `expected [ …(8) ] to deeply equal [ …(5) ]`, the three live files moved |
+| fail-closed guard dropped (`if false`) | both manifest-absent tests die; it retired shards with no manifest at all |
+
+### Gates
+
+| Gate | Parent `229ee30` | Branch `1d6891d` |
+|---|---|---|
+| `npm test` | 5 failed, 2007 passed, 1 skipped (2013) | 7 failed, 2014 passed, 1 skipped (2022) |
+| `npx tsc --noEmit` | 29 errors | 29 errors, list diff empty |
+| `npm run build` | | exit 0 |
+
+The +9 total is the nine new tests. `npm test`, not bare `vitest run`, so
+`test/integration.test.ts` stays excluded.
+
+Every failure on both sides is a 5,000 ms timeout in a file unrelated to this
+change, and neither entrypoint test file failed on either side. Pre-existing
+status was proven, not assumed: the four files that failed on the branch but not
+on the parent (`context-injection`, `observe-implicit-session`,
+`remember-supersede-recall`, plus `copilot-plugin`) were run as one identical set
+on each worktree back to back:
+
+```
+parent: Test Files  1 failed | 4 passed (5)   Tests  2 failed | 28 passed (30)
+branch: Test Files  1 failed | 4 passed (5)   Tests  2 failed | 28 passed (30)
+```
+
+Same shape both sides, and in both the only failing file is
+`test/copilot-plugin.test.ts` with the victim test rotating between runs.
+`hook-project` is on the known-flaky list in `.claude/rules/pr-governance.md`.
+
+### Sandbox environment change
+
+One variable name, set on the service, no value beyond the literal:
+
+- `INDEX_GENERATIONS_RETIRE_AT_BOOT`
+
+Nothing was deployed and nothing was set. That is the operator's step.
+
+### Limitations
+
+_The bullets below are as of `1d6891d`, the commit this section records._ Five of
+them read as durable claims about the code and are not. The reader has since been
+run against a real engine-written scope file, by the 02:58:06Z sandbox deployment
+the PR body records, which retired five dead BM25 generations and kept the live
+one. That same read observed the object form of a scope value, so the
+object-or-string bullet's "neither has been observed on a real file" no longer
+holds, and the PR body says only the object form has been. `270a42f` made the
+skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
+at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
+disjoint from the helper's. No code carries `_gbase` at head; the remaining
+mentions are this document's own records. `npm test` was green at `53f3b8c`,
+one run: 182 files and 1998 tests pass, with one file and one test skipped. It
+returned exit 1 twice at `1324017`, failing only `test/copilot-plugin.test.ts`,
+which is load-sensitive rather than a branch regression: it passes 16 of 16 in
+isolation at `1324017` and at `878174f`, and unmodified `878174f` fails it
+under an equivalent parallel load.
+
+- **This does not fix the leak.** `index-persistence.ts` still strands a
+  generation per boot. This moves them off the eagerly-loaded store after the
+  fact, once per boot, so the store sawtooths instead of growing. The per-boot
+  reclaim belongs in the gc ledger and is a separate change against
+  `origin/production`.
+- **The reader was never run against a real engine-written scope file.** No
+  state store exists on this host, and nothing was deployed. It is built to the
+  format the graph redesign plan's Appendix documents and verified against a
+  fixture shaped that way, including a trailer after the JSON body. If the real
+  file parses differently the flag fails closed and moves nothing, which is the
+  safe direction, but it would then be a no-op until the reader is corrected.
+- **The fail-closed guard is on the whole read, not per family.** The reader
+  skips the retire only when neither `data:manifest` nor `vectors:manifest`
+  yields a generation, so when one key is usable and the other is absent or
+  unreadable, that other family has no live id and every generation in it is
+  retired.
+- **Whether a scope value is an object or a JSON-encoded string is not pinned.**
+  Both are handled and both are tested; neither has been observed on a real file.
+- **The 21:32Z figures are the census's own rounded MiB**, not a byte-exact read.
+  The 09-05 figures are byte-exact from the diagnostics JSON.
+- **The entrypoint now calls `node`** to parse the manifest, which it did not
+  need before. Every deploy target is a node image and the app itself is node,
+  so the binary is present before the engine starts. If it ever is not, the call
+  exits non-zero, `_live` is empty, and the run takes the same fail-closed path
+  as an unparseable manifest: it moves nothing and logs the skip. A missing
+  binary is therefore safe and visible in the boot log, not a silent retire.
+- **The skip log does not say which failure it hit.** Absent file and failed
+  read produce the same line, because `stderr` from the reader is dropped to
+  keep an absent manifest quiet. Distinguishing them is free (the `[ -f ]` test
+  is right there) and would tell an operator whether the format assumption above
+  is the problem. Left out to keep this to the one commit the task asked for; it
+  is a one-line follow-up.
+- **No variable collision with the shared helper**, checked rather than assumed:
+  `retire_matching_file` assigns `_dir`, `_name`, `_f`, `_dest`, and `_size`,
+  and the retire loop uses `_live`, `_sep`, `_gf`, `_gname`, `_gbase`,
+  `_gshardless`, and `_gen`. Disjoint. An edit that adds `_live` or `_sep` to
+  the helper would turn the filter into "retire everything".
+- **`npm test` is not green on either side.** 5 to 7 timeout failures in
+  unrelated files. Proven equivalent, not proven absent.
+
+## Why the manifest, not a list
+
+The four deploy entrypoints and the test file each carried the census numbers and
+the on-disk format derivation verbatim, so one paragraph existed in five copies.
+`deploy-entrypoint-drift.test.ts` normalises through `code()`, which drops every
+line starting with `#`, so those copies were unpinned and could drift silently.
+The prose lives here now and the entrypoints carry a pointer.
+
+### The backlog the census measured
+
+Index persistence mints a generation per boot and the manifest-driven GC does not
+reclaim the prior one, so a store grows by roughly one whole index per redeploy.
+The 2026-09-06 21:32Z sandbox census, on a service with 20 redeploys in a day:
+six BM25 generations totalling 1,104 MiB, one of them live at ~257 MiB. That is
+~847 MiB of dead index, larger than any single lever in the composition table.
+
+Those are the census's own rounded MiB figures. The byte-exact production figures
+come from the diagnostics endpoint's 2026-09-05 07:05:57Z read of production.
+
+### Why a list of ids cannot be the selector
+
+A list written ahead of a boot cannot keep up with a per-boot growth term. It is
+also wrong in practice, which was measured rather than argued.
+
+The 21:32Z census named `mtow4iaa` as the live generation. When the change ran on
+that same store at 02:59Z the next morning, the manifest named `mtorf55a`, and
+the code kept `mtorf55a`. A hardcoded list built from that census would have
+retired the live index and forced a full-corpus rebuild: `src/index.ts:485` sets
+`needsRebuild = bm25Index.size === 0`, and `rebuildIndex` awaits an
+embedding-provider call per record across every observation in the corpus.
+
+### Why the manifest is read by key name and not grepped
+
+`src/state/index-persistence.ts` stores the gc ledger under `` `${manifestKey}:gc` ``
+in `KV.bm25Index`, which is the manifest's own scope, and the engine writes one
+file per scope. So `mem%3Aindex%3Abm25.bin` (44,092 bytes on the 09-05 store)
+holds the BM25 manifest, the vector manifest, and both ledgers, and the ledgers
+name every orphan alongside the live one. A grep of that file for a generation id
+refuses exactly the generations this flag exists to move.
+
+The reader takes `data:manifest` and `vectors:manifest` by key name and reads
+`generation` from each.
+
+### The on-disk scope format the reader assumes
+
+The engine writes a scope as
+`rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`: the scope's JSON
+object as raw bytes from offset 0, then a short rkyv trailer. So the JSON body is
+`data[0 .. rfind("}") + 1]`, except that the trailer encodes the body length and
+one of its bytes can itself be `0x7d`. The reader takes the last `}` and, on a
+parse failure, retries from the one before it while the candidate stays within
+the last 12 bytes, which is the whole trailer.
+
+The derivation was first written up in the graph memory redesign plan's Appendix,
+verified there against both graph scope files to within one byte. It is restated
+here because that plan document is committed on no branch, and a citation to an
+uncommitted file is not a citation.
+
+A value under a manifest key is read as an object or as a JSON-encoded string,
+because which one the engine writes is not pinned by a type in this repo. Both
+are handled and both are tested.
+
+**Ceiling.** The last-`}` scan is the only place in this repo coupled to the
+engine's on-disk scope format. Grepping `src/`, `test/`, and `scripts/` for a
+raw scope-file read returns this change and nothing else. The scan is not exact:
+the trailer encodes the body length, so one of its bytes can be `0x7d`, and the
+reader tolerates that by retrying from the previous `}` within the last 12
+bytes. That covers the trailer as it ships. An engine upgrade that changes the
+trailer still breaks the reader in the fail-closed direction, so the cost is a
+skipped retire and not a lost index. The entrypoint carries a `ponytail:` marker
+naming that ceiling.
+
+---
+
+## review round 2 fixes
+
+Two round-2 reviews ran against `cf1c7ff`: a code review (lens A) and a ponytail
+review (lens B). Neither found a P0 or a P1. Lens A raised one P2 (a PR-body
+defect) and three P3. Lens B named three cuts. Both keep lists were settled and
+are not re-opened. This section records what landed.
+
+### The commits
+
+| commit | what |
+|---|---|
+| `7f2c10a` | `refactor(retire)` collapse the destination branch to a default expansion (lens B cut 1) |
+| `2e0335f` | `test(retire)` drop the `containing` fixture; pin the helper's own behaviour (lens B cut 2 + lens A P3-1) |
+| `6b710cd` | `docs(retire)` trim the two-message comment; correct the process count (lens B cut 3 + lens A P3-3) |
+| `cdf6b46` | `docs(retire)` repair the three cross-references (lens A P3-2) |
+| `e85f68c` | `docs(retire)` PR body: disclose the shared-helper change, name the deployed commit (lens A P2-1) |
+| `bcdb75b` | `docs(retire)` say what the doc-pointer assertion needs from a new pointer (comment only) |
+
+`bcdb75b` is the last commit that touches a file under `deploy/` or `test/`, and
+it changes a comment. Everything after it is documentation.
+
+### The destination collapse does not spawn a date in batch mode
+
+Lens B's cut 1 replaces a five-line `if` with
+`_dest="${_retire_dest:-$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)}"`. The
+doubt worth measuring is whether `$(date)` still stays unspawned when the caller
+sets a destination. A counting stub on `PATH` appended a line per spawn. Both
+forms, three states, three shells, 18 rows, all agreeing:
+
+```
+form=old mode=batch dest=/preset                        date_spawns=0
+form=new mode=batch dest=/preset                        date_spawns=0
+form=old mode=empty dest=/data/retired/20260906T000000Z date_spawns=1
+form=new mode=empty dest=/data/retired/20260906T000000Z date_spawns=1
+form=old mode=solo  dest=/data/retired/20260906T000000Z date_spawns=1
+form=new mode=solo  dest=/data/retired/20260906T000000Z date_spawns=1
+```
+
+Identical under `/bin/sh`, `/bin/dash`, and `/bin/bash`. The `empty` row is the
+one that could have differed: `:-` treats null and unset alike, and so did the
+`[ -n "${_retire_dest:-}" ]` test it replaces. The solo rows are the positive
+control; without them a broken counter reads the same as a proven claim, which
+is what the first run of this stub did.
+
+### Fail-first for the new helper test
+
+Lens A's P3-1 is that nothing on this branch tested what `1bd6aee` did to
+`retire_matching_file`. The two new tests run against `a12dbdc` (`cf1c7ff~6`),
+where the helper has no batch branch. The batch-mode test dies there:
+
+```
+ FAIL  test/deploy-entrypoint-index-retire.test.ts > the shared retire helper
+       keeps both of its modes > sets _retire_dest: one directory for the run,
+       counted not echoed
+AssertionError: expected 'agentmemory: retired mem%3Aindex%3Abm…' not to match
+                /retired mem%3Aindex/
+
++ Received:
+"agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtj0pzb2_73ee689c0219%3A00000.bin,      300 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtlwdg4b_4d6f0fb52cfe%3A00000.bin,      301 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtnp1c9s_3698dd9cd6e0%3A00000.bin,      304 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtohwasy_5555cccc6666%3A00000.bin,      302 bytes, to …/retired/20260906T071726Z
+agentmemory: retired mem%3Aindex%3Abm25%3Abm25%3Aidx_mtorf55a_7777dddd8888%3A00000.bin,      303 bytes, to …/retired/20260906T071726Z
+"
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 9 skipped (11)
+```
+
+Read the destination on those five lines. They share one stamp, so the
+`toHaveLength(1)` assertion passes at `a12dbdc` too: that loop did not cross a
+second, and a single destination was incidental there rather than guaranteed.
+The echo assertion is the discriminating one. The pair is what pins the if/else.
+
+The unset-mode test passes at `a12dbdc`, and at `878174f`, on purpose. It pins
+the shipped path the two audit callers take, which this branch must not change,
+so its evidence is a mutation and not a fail-first.
+
+Whole file against unmodified `878174f`: **7 of 11 fail**. The four that pass are
+the positive control, the two guard tests (vacuously, nothing moves), and the
+unset-mode helper test.
+
+### Mutations
+
+Baseline is 17 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation was applied to all four
+entrypoint copies unless noted.
+
+| mutation | round 1 | round 2 review | after these fixes |
+|---|---|---|---|
+| live filter never matches | 3 fail | 3 fail | **4 fail** |
+| both fail-closed guards removed | 2 fail | 2 fail | 2 fail |
+| shared helper clobbers `_sep` | 3 fail | 3 fail | **4 fail** |
+| `\|` delimiters removed | 0, survived | 1 fail | 1 fail |
+| per-file log `echo` replaced with `:` | not run | **0 fail, full suite green** | **1 fail** |
+| batch destination scattered one file per directory | not run | **0 fail** | **1 fail** |
+| doc pointer rewritten to a path that does not exist | not run | **0 fail, 5 drift green** | **1 fail of 6 drift** |
+
+The delimiter row is the one that could have regressed. Dropping the `containing`
+fixture did not weaken it: `contained` carried that mutation on its own, which is
+why `containing` was cut.
+
+The echo row is the strongest number here, because it is a before and after on
+one measurement. Lens A ran that mutation against the **entire suite** and got
+182 files and 1993 tests green. Re-run against the entire suite now:
+
+```
+FAIL  test/deploy-entrypoint-index-retire.test.ts > the shared retire helper
+      keeps both of its modes > leaves _retire_dest unset: own stamp directory,
+      one line per file
+ Test Files  1 failed | 181 passed | 1 skipped (183)
+      Tests  1 failed | 1995 passed | 1 skipped (1997)
+```
+
+### Gates, measured at `bcdb75b` in the branch worktree
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. Duration 12.12 s. Exit 0. |
+| `npx tsc --noEmit` | 29 errors on both sides. `diff` of the two sorted error lists against a detached `878174f` worktree is **empty**. Exit 2 on both, which is the pre-existing baseline. |
+| `npm run build` | Exit 0. 20 files, 3.17 MB, 4108 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays
+excluded. No flake appeared on this host. All three were run again at `bcdb75b`
+after the earlier run at `cdf6b46`, and agreed. The documentation commits after
+`bcdb75b` cannot move them, because the only test that reads anything under
+`docs/` reads a path and not a file's contents.
+
+The four entrypoints are byte-identical over the whole retire region, lines 93 to
+225, `shasum` `9e1e9bd1bb4d` on each.
+
+### The three cross-references, and what each became
+
+- **Rewritten.** `test/deploy-entrypoint-index-retire.test.ts` named
+  `retire_scope`, which is the experiment branches' helper and does not exist
+  here. It now names `retire_matching_file`, matching the entrypoint paragraph
+  that was already corrected in round 1.
+- **Removed.** The citation of
+  `docs/plans/2026-09-06-001-graph-memory-redesign-plan.md` at the on-disk format
+  derivation. That file is committed on no branch. The byte check it carried is
+  now stated in place as the measurement it is. This makes the section consistent
+  with what "The on-disk scope format the reader assumes" already says further
+  down: a citation to an uncommitted file is not a citation.
+- **Kept and guarded.** The entrypoints' pointer to this document resolves, and
+  nothing kept it resolving, because `deploy-entrypoint-drift` normalises through
+  `code()` and drops every `#` line. One assertion there now sweeps every
+  `docs/**.md` path in all four copies and fails on any that does not resolve. It
+  reports the path it lost rather than a bare `false`.
+
+### Left alone, so a round 3 does not re-raise them
+
+- **The `ponytail:` marker at `deploy/*/entrypoint.sh` ships.** Round 1's PR gate
+  asked for confirmation that none did. One does, added on the round-1 ponytail
+  review's own recommendation, and it names a real ceiling. `src/functions/session-sweep.ts`
+  carries one and is already on `origin/production`, so it matches the target
+  branch's convention. This holds because the PR targets `origin/production`. For
+  an upstream maintainer the persona label would mean nothing and the same
+  content should be plain prose.
+- **The recursive ownership call is still one per moved file** inside the loop,
+  where `retire_stream_files` makes the same call once after its loop. Lens B
+  measured the cost: about 148 forks and roughly 11,000 inode touches, once, on
+  the boot that drains the backlog. It is not a regression, because the per-call
+  date stamp already shared a directory in the common case. It is a separate
+  logical change and is not in this branch.
+- **`GRAPH_SCOPES_RETIRE_AT_BOOT` in the gate comment** names a flag this branch
+  does not have. Kept deliberately so the block stays byte-identical with the
+  branch it was measured on, and disclosed in the PR body's limitations. After
+  the `retire_scope` fix above, the body's count of "one comment" is exact.
+- **Three `src/` paths at "What the rebase had to change"** sit inside a
+  `git ls-tree` transcript whose output is `(empty)`. Their absence is the point.
+- **`test/deploy-entrypoint-scope-retire.test.ts` in the fail-first record** is
+  the name the test file had when that run was made.
+- **The `containing` fixture is gone, and one delimiter spelling stays
+  unpinned.** `contained` kills the both-delimiters-dropped and
+  leading-delimiter-dropped mutations. Dropping only the *trailing* delimiter
+  (`*"$_gen|"*`) is killed by neither fixture, before this change or after it, as
+  lens B's own table shows. Lens B offered a swap that would close it, the live
+  id minus its *first* character, explicitly as optional. It is a swap rather
+  than a cut, so it was not taken.
+- **The two diagnostics JSON files this document cites** are under
+  `docs/investigations/`, which is excluded from git here, so they resolve
+  locally and not for a reader of the branch. That is pre-existing, it applies to
+  the PR body as well, and neither round-2 lens raised it.
+
+## review round 3 fixes
+
+Round 3 ran two lenses over `66e5996`. Lens B (ponytail, ULTRA) returned SHIP
+AFTER 3 CUTS, worth -13 lines. Lens A (code review) returned 0 P0, 0 P1, 0 P2,
+and 3 P3, all of them numbers in the two committed docs. Both reports are
+untracked, as the round-1 and round-2 reports are:
+`docs/investigations/2026-09-06-retire-idx-ponytail-review-r3.md` and
+`-code-review-r3.md`.
+
+### Commits
+
+| commit | lens | what |
+|---|---|---|
+| `403d13a` | B cut 1 | helper contract comment, six lines to four, all four entrypoints |
+| `37cfbaf` | B cuts 2 and 3 | duplicated summary-line assertion, and a comment the check cannot honour |
+| `f67bec4` | A P3-1, P3-2, P3-3 | three counts corrected across the two docs and one test comment |
+| `a6fe99c` | consequence of `37cfbaf` | two PR-body mutation counts re-trued, and the follow-up count replaced by its boundary |
+
+Follow-ups after `a12dbdc` at this head: **19**, by
+`git rev-list --count a12dbdc..HEAD`.
+
+### The three cuts
+
+**Cut 1, `403d13a`.** The comment above `retire_matching_file()` still ended by
+restating what the call site says with its reasons attached, because `7f2c10a`
+removed the `if` those two-and-a-half lines described and left them standing. The
+sentence now ends one clause early. This is comment, which `code()` normalises
+away, so `deploy-entrypoint-drift` cannot see it applied to three copies out of
+four. It was applied by hand to all four and re-checked by hash.
+
+**Cut 2, in `37cfbaf`.** The batch-mode helper test asserted the summary-line
+template character for character identically to "moves the five dead generations
+and leaves the live one", under the same setup. The two assertions above it, the
+one-stamp-directory count and the no-per-file-echo regex, are what make the batch
+test discriminating and they stay.
+
+**Cut 3, in `37cfbaf`.** The doc-pointer guard's comment claimed the target has to
+be committed rather than merely present. The check below it is `existsSync`,
+which reads the working tree, so nothing enforces that. The three lines above it
+stay.
+
+Lens A read the same two lines and called them accurate, as a requirement on the
+author rather than a claim about `existsSync`. The two readings do not conflict on
+the fact, only on whether a test comment should carry a requirement its test
+cannot check. Lens B's reading was taken. The requirement itself is not lost: it
+is stated here, and `docs/` being in `.git/info/exclude` means a new pointer's
+target is untracked and does not appear in `git status`, so an author adding one
+has to `git add -f` it.
+
+### The three counts
+
+**P3-1, "six copies of the prose" is five.** Measured at `a12dbdc` with
+`git grep -l` on three different phrases from the duplicated paragraph:
+
+```
+git grep -l '1,104 MiB'      a12dbdc  -> 4 entrypoints + index test = 5
+git grep -l '847 MiB'        a12dbdc  -> 4 entrypoints + index test = 5
+git grep -l 'rkyv::to_bytes' a12dbdc  -> 4 entrypoints + index test = 5
+```
+
+Four sites carried the claim and one of them is shipped test code. Where the
+claim is about carriers it now says five and names the index test as the fifth.
+Where it is about the entrypoints alone, which is the PR body's drift paragraph
+and the drift test's own comment, it says four. `git grep 'six copies'` over the
+tracked files returns nothing.
+
+**P3-2, the evidence window.** The paragraph said "six follow-up commits" when ten
+existed at the moment it was authored, and it anchored every sandbox number to
+`1d6891d`, which is not reachable from this branch. It now names `a12dbdc` as
+`1d6891d`'s rebased equivalent and the first commit of this PR, gives the
+02:58:06Z boot the numbers were read at, and points at `git diff a12dbdc..HEAD`
+so the byte-identity claim can be checked rather than trusted.
+
+`f67bec4` first replaced the count with "eighteen", predicting the head after one
+more commit. That prediction was never true at any head, which is the fourth time
+this integer has been wrong, so `a6fe99c` removed it and gave the boundary and the
+listing command instead. The measured count lives here, above, where a
+point-in-time number belongs.
+
+**P3-3, the rebase doc's own two errors.** The `### Limitations` block still
+listed `_gbase`, which `f527c4d` deleted. `git grep _gbase` at head returns
+exactly that one line. The block is a point-in-time record of `1d6891d`, so it
+keeps its bullets and gains an as-of marker naming those that read as durable
+claims about the code and are not. `f67bec4` named three, and round 4 found a
+fourth.
+
+The byte-identity sentence paired `shasum` `9e1e9bd1bb4d` with lines 95 to 228.
+That hash is lines 95 to 227 at `66e5996`, and 228 was `cat > "$III_CONFIG"`,
+outside the retire region. Cut 1 moved the region up two lines, so the sentence
+now reads lines 93 to 225 at `9e1e9bd1bb4d`. `f67bec4` moved only the end line,
+and round 4 moved the start.
+
+### What the cuts moved, and was re-trued
+
+Cut 2 removed the batch test's only reader of the two mutations that break
+selection, so both fall from 4 dying tests to 3. Every mutation still dies, and
+nothing was killed only by the deleted line, which is why the cut was sound. The
+two PR-body rows were corrected in `a6fe99c`. The round-2 mutation table above is
+a point-in-time record of that round and keeps its numbers.
+
+Cut 2 does not touch the fail-first record. Re-run at `878174f` with the branch's
+test file copied into an otherwise pristine worktree: **7 of 11 fail**, and the
+four that pass are the same four the PR body names, read from `--reporter=verbose`
+output rather than inferred.
+
+### The item priced and not taken
+
+Lens B priced folding the batch-mode test into the `L185` test at about -13 more
+lines and excluded it from its own count, calling it a consolidation of code that
+should exist rather than dead weight. It was not taken. It would drop the index
+test file from 11 tests to 10, which stales the fail-first record above, the named
+test in the transcript, and the mutation table's attribution for the batch row.
+
+### Mutations, re-run at `f67bec4`
+
+Baseline 17 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four
+entrypoint copies. Harness and per-run output in the round-3 scratchpad.
+
+| mutation | after round-2 fixes | after round-3 fixes | test that dies |
+|---|---|---|---|
+| live filter never matches | 4 fail | **3 fail** | moves-five, JSON-encoded values, substring neighbour |
+| both fail-closed guards removed | 2 fail | 2 fail | absent manifest, unparseable manifest |
+| shared helper clobbers `_sep` | 4 fail | **3 fail** | the same three |
+| `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| batch destination scattered one file per directory | 1 fail | 1 fail | helper batch mode |
+| doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+
+No mutation survives.
+
+### Gates, measured at `f67bec4` in a detached worktree
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. **Exit 0.** No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, which is the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 3706 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays
+excluded. The gates were run at `f67bec4`. `a6fe99c` and this section are
+documentation, and the only test that reads anything under `docs/` reads a path
+and not a file's contents.
+
+The four entrypoints are byte-identical over the whole retire region after cut 1,
+measured on each of the four rather than on one and inferred: lines 93 to 225,
+`shasum` `9e1e9bd1bb4d` on railway, fly, render, and coolify. The helper's
+comment block plus the retire region, lines 89 to 225, agrees the same way at
+`5d9bb326252f`.
+
+## review round 4 fixes
+
+Round 4 ran two lenses over `06e0f98`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 6 P3, grouped into three fixes. Fix A was two numbers in this doc,
+both regressions from `f67bec4`. Fix B was two test hardenings against
+mutations the seven in the round-3 table do not cover. Fix C was an inverted
+test comment and an undisclosed per-family fail-open. Lens B (ponytail)
+returned SHIP AFTER 1 CUT, worth -12 lines, and the cut was declined.
+
+Only Fix A was implemented in this round. The round-4 report grew after the
+implementation spec was cut from a draft of it, so Fix B and Fix C were never
+dispatched. Round 5 caught that as R5-1, and both landed there: Fix B is
+`95c1021` and Fix C is `7ee0d10`, recorded under "review round 5 fixes" below.
+Both round-4 reports were untracked, as the round-1 to round-3 reports are, and
+were lost with the scratchpad worktree when the host rebooted on 2026-09-06.
+
+### Commits
+
+| commit | lens | what |
+|---|---|---|
+| `ea76542` | A Fix A (P3-1, P3-2) | the retire-region range at three sites, and the as-of marker's stale-bullet count |
+
+### The two findings of Fix A
+
+**P3-1, the retire-region range.** `f67bec4` re-trued the byte-identity sentence
+after cut 1 by moving the end line from 227 to 225 and leaving the start at 95.
+Cut 1 moved both ends. Measured at `06e0f98` on all four entrypoint copies rather
+than on one and inferred: `retire_matching_file() {` opens at line 93, the blank
+line that closes the region is 225, and `cat > "$III_CONFIG" <<'EOF'` is 226.
+
+| span | `shasum` | what it is |
+|---|---|---|
+| 93 to 225 | `9e1e9bd1bb4d` | the retire region, identical on all four copies |
+| 95 to 225 | `13cb38b03420` | the span this doc documented, real but starting two statements into the helper body |
+| 89 to 225 | `5d9bb326252f` | the helper's comment block plus the region, identical on all four copies |
+| 89 to 224 | `e6957b99a290` | the superset this doc documented, ending one line before its own subset ended |
+
+Every error across the four rounds was in the span label and none was in the
+measurement. `9e1e9bd1bb4d` is and always was the region's hash, which is why the
+round-3 record above carries it against "lines 95 to 228" and the corrected sites
+now carry it against 93 to 225.
+
+**P3-2, the as-of marker's count.** Round 3's P3-3 named three bullets that read
+as durable claims about the code and are not: the reader, the skip log, and
+`npm test`. The marker `f67bec4` wrote enumerates the skip log, `_gbase`, and
+`npm test`, substituting `_gbase` for the reader while holding the total at
+three. The union of the two lists is four. The reader bullet is the fourth, and
+the 02:58:06Z sandbox deployment answers it. Retiring five dead BM25 generations
+while keeping the live one is only possible if the reader parsed a real
+engine-written manifest and resolved live from dead correctly.
+
+### The cut priced and declined
+
+Lens B priced `test/deploy-entrypoint-index-retire.test.ts:103-114` at -12 lines,
+the third carrier of the on-disk filename paragraph. Round 1's cut 4 (`cf1c7ff`)
+kept that paragraph in all five carriers "because the glob is unreadable without
+it". The test file has no glob, so the stated reason does not reach it, and the
+lens called this a judgment call overriding a reasoned keep rather than a defect.
+It was declined. `cf1c7ff`'s ruling stands, and the file builds the same names
+through `shardName` at `:127-128` whether or not the prose sits above it.
+
+### Gates
+
+Both findings are documentation-only and no code changed, so round 4's own
+measurements at `06e0f98` stand: `npm test` at 182 files and 1996 tests passing
+with one of each skipped, exit 0. `npx tsc --noEmit` at 29 errors on head and 29
+on a pristine `878174f`, the two sorted lists identical, exit 2 on both as the
+pre-existing baseline. `npm run build` exit 0. All seven mutations die, and
+fail-first reproduces 7 of 11.
+
+`ea76542` was re-checked against the two entrypoint test files,
+`deploy-entrypoint-index-retire` and `deploy-entrypoint-drift`: **17 tests, 2
+files, all green** in 4.37 s. The four copies still hash `9e1e9bd1bb4d` over
+lines 93 to 225 after the commit, so the documentation change moved no code.
+
+## review round 5 fixes
+
+Round 5 ran two lenses over `14913f5`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 1 P3. R5-1 (P2): round 4's Fix B and Fix C were never implemented,
+because the round-4 report grew after the implementation spec was cut from a
+draft of it, and the spec is what got dispatched. R5-2 (P3): the `### Limitations`
+as-of marker said "Four of them" and the true count is five, the fifth being the
+object-or-string bullet. Lens B's round-4 cut, `test/deploy-entrypoint-index-retire.test.ts:103-114`,
+stays declined for the reason the round-4 record gives.
+
+Both round-5 reports, and both round-4 reports, were untracked and were lost with
+the scratchpad worktree when the host rebooted on 2026-09-06. This record is
+reconstructed from the coordinator's implementation spec, which carried the
+findings and the two uncovered mutations, not from the reports.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `95c1021` | R5-1, Fix B (round-4 P3-3, P3-4) | `date` stubbed to a call counter so the batch stamp is deterministic, and one test for a manifest that parses but names no generation |
+| `7ee0d10` | R5-1, Fix C (round-4 P3-5, P3-6) | the vector-test comment un-inverted, and the per-family fail-open disclosed in the PR body and in `### Limitations` |
+| this commit | R5-2, and the round-4 record | "Four of them" to "Five of them" naming the fifth, the round-4 record retold in full, and every live count the new test moves |
+
+### The two hardenings, and what each kills
+
+**The batch stamp.** The one-stamp assertion in the batch-mode helper test,
+`toHaveLength(1)` on `retired/`, passed a helper that stamped per call whenever
+the five moves fit in one wall-clock second, which is every run on this host.
+Measured in this round: the mutation, line 99's default expansion replaced with
+`_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"`, left the round-4 test
+file at 17 of 17 green. The file now writes a `date` stub on PATH next to
+`chown` and `gosu`, and the stub prints a count of its calls. A run's stamp is
+then the number of stamps the script asked for: one for the unmutated loop, five
+for the per-call helper, and the assertion fails the mutation on every run.
+
+**The reader's empty-list guard.** `if (out.length === 0) process.exit(1);` is
+what makes a manifest that parses but names no generation take the fail-closed
+path. Without it the reader prints `||`, which `[ -z ]` reads as non-empty, and
+the case pattern `*"|$_gen|"*` then matches nothing, so every generation on disk
+reads as dead. Nothing pinned it. One test seeds a manifest holding only the gc
+ledger and asserts the "no live generation read from" skip line and no `retired/`
+directory. It fails at `878174f` too, so fail-first is now 8 of 12 with the same
+four passing.
+
+**Fix C's location.** The per-family fail-open sentence went into the PR body's
+limitations and this doc's `### Limitations`, not into the reader's comment
+block in the four entrypoint copies. That is two edits with nothing to
+re-measure, against four the drift test cannot see, because `code()` drops every
+`#` line, and which would move the 93-to-225 retire region and its hash at every
+site in both docs that carries them. The entrypoints did not change in this
+round: all four still hash `9e1e9bd1bb4d` over lines 93 to 225, measured on each.
+
+### Mutations, re-run at `7ee0d10`
+
+Baseline 18 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four
+entrypoint copies with `perl -pi` and restored with `git checkout -- deploy`
+between runs, in a detached worktree at `14913f5` with the branch's test file
+copied in. The harness and per-run output are in the session scratchpad, which
+does not outlive a reboot, so this table is the record.
+
+| mutation | after round-3 fixes | after round-5 fixes | test that dies |
+|---|---|---|---|
+| m1 live filter never matches | 3 fail | 3 fail | moves-five, JSON-encoded values, substring neighbour |
+| m2 both fail-closed guards removed | 2 fail | **3 fail** | absent manifest, unparseable manifest, names-no-generation |
+| m3 shared helper clobbers `_sep` | 3 fail | 3 fail | the same three as m1 |
+| m4 `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| m5 per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| m6 batch destination scattered one file per directory | 1 fail | 1 fail | helper batch mode |
+| m7 doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+| m8 helper stamps per call instead of once for the run | **0 fail, survived** | **1 fail** | helper batch mode |
+| m9 reader's `out.length === 0` guard deleted | **0 fail, survived** | **1 fail** | names-no-generation |
+
+No mutation survives. The two "survived" cells were measured in this round
+against the round-4 test file, not read from the lost report. m6 and m8 differ in
+one thing: m6 appends the filename to the stamp, so it scatters on every run under
+any clock, and m8 is the same expansion without the suffix, so it scatters only
+when the clock ticks between calls.
+
+### Gates, measured at `7ee0d10`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1997 passed, 1 skipped (1998)**. **Exit 0.** The +1 is the new test. No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 4014 ms. |
+
+Fail-first, the branch's test file copied into the pristine `878174f` worktree:
+**8 of 12 fail**, read from `--reporter=verbose`. The four that pass are the
+positive control, the idempotent and flag-unset guards, and the helper's unset
+mode, the same four as every prior round.
+
+### The counts the new test moved
+
+Live counts changed in the PR body: "Eleven tests" and "eight index tests" to
+twelve and nine, "7 of the 11 fail" to 8 of 12, the mutation table's fail-closed
+row from 2 to 3 with two rows added for m8 and m9, and the `npm test` totals from
+1997 and 1996 to 1998 and 1997. The round-2, round-3, and round-4 records above
+are point-in-time measurements at named heads and keep their numbers, as the
+round-3 record says of the round-2 table.
+
+## review round 6 fixes
+
+Round 6 ran two lenses over `77369a3`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 7 P3, grouped into four fixes: F1, the reader failing closed on a
+computable class of manifest body lengths under today's trailer; F2, a
+test-strength gap with a measured surviving mutation; F3 to F6, four doc or
+comment numbers and wordings; and F7, a stale phrase in a comment carried by all
+four entrypoint copies. Lens B (ponytail) returned SHIP AFTER 2 CUTS, worth -12
+lines. All seven findings and both cuts were accepted.
+
+For F1 the bounded retry was taken rather than the disclose-only alternative the
+report priced alongside it. A reader that skips a healthy store on every body
+length congruent to 125 modulo 256, and logs that skip as the on-disk shape
+assumption breaking, is a defect and not a documentation gap, and F7 moves a hash
+in the same round either way.
+
+Both round-6 reports are untracked, as every round's are, because `docs/` sits in
+`.git/info/exclude`.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `9270947` | A F1, Fix A | the reader retries from the previous `}` when a trailer byte is `0x7d`, and one test seeding a colliding body length |
+| `5b59f54` | A F2, Fix B | two assertions anchoring the idempotent test and pinning the no-directory contract |
+| `3f15d23` | B C1 | `stubDate` folded into `stub(name, body)`, with the bytes written unchanged |
+| `6e13296` | A F7, Fix D | "and graph" dropped from the helper contract comment in all four copies |
+| `eee66c3` | A F3 to F6, Fix C | a live test count, the `needsRebuild` citation at two sites, a stamp width, and the "silent no-op" wording |
+| `e596d00` | B C2 | the two round-5 rows dropped from the round-4 commits table |
+| `b3ded01` | the record | this section, the region ranges and hashes, and every live count the new test moves |
+| `16bf3fd` | a follow-up | the PR body called m11 a measured survivor; the retry is code this round added, so it is a new row and not a survivor |
+| this commit | a follow-up | `16bf3fd` shifted the PR body, staling one citation in this record; the site list below also now names the range-only carriers |
+
+`9270947` was reworded after `e596d00` landed, by an autosquash rebase that
+renumbered the five commits above it. The content diff against `77369a3` is
+byte-identical across that rewrite, checked by diffing it before and after.
+
+### F1's mechanism
+
+The engine frames a scope as the JSON body from offset 0, zero padding to a
+4-byte boundary, then rkyv's 8-byte string root holding the body length as a
+little-endian `u32` and a negative relative pointer, so the trailer encodes the
+length and one of its bytes can itself be `0x7d`. Computed over every body length
+from 1 to 70,000 with that layout, `lastIndexOf(0x7d)` lands in the trailer for
+**every length congruent to 125 modulo 256**, plus the two bands **32,000 to
+32,255** (the length's second byte) and **33,281 to 33,536** (the pointer's second
+byte): 783 of 70,000, and 1 in 256 outside the bands.
+
+The reader now retries from the previous `}` while the candidate index stays at
+or above `raw.length - 12`. The trailer is at most 11 bytes, 3 of padding plus the
+8-byte root, so the body's closing brace is always inside that window and the
+retry is bounded by construction rather than by a loop limit. The report's
+refutation of the correctness lens's "congruent to 131 modulo 256" class holds
+here too: the pointer is a multiple of 4 and `0x7d` is odd.
+
+The test seeds a 1405-byte body, congruent to 125 modulo 256, which frames to 1416
+bytes with the body's brace at 1404 and a trailer `0x7d` at 1408. That is the
+tightest case in the class, because `raw.length - 12` is 1404, exactly the body's
+brace, so the fixture pins the bound rather than clearing it. Driven through the
+real entrypoint at `77369a3` that fixture logged `index generation retire skipped,
+no live generation read from mem%3Aindex%3Abm25.bin` and moved nothing; after the
+fix the same fixture retired 5 shards and 1500 bytes.
+
+The reader's comment block was trued in the same commit. `:174-175` reads a
+present-but-unreadable manifest as the on-disk shape assumption breaking, which
+the retry is what makes true, and `:176-177` now says so.
+
+### The region ranges and hashes
+
+Fix A added 9 lines inside the retire region and Fix D changed one line above it,
+so both spans move. Measured on each of the four copies rather than on one and
+inferred:
+
+| span | `shasum` | what it is |
+|---|---|---|
+| 93 to 234 | `f23ea18a0733` | the retire region, identical on all four copies |
+| 89 to 234 | `be42b04fd45f` | the helper's comment block plus the region, identical on all four copies |
+
+`retire_matching_file() {` still opens at 93, the blank line that closes the region
+is 234, and `cat > "$III_CONFIG" <<'EOF'` is 235.
+
+Every site was checked against the discriminator this doc already uses: a
+sentence that names a head is a point-in-time record and keeps its numbers, and a
+sentence that says "at head" with no anchor is a live claim and gets trued. The
+sweep matched the two hashes and the bare boundary numbers separately, because
+three sites carry a range with no hash on the same line and one splits its range
+across a line break. All of them name a head, so none moves:
+
+- `:833-834`, in the round-2 record, which `:819` and `:830` anchor to `bcdb75b`.
+- `:975-976` and `:978`, in the round-3 record, describing what `f67bec4`
+  corrected and what `66e5996` covered.
+- `:1034-1035` and `:1036-1037`, the round-3 gates, which `:1020` and `:1029`
+  anchor to `f67bec4`.
+- `:1064`, `:1071` to `:1074`, and `:1077-1079`, the round-4 P3-1 prose and span
+  table, which `:1065` anchors to `06e0f98`.
+- `:1111-1112`, the round-4 re-check, which `:1109` anchors to `ea76542`.
+- `:1164`, the round-5 statement that the entrypoints did not change in that
+  round, which `:1193` anchors to `7ee0d10`.
+
+The PR body carries neither hash. So the new pair lives only in the table above.
+
+That declines F7's cost line, which said the `5d9bb326252f` sites at the round-3
+gates and the round-4 span table move. Both record a measurement that was correct
+at the head it names, and the convention that keeps them is the one the end of the
+round-5 record states. Nothing there is a claim about the current head.
+
+### Mutations, re-run at `e596d00`
+
+Baseline 19 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four entrypoint
+copies with `git diff --numstat` confirming 4 files changed each time, both files
+run with `--reporter=verbose`, the copies restored with `git checkout -- deploy`
+and the tree checked clean before the next. Run in a detached worktree at
+`e596d00`, so the branch worktree was never mutated.
+
+| mutation | round 5 | round 6 | test that dies |
+|---|---|---|---|
+| m1 live filter never matches | 3 fail | **5 fail** | moves-five, JSON-encoded values, substring neighbour, idempotent, rkyv trailer |
+| m2 both fail-closed guards removed | 3 fail | 3 fail | absent manifest, unparseable manifest, names-no-generation |
+| m3 shared helper clobbers `_sep` | 3 fail | **5 fail** | the same five as m1 |
+| m4 `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| m5 per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| m6 batch destination scattered one file per directory | 1 fail | **2 fail** | helper batch mode, idempotent |
+| m7 doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+| m8 helper stamps per call instead of once for the run | 1 fail | **2 fail** | helper batch mode, idempotent |
+| m9 reader's `out.length === 0` guard deleted | 1 fail | 1 fail | names-no-generation |
+| m10 eager `mkdir` after the stamp line | **0 fail, survived** | **1 fail** | idempotent |
+| m11 the trailer retry removed | not run | **1 fail** | rkyv trailer |
+
+No mutation survives. m10 is the round-6 report's m10a. It was measured surviving
+19 of 19 against the test file before Fix B and dies after it, which is the
+measurement F2 rests on.
+
+m11 kills exactly one test and no other, which is the check that the retry changed
+no existing path. Every other fixture writes the four-byte stand-in trailer, which
+holds no `0x7d`, so the first `lastIndexOf` already lands on the body's brace and
+the retry never fires.
+
+The four strengthened rows are Fix A's and Fix B's doing rather than new
+mutations. The new trailer test and the now-anchored idempotent test both die
+under m1 and m3, and the idempotent test's directory-count assertion also catches
+m6 and m8.
+
+One harness correction, recorded because the first run of it read as a survivor.
+m6 was first encoded as `"${_retire_dest:-…}/$_name"`, which appends the filename
+outside the `:-` default and therefore nests one directory per file under the
+single stamp, leaving both `retiredFiles()` and the stamp count unchanged: 19 of
+19 green. That is not the mutation the round-5 record describes, which replaces
+the whole expansion and appends the name to the stamp itself, so each file gets
+its own stamp directory. Re-encoded that way it dies, 2 of 19. The survivor was
+the harness, not the tests.
+
+### Gates, measured at `e596d00`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1998 passed, 1 skipped (1999)**. **Exit 0.** The +1 is Fix A's test. No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 6567 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays excluded.
+
+Fail-first, the branch's test file copied into a pristine `878174f` worktree:
+**10 of 13 fail**, read from `--reporter=verbose`. Three pass: the positive
+control, the flag-unset guard, and the helper's unset mode.
+
+The idempotent guard moved from the passing side to the failing side, and prior
+rounds had four passing rather than three for that reason. At `878174f` nothing is
+retired, so `after` is empty and Fix B's `toEqual(deadFiles().sort())` fails there.
+That flip is a second measurement that Fix B added a real anchor, independent of
+m10: the old test passed at a head where the feature does not exist.
+
+### The counts the new tests moved
+
+Fix A adds one test and Fix B adds two assertions to an existing one, so the file
+goes from twelve tests to thirteen and from nine index tests to ten. Live counts
+changed in the PR body: "Twelve tests" and "nine index tests" to thirteen and ten
+at `:191`, "8 of the 12 fail" to 10 of 13 and "Four pass" to "Three pass" at
+`:198-201`, two mutation rows added at `:217-218` with the paragraph below them
+retold at `:220-226`, and the `npm test` totals from 1998 and 1997 to 1999 and
+1998 at `:243`.
+
+Three prose sites now say the reader tolerates a `0x7d` inside the trailer: the PR
+body's format bullet at `:31-44`, this doc's format section at `:679-683`, and its
+ceiling paragraph at `:694-702`. The ceiling had read as if the last-`}` scan were
+exact, which round 2 settled only for the case of an engine upgrade changing the
+trailer. This is the trailer as it ships, so it narrows that paragraph rather than
+re-raising it.
+
+`eee66c3` had already trued the as-of marker's live count at `:589`, and it carries
+1998 rather than the 1997 the round-6 report named at `77369a3`, because Fix A's
+test had landed by the time that commit was written. Writing 1997 there would have
+reproduced the finding it fixes.
+
+The round-2 through round-5 records above are point-in-time measurements at named
+heads and keep their numbers, as the round-3 record says of the round-2 table.
+
+## review round 7 fixes
+
+Round 7 ran two lenses over `53f3b8c`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 2 P3, collapsing to one fix. Lens B (ponytail) returned SHIP AS-IS, with
+nothing to cut. Both findings were accepted. Both are stale numbers in the PR body
+that round 6's own code changes moved and round 6's propagation pass did not carry
+across. The shipped code, the tests, and this document are clean at that head, and
+each round-6 fix was re-verified by measurement rather than by reading the record.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `0171f63` | A R7-1 and R7-2, Fix A | one sentence and four table cells in the PR body, plus a paragraph naming why the four moved |
+| `3a8032f` | the record | this section |
+| `79eedab` | a follow-up | the paragraph `0171f63` added named four mutations against two tests without pairing them, so it read as the trailer test dying under the two batch mutations as well |
+| `bf47916` | the record | the row above |
+| this commit | the record | the line-shift section at the end, and this row |
+
+### The two findings
+
+**R7-1.** The PR body at `53f3b8c:109-113` said the selection logic, naming the
+manifest read among its three parts, is byte-identical from `1d6891d` to the
+current head. Fix A rewrote the body of `index_live_generations`, which is that
+read. Extracted from `a12dbdc` and from head, the two are not equal. The sentence
+names no head of its own, so it is a live claim under the discriminator this doc
+states at `:1296-1298`.
+
+The conclusion survives and no re-measurement is owed. The new reader tries the
+same index the old one tried and breaks on success, so it parses everything the
+old one parsed, and the 02:58:06Z numbers still describe the merged code. Only the
+stated ground failed, so the fix is wording.
+
+**R7-2.** Four rows of the PR body's mutation table at `53f3b8c:208-215` read 3, 3,
+1, and 1 where the round-6 table at `:1330-1342` reads 5, 5, 2, and 2. Round 6
+measured all four moves, recorded them here, and explained them at `:1353-1356`.
+Its propagation pass at `:1387-1395` then added the two new rows and retold the
+paragraph below them without truing these four cells. The direction is
+understatement, so the tests are stronger than the maintainer-facing table claimed.
+
+Both findings are the same class. Round 6 carried its code changes into this
+document but not into the PR body, which is the one artifact `pr-governance.md`
+requires the measured proof to live in.
+
+### Gates, measured at `53f3b8c`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1998 passed, 1 skipped (1999)**. **Exit 0.** No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 10481 ms. |
+
+Fail-first, the branch's index test file copied into a pristine `878174f`
+worktree: **10 of 13 fail**. The three that pass are the positive control, the
+flag-unset guard, and the helper's unset mode.
+
+### Mutations, re-run at `53f3b8c`
+
+m1 to m11 reproduce the round-6 table row for row, attribution included, and none
+survives. Two bound probes no prior round ran were added:
+
+| mutation | round 7 | test that dies |
+|---|---|---|
+| m12 retry bound tightened to `raw.length - 11` | **1 fail of 19** | rkyv trailer |
+| m13 retry bound removed entirely | **survives 19 of 19** | none |
+
+m12 shows the fixture pins the bound rather than clearing it. m13's survival is a
+settled residual and not a test gap. No strict prefix of a JSON object text ending
+at `}` is itself valid JSON, so an unbounded walk back finds the true body brace or
+nothing on any shape the engine writes. The bound is a cost guard, and a defence
+against a file holding a complete earlier JSON object followed by junk, which
+nothing in this repo writes. Pinning it from the loose side needs a contrived
+fixture that asserts nothing about the shipped path, and the tight side is pinned
+by m12.
+
+### The lines this round moved
+
+`0171f63` added one line above PR body `:113` and six below `:234`. Every PR-body
+citation in the round-6 record at `:1392-1395` therefore shifts: `:191`,
+`:198-201`, `:217-218`, and `:220-226` by one, and `:243` by seven. None of them
+is trued. They sit inside the round-6 record, which names `77369a3` and `e596d00`,
+so they are point-in-time and keep their numbers. The sentence at `:1409-1410`
+states that convention for the round-2 through round-5 records and does not name
+round 6, because round 6 wrote it. This round extends it to round 6 on the same
+ground.
+
+The PR body carries no line citation of its own, so nothing else moved. The
+round-7 citations above anchor their PR-body references to `53f3b8c` for this
+reason.
+
+## review round 8 fixes
+
+Round 8 ran one lens over `6b476c4`. Lens A (code review) returned 0 P0, 0 P1, 0
+P2, and 1 P3, collapsing to one fix, which was accepted. Lens B did not run: the
+delta since `53f3b8c` is docs-only, and lens B passed `53f3b8c` SHIP AS-IS. The
+finding predates `53f3b8c` and every round from 3 to 7 missed it, so it is not
+something the round-7 fixes introduced.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `211582a` | A R8-1, Fix A | one sentence in the Limitations preamble, plus the sweep of that block's other command-naming claims |
+| this commit | the record | this section |
+
+### The finding
+
+**R8-1.** The Limitations preamble said `git grep _gbase` at head returns only the
+bullet below. It returns six lines, all in this file: the sentence's own two
+halves, the bullet, the round-3 record, and two lines of the round-4 record. The
+sentence names no head, so it is a live claim under the discriminator at
+`:1296-1298`, and it was never true at any head, including `f67bec4`, which wrote
+it. Its substance held throughout: no code carries `_gbase`.
+
+The replacement names no command and asserts no number. That is deliberate. The
+sentence sits inside its own grep, so any count it states falsifies itself. The
+edit is line-count neutral, so no citation in this document moved.
+
+The round-7 record at `:1418` says the shipped code, the tests, and this document
+are clean at that head. The code and the tests were. This sentence was not, and no
+round from 3 to 7 examined it. That row keeps its wording as the point-in-time
+record it is, and this section is the correction.
+
+### The Limitations sweep, at `6b476c4`
+
+The sweep round 8 asked for and rounds 3 to 7 never finished: every other sentence
+in the block that names a command and states its output as a live claim, re-run at
+head. Four sites, one changed.
+
+| line | claim | result |
+|---|---|---|
+| `:588` | `git grep _gbase` returns one line | **false**, it returns six. Fixed by `211582a` |
+| `:589` | 182 files and 1998 tests pass, with one file and one test skipped | counts **true**, measured. Greenness is flake-dependent, see the gates below |
+| `:629` | `npm test` is not green on either side | a bullet, as of `1d6891d` by `:579`, so point-in-time. Kept |
+| `:695` | grepping `src/`, `test/`, and `scripts/` for a raw scope-file read returns this change alone | **true**, measured |
+
+### Gates, measured at `6b476c4`
+
+The delta is docs-only, so the gate is the two entrypoint test files.
+`npx vitest run test/deploy-entrypoint-index-retire.test.ts
+test/deploy-entrypoint-drift.test.ts` returns **19 of 19 pass**, exit 0. The
+retire region hashes to the record's pair on all four copies, `f23ea18a0733` for
+93 to 234 and `be42b04fd45f` for 89 to 234, measured with the recorded
+instrument, bare `shasum`, which is SHA-1.
+
+`npm test` was run twice anyway and returned exit 1 both times, one failed file
+each, `test/copilot-plugin.test.ts`, with the victim test rotating. Traced, not
+dismissed: the file passes 16 of 16 in isolation, and a pristine `878174f`
+worktree fails the same file with the same assertion, 2 failed of 1985. Same
+shape both sides, which is what `:553-567` already records for this file. Round
+8's report reached green at this head on its second and third runs, and this host
+reached red twice. Proven equivalent, not proven absent.
+
+### What this round inherited rather than re-measured
+
+The six code and test files are identical between `53f3b8c` and head, so the m1 to
+m13 mutation set and the 10-of-13 fail-first number carry forward on identical
+bytes rather than on the record's word. Neither was re-run.
+
+## review round 9 fixes
+
+Round 9 ran one lens over `1324017`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 0 P3, collapsing to one fix, which was accepted. Lens B did not run:
+the delta since `53f3b8c` is docs-only, and lens B passed `53f3b8c` SHIP AS-IS.
+The six code and test files were hashed against `53f3b8c` rather than inherited
+from the record, and they are identical, so nothing shipped moved.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `279adfd` | A R9-1, Fix A | the gate claim at PR body `:250` and at `:589-590`, plus one PR body Limitations bullet naming the load-sensitive test |
+| this commit | the record | this section |
+
+### The finding
+
+**R9-1.** Both sites said `npm test` passes and neither named a head, so both
+are live claims under the discriminator at `:1296-1298`. Measured at `1324017`
+on an idle machine, the gate returned exit 1 twice out of two, failing only
+`test/copilot-plugin.test.ts`. The counts inside the two sentences are correct
+for a green run, so the fix is a condition clause and not a different number.
+
+It became raisable at this head because `1324017` is the commit that made it a
+contradiction. That commit landed the round-8 gates record at `:1557-1563`,
+which reports the same gate returning exit 1 twice at `6b476c4`, a head whose
+code tree is byte-identical to this one. That record is anchored and keeps its
+numbers, so the two unanchored sentences are what had to move. Rounds 6, 7, and
+8 each re-measured the integer inside `:589` and none examined its verb, and PR
+body `:250` was examined for its counts by round 6 and for greenness by no
+round.
+
+### `test/copilot-plugin.test.ts`, eight runs
+
+| run | worktree | files | load | result |
+|---|---|---|---|---|
+| 1 | `1324017` | 1, isolation | none | 16 of 16 pass |
+| 2 | `878174f` | 1, isolation | none | 16 of 16 pass |
+| 3 | `1324017` | 183, full | none added | exit 1 |
+| 4 | `1324017` | 183, full | none added | exit 1 |
+| 5 | `878174f` | 182, full | none added | exit 0 |
+| 6 | `878174f` | 182, full | none added | exit 0 |
+| 7 | `1324017` | 182, the branch's index test file excluded | none added | exit 0, n=1 |
+| 8 | `878174f` | 182, full | five concurrent runs of that same test file | **exit 1**, same assertion |
+
+Run 8 settles it: the unmodified base, with no branch code in its tree, fails
+the same file with the same assertion once an equivalent load runs beside it.
+The cause is `postWithRetry` in `plugin/scripts/notification.mjs` and
+`plugin/scripts/post-tool-failure.mjs`, which allows each POST 400 ms per
+attempt and returns silently on expiry, so the hook never posts and the
+assertion sees `undefined`. The branch's contribution is scheduling only, and it
+changes no file under `plugin/` or `src/`. The file is not on the known-flaky
+list in `.claude/rules/pr-governance.md`, which is why the PR body now names it
+rather than leaving a maintainer to self-serve the explanation.
+
+### The docs-truth pass, at `1324017`
+
+Every live claim in the PR body and in the Limitations block was re-run rather
+than inherited, including the 10-of-13 fail-first number that round 8 carried on
+identical bytes. All are true except PR body `:250`, which is R9-1. The
+scope-file-read grep at `:695` was measured independently and holds. Every claim
+in the round-8 record checked true, `:1514` to `:1569`, and its count-free
+`_gbase` replacement is still true even though the count it declined to state
+has moved from 6 to 9.
+
+### Gates, measured at `1324017`
+
+The delta since `6b476c4` is this document alone, so the gate is the two
+entrypoint test files. They return **19 of 19 pass**, exit 0. Both retire region
+hashes match the record's pair on all four copies. `npx tsc --noEmit` is 29
+errors at head and 29 at `878174f`, with a 0-byte diff of the two sorted lists.
+`npm run build` exits 0, 20 files, 3.17 MB.
+
+Two instrument notes. `tsc --noEmit` is incremental in this repo, so a second
+consecutive run in the same worktree emits nothing and reads as a false clean;
+both lists were captured with `--incremental false`. And `git diff --stat
+origin/production..HEAD` returned empty output under rtk compaction while the
+same command against the literal SHA returned the eight files, so the round's
+diffs and greps were re-run through `rtk proxy` or with `awk`.
+
+### The lines this round moved
+
+`279adfd` added six lines at PR body `:74`, above every PR-body citation in this
+document, and nine more at its Gates paragraph. It added four lines here, above
+`:629` and `:695`. The citations in the round-6, round-7, and round-8 records
+each name a head, so they are point-in-time and keep their numbers. The two
+sites R9-1 names are as they stood at `1324017`.
+
+## review round 10 fixes
+
+Round 10 ran one lens over `e92bd34`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 2 P3, all docs, fixed in one commit, `587c00d`. The six code and test
+files are byte-identical to `53f3b8c`, hashed rather than inherited, so the code
+has been at zero for four rounds.
+
+**R10-1 (P2).** Three live sites named a store-diagnostics JSON as the source
+of the production figures, and it is reachable from neither this branch nor any
+pushed remote. Round 2 deleted a different citation on the ground that the file
+was committed on no branch.
+
+**R10-2 (P3).** The bullet `279adfd` added placed `test/copilot-plugin.test.ts`
+under `plugin/`. The file is under `test/`.
+
+**R10-3 (P3).** The round-9 record said PR body `:250` had been examined by no
+round. `b3ded01` rewrote its two integers in round 6.
+
+R9-1 is verified fixed: both gate sentences name a head.
+
+Gates at `e92bd34`. The two entrypoint test files return **19 of 19 pass**, exit
+0. Both retire region hashes match on all four copies, `f23ea18a0733` for 93 to
+234 and `be42b04fd45f` for 89 to 234. `npx tsc --noEmit` is 29 errors at head
+and 29 at `878174f`, with a 0-byte diff of the two sorted lists. `npm run build`
+exits 0.

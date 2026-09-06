@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // The four deploy targets ship copies of one entrypoint, not a shared file:
@@ -56,6 +56,18 @@ describe("deploy entrypoint drift", () => {
   it("railway's executable body matches render apart from that one flag", () => {
     const norm = (s: string) => code(s).replace(/enabled: (true|false)/, "enabled: X");
     expect(norm(files.railway)).toBe(norm(files.render));
+  });
+
+  // The entrypoints point at one doc rather than carrying four copies of its
+  // prose. That pointer is a path, and code() strips every `#` line, so the
+  // guard above cannot see it dangle. This can, and it names the path it lost.
+  it("the docs the entrypoints point at exist", () => {
+    const missing = TARGETS.flatMap((t) =>
+      [...files[t].matchAll(/docs\/\S+\.md/g)].map((m) => m[0]),
+    ).filter(
+      (p) => !existsSync(fileURLToPath(new URL(`../${p}`, import.meta.url))),
+    );
+    expect(missing).toEqual([]);
   });
 
   // Fly inserts its own block BEFORE the final exec rather than appending after
