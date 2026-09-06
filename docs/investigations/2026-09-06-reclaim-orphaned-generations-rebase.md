@@ -1425,7 +1425,8 @@ each round-6 fix was re-verified by measurement rather than by reading the recor
 | `0171f63` | A R7-1 and R7-2, Fix A | one sentence and four table cells in the PR body, plus a paragraph naming why the four moved |
 | `3a8032f` | the record | this section |
 | `79eedab` | a follow-up | the paragraph `0171f63` added named four mutations against two tests without pairing them, so it read as the trailer test dying under the two batch mutations as well |
-| this commit | the record | the row above |
+| `bf47916` | the record | the row above |
+| this commit | the record | the line-shift section at the end, and this row |
 
 ### The two findings
 
@@ -1482,3 +1483,18 @@ against a file holding a complete earlier JSON object followed by junk, which
 nothing in this repo writes. Pinning it from the loose side needs a contrived
 fixture that asserts nothing about the shipped path, and the tight side is pinned
 by m12.
+
+### The lines this round moved
+
+`0171f63` added one line above PR body `:113` and six below `:234`. Every PR-body
+citation in the round-6 record at `:1392-1395` therefore shifts: `:191`,
+`:198-201`, `:217-218`, and `:220-226` by one, and `:243` by seven. None of them
+is trued. They sit inside the round-6 record, which names `77369a3` and `e596d00`,
+so they are point-in-time and keep their numbers. The sentence at `:1409-1410`
+states that convention for the round-2 through round-5 records and does not name
+round 6, because round 6 wrote it. This round extends it to round 6 on the same
+ground.
+
+The PR body carries no line citation of its own, so nothing else moved. The
+round-7 citations above anchor their PR-body references to `53f3b8c` for this
+reason.
