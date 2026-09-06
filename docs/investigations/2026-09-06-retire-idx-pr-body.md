@@ -88,17 +88,20 @@ generations this flag exists to move. The reader takes `data:manifest` and
 The full derivation, including the on-disk format and the census it replaces, is
 in "Why the manifest, not a list" in
 `docs/investigations/2026-09-06-reclaim-orphaned-generations-rebase.md`, which
-this PR adds. The four entrypoints carry a pointer to it rather than six copies
-of the prose.
+this PR adds. The four entrypoints and the index test carry a pointer to it
+rather than the five copies of the prose they used to carry.
 
 ## Real behaviour, and how each number was read
 
-**The deployed commit was `1d6891d`.** Every sandbox number below was read off
-that deployment, and the six follow-up commits were authored about three hours
-after it booted. The selection logic (the glob, the manifest read, the live
-filter) is byte-identical at the current head, so the numbers still describe the
-code being merged. What changed after the measurement is the logging, the
-destination stamp, and the shared helper.
+**The deployed commit was `1d6891d`**, on `feat/retire-orphaned-index-generations`.
+Its rebased equivalent in this PR is `a12dbdc`, the first commit here. Every
+sandbox number below was read off that deployment, which booted at 02:58:06Z.
+Everything after `a12dbdc` is review follow-up, eighteen commits authored three to
+five hours later. The selection logic (the glob, the manifest read, the live
+filter) is byte-identical from `1d6891d` to the current head, so the numbers still
+describe the code being merged, and `git diff a12dbdc..HEAD` is the in-PR way to
+check it. What changed after the measurement is the logging, the destination
+stamp, and the shared helper.
 
 **Sandbox, deployed and measured (experiment log tick 35, 2026-09-06 02:59Z).**
 The deployment of the change booted at 02:58:06Z and the worker registered 16 s
@@ -224,7 +227,7 @@ passes here. It normalises through `code()`, which drops every `#` line, so it
 cannot see comment drift; the four entrypoints were therefore also byte-compared
 directly, and the index retire block is byte-identical across railway, fly,
 render, and coolify. One comment is exempt from that blind spot: the entrypoints
-point at one investigation doc rather than carrying six copies of its prose, and
+point at one investigation doc rather than carrying four copies of its prose, and
 a drift assertion now checks that every `docs/**.md` path in all four copies
 resolves on disk.
 

@@ -576,6 +576,14 @@ Nothing was deployed and nothing was set. That is the operator's step.
 
 ### Limitations
 
+_The bullets below are as of `1d6891d`, the commit this section records._ Three of
+them read as durable claims about the code and are not. `270a42f` made the skip log
+distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
+at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
+disjoint from the helper's, and `git grep _gbase` at head returns only the bullet
+below. `npm test` is green at head: 182 files and 1996 tests pass, with one file and
+one test skipped.
+
 - **This does not fix the leak.** `index-persistence.ts` still strands a
   generation per boot. This moves them off the eagerly-loaded store after the
   fact, once per boot, so the store sawtooths instead of growing. The per-boot
@@ -614,7 +622,7 @@ Nothing was deployed and nothing was set. That is the operator's step.
 ## Why the manifest, not a list
 
 The four deploy entrypoints and the test file each carried the census numbers and
-the on-disk format derivation verbatim, so one paragraph existed in six copies.
+the on-disk format derivation verbatim, so one paragraph existed in five copies.
 `deploy-entrypoint-drift.test.ts` normalises through `code()`, which drops every
 line starting with `#`, so those copies were unpinned and could drift silently.
 The prose lives here now and the entrypoints carry a pointer.
@@ -807,7 +815,7 @@ after the earlier run at `cdf6b46`, and agreed. The documentation commits after
 `docs/` reads a path and not a file's contents.
 
 The four entrypoints are byte-identical over the whole retire region, lines 95 to
-228, `shasum` `9e1e9bd1bb4d` on each.
+225, `shasum` `13cb38b03420` on each.
 
 ### The three cross-references, and what each became
 

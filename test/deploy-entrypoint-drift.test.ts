@@ -58,7 +58,7 @@ describe("deploy entrypoint drift", () => {
     expect(norm(files.railway)).toBe(norm(files.render));
   });
 
-  // The entrypoints point at one doc rather than carrying six copies of its
+  // The entrypoints point at one doc rather than carrying four copies of its
   // prose. That pointer is a path, and code() strips every `#` line, so the
   // guard above cannot see it dangle. This can, and it names the path it lost.
   it("the docs the entrypoints point at exist", () => {
