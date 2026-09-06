@@ -1498,3 +1498,72 @@ ground.
 The PR body carries no line citation of its own, so nothing else moved. The
 round-7 citations above anchor their PR-body references to `53f3b8c` for this
 reason.
+
+## review round 8 fixes
+
+Round 8 ran one lens over `6b476c4`. Lens A (code review) returned 0 P0, 0 P1, 0
+P2, and 1 P3, collapsing to one fix, which was accepted. Lens B did not run: the
+delta since `53f3b8c` is docs-only, and lens B passed `53f3b8c` SHIP AS-IS. The
+finding predates `53f3b8c` and every round from 3 to 7 missed it, so it is not
+something the round-7 fixes introduced.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `211582a` | A R8-1, Fix A | one sentence in the Limitations preamble, plus the sweep of that block's other command-naming claims |
+| this commit | the record | this section |
+
+### The finding
+
+**R8-1.** The Limitations preamble said `git grep _gbase` at head returns only the
+bullet below. It returns six lines, all in this file: the sentence's own two
+halves, the bullet, the round-3 record, and two lines of the round-4 record. The
+sentence names no head, so it is a live claim under the discriminator at
+`:1296-1298`, and it was never true at any head, including `f67bec4`, which wrote
+it. Its substance held throughout: no code carries `_gbase`.
+
+The replacement names no command and asserts no number. That is deliberate. The
+sentence sits inside its own grep, so any count it states falsifies itself. The
+edit is line-count neutral, so no citation in this document moved.
+
+The round-7 record at `:1418` says the shipped code, the tests, and this document
+are clean at that head. The code and the tests were. This sentence was not, and no
+round from 3 to 7 examined it. That row keeps its wording as the point-in-time
+record it is, and this section is the correction.
+
+### The Limitations sweep, at `6b476c4`
+
+The sweep round 8 asked for and rounds 3 to 7 never finished: every other sentence
+in the block that names a command and states its output as a live claim, re-run at
+head. Four sites, one changed.
+
+| line | claim | result |
+|---|---|---|
+| `:588` | `git grep _gbase` returns one line | **false**, it returns six. Fixed by `211582a` |
+| `:589` | 182 files and 1998 tests pass, with one file and one test skipped | counts **true**, measured. Greenness is flake-dependent, see the gates below |
+| `:629` | `npm test` is not green on either side | a bullet, as of `1d6891d` by `:579`, so point-in-time. Kept |
+| `:695` | grepping `src/`, `test/`, and `scripts/` for a raw scope-file read returns this change alone | **true**, measured |
+
+### Gates, measured at `6b476c4`
+
+The delta is docs-only, so the gate is the two entrypoint test files.
+`npx vitest run test/deploy-entrypoint-index-retire.test.ts
+test/deploy-entrypoint-drift.test.ts` returns **19 of 19 pass**, exit 0. The
+retire region hashes to the record's pair on all four copies, `f23ea18a0733` for
+93 to 234 and `be42b04fd45f` for 89 to 234, measured with the recorded
+instrument, bare `shasum`, which is SHA-1.
+
+`npm test` was run twice anyway and returned exit 1 both times, one failed file
+each, `test/copilot-plugin.test.ts`, with the victim test rotating. Traced, not
+dismissed: the file passes 16 of 16 in isolation, and a pristine `878174f`
+worktree fails the same file with the same assertion, 2 failed of 1985. Same
+shape both sides, which is what `:553-567` already records for this file. Round
+8's report reached green at this head on its second and third runs, and this host
+reached red twice. Proven equivalent, not proven absent.
+
+### What this round inherited rather than re-measured
+
+The six code and test files are identical between `53f3b8c` and head, so the m1 to
+m13 mutation set and the 10-of-13 fail-first number carry forward on identical
+bytes rather than on the record's word. Neither was re-run.
