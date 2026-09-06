@@ -1242,7 +1242,8 @@ Both round-6 reports are untracked, as every round's are, because `docs/` sits i
 | `eee66c3` | A F3 to F6, Fix C | a live test count, the `needsRebuild` citation at two sites, a stamp width, and the "silent no-op" wording |
 | `e596d00` | B C2 | the two round-5 rows dropped from the round-4 commits table |
 | `b3ded01` | the record | this section, the region ranges and hashes, and every live count the new test moves |
-| this commit | a follow-up | the PR body called m11 a measured survivor; the retry is code this round added, so it is a new row and not a survivor |
+| `16bf3fd` | a follow-up | the PR body called m11 a measured survivor; the retry is code this round added, so it is a new row and not a survivor |
+| this commit | a follow-up | `16bf3fd` shifted the PR body, staling one citation in this record; the site list below also now names the range-only carriers |
 
 `9270947` was reworded after `e596d00` landed, by an autosquash rebase that
 renumbered the five commits above it. The content diff against `77369a3` is
@@ -1292,18 +1293,21 @@ inferred:
 `retire_matching_file() {` still opens at 93, the blank line that closes the region
 is 234, and `cat > "$III_CONFIG" <<'EOF'` is 235.
 
-Every site carrying the old `9e1e9bd1bb4d` or `5d9bb326252f` was checked against
-the discriminator this doc already uses: a sentence that names a head is a
-point-in-time record and keeps its numbers, and a sentence that says "at head"
-with no anchor is a live claim and gets trued. All six name a head, so none moves:
+Every site was checked against the discriminator this doc already uses: a
+sentence that names a head is a point-in-time record and keeps its numbers, and a
+sentence that says "at head" with no anchor is a live claim and gets trued. The
+sweep matched the two hashes and the bare boundary numbers separately, because
+three sites carry a range with no hash on the same line and one splits its range
+across a line break. All of them name a head, so none moves:
 
-- `:834`, in the round-2 record, which `:819` and `:830` anchor to `bcdb75b`.
-- `:975` and `:978`, in the round-3 record, describing what `f67bec4` corrected.
-- `:1035` and `:1037`, the round-3 gates, which `:1020` and `:1029` anchor to
-  `f67bec4`.
-- `:1071` to `:1074` and `:1077`, the round-4 P3-1 span table, which `:1065`
-  anchors to `06e0f98`.
-- `:1111`, the round-4 re-check, which `:1109` anchors to `ea76542`.
+- `:833-834`, in the round-2 record, which `:819` and `:830` anchor to `bcdb75b`.
+- `:975-976` and `:978`, in the round-3 record, describing what `f67bec4`
+  corrected and what `66e5996` covered.
+- `:1034-1035` and `:1036-1037`, the round-3 gates, which `:1020` and `:1029`
+  anchor to `f67bec4`.
+- `:1064`, `:1071` to `:1074`, and `:1077-1079`, the round-4 P3-1 prose and span
+  table, which `:1065` anchors to `06e0f98`.
+- `:1111-1112`, the round-4 re-check, which `:1109` anchors to `ea76542`.
 - `:1164`, the round-5 statement that the entrypoints did not change in that
   round, which `:1193` anchors to `7ee0d10`.
 
@@ -1388,7 +1392,7 @@ changed in the PR body: "Twelve tests" and "nine index tests" to thirteen and te
 at `:191`, "8 of the 12 fail" to 10 of 13 and "Four pass" to "Three pass" at
 `:198-201`, two mutation rows added at `:217-218` with the paragraph below them
 retold at `:220-226`, and the `npm test` totals from 1998 and 1997 to 1999 and
-1998 at `:242`.
+1998 at `:243`.
 
 Three prose sites now say the reader tolerates a `0x7d` inside the trailer: the PR
 body's format bullet at `:31-44`, this doc's format section at `:679-683`, and its
