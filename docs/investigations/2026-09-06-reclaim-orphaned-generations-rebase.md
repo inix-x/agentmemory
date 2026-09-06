@@ -1423,7 +1423,9 @@ each round-6 fix was re-verified by measurement rather than by reading the recor
 | commit | finding | what |
 |---|---|---|
 | `0171f63` | A R7-1 and R7-2, Fix A | one sentence and four table cells in the PR body, plus a paragraph naming why the four moved |
-| this commit | the record | this section |
+| `3a8032f` | the record | this section |
+| `79eedab` | a follow-up | the paragraph `0171f63` added named four mutations against two tests without pairing them, so it read as the trailer test dying under the two batch mutations as well |
+| this commit | the record | the row above |
 
 ### The two findings
 
