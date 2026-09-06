@@ -217,12 +217,13 @@ dies:
 | a batch retire whose stamp directory is created eagerly | 1 test fails |
 | the reader's retry past a `0x7d` in the trailer removed | 1 test fails |
 
-The last two were measured surviving in review round 6. The eager `mkdir` left
-the idempotent test green, because that test read only the files under
-`retired/` and an empty stamp directory contributes none of them; two assertions
-now anchor it. Removing the retry restores the pre-fix reader and fails the one
-test that seeds a colliding body length. The two before them were measured
-surviving in review round 4. The per-call stamp
+The eager `mkdir` was measured surviving in review round 6. It left the
+idempotent test green, because that test read only the files under `retired/`
+and an empty stamp directory contributes none of them; two assertions now anchor
+it. The retry row is not a survivor, because the retry is code this round added:
+removing it restores the pre-fix reader and fails the one test that seeds a
+colliding body length. The two before them were measured surviving in review
+round 4. The per-call stamp
 survived because the one-stamp assertion could only catch it when the loop
 straddled a second boundary, so `date` is stubbed to a call counter and it now
 fails on every run. The deleted guard made a manifest that parses but names no

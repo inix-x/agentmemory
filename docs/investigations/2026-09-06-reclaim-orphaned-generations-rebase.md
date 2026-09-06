@@ -1241,7 +1241,8 @@ Both round-6 reports are untracked, as every round's are, because `docs/` sits i
 | `6e13296` | A F7, Fix D | "and graph" dropped from the helper contract comment in all four copies |
 | `eee66c3` | A F3 to F6, Fix C | a live test count, the `needsRebuild` citation at two sites, a stamp width, and the "silent no-op" wording |
 | `e596d00` | B C2 | the two round-5 rows dropped from the round-4 commits table |
-| this commit | the record | this section, the region ranges and hashes, and every live count the new test moves |
+| `b3ded01` | the record | this section, the region ranges and hashes, and every live count the new test moves |
+| this commit | a follow-up | the PR body called m11 a measured survivor; the retry is code this round added, so it is a new row and not a survivor |
 
 `9270947` was reworded after `e596d00` landed, by an autosquash rebase that
 renumbered the five commits above it. The content diff against `77369a3` is
