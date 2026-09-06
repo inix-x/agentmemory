@@ -585,9 +585,9 @@ object-or-string bullet's "neither has been observed on a real file" no longer
 holds, and the PR body says only the object form has been. `270a42f` made the
 skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
 at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
-disjoint from the helper's, and `git grep _gbase` at head returns only the bullet
-below. `npm test` is green at head: 182 files and 1998 tests pass, with one file and
-one test skipped.
+disjoint from the helper's. No code carries `_gbase` at head; the remaining
+mentions are this document's own records. `npm test` is green at head: 182 files
+and 1998 tests pass, with one file and one test skipped.
 
 - **This does not fix the leak.** `index-persistence.ts` still strands a
   generation per boot. This moves them off the eagerly-loaded store after the
