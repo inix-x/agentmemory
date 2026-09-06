@@ -576,11 +576,14 @@ Nothing was deployed and nothing was set. That is the operator's step.
 
 ### Limitations
 
-_The bullets below are as of `1d6891d`, the commit this section records._ Four of
+_The bullets below are as of `1d6891d`, the commit this section records._ Five of
 them read as durable claims about the code and are not. The reader has since been
 run against a real engine-written scope file, by the 02:58:06Z sandbox deployment
 the PR body records, which retired five dead BM25 generations and kept the live
-one. `270a42f` made the skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
+one. That same read observed the object form of a scope value, so the
+object-or-string bullet's "neither has been observed on a real file" no longer
+holds, and the PR body says only the object form has been. `270a42f` made the
+skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
 at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
 disjoint from the helper's, and `git grep _gbase` at head returns only the bullet
 below. `npm test` is green at head: 182 files and 1996 tests pass, with one file and
@@ -1030,20 +1033,28 @@ comment block plus the retire region, lines 89 to 225, agrees the same way at
 ## review round 4 fixes
 
 Round 4 ran two lenses over `06e0f98`. Lens A (code review) returned 0 P0, 0 P1,
-0 P2, and 2 P3, both of them numbers in this doc and both regressions from
-`f67bec4`. Lens B (ponytail) returned SHIP AFTER 1 CUT, worth -12 lines, and the
-cut was declined. Both reports are untracked, as the round-1, round-2, and
-round-3 reports are:
-`docs/investigations/2026-09-06-retire-idx-code-review-r4.md` and
-`-ponytail-review-r4.md`.
+0 P2, and 6 P3, grouped into three fixes. Fix A was two numbers in this doc,
+both regressions from `f67bec4`. Fix B was two test hardenings against
+mutations the seven in the round-3 table do not cover. Fix C was an inverted
+test comment and an undisclosed per-family fail-open. Lens B (ponytail)
+returned SHIP AFTER 1 CUT, worth -12 lines, and the cut was declined.
+
+Only Fix A was implemented in this round. The round-4 report grew after the
+implementation spec was cut from a draft of it, so Fix B and Fix C were never
+dispatched. Round 5 caught that as R5-1, and both landed there: Fix B is
+`95c1021` and Fix C is `7ee0d10`, recorded under "review round 5 fixes" below.
+Both round-4 reports were untracked, as the round-1 to round-3 reports are, and
+were lost with the scratchpad worktree when the host rebooted on 2026-09-06.
 
 ### Commits
 
 | commit | lens | what |
 |---|---|---|
-| `ea76542` | A P3-1, P3-2 | the retire-region range at three sites, and the as-of marker's stale-bullet count |
+| `ea76542` | A Fix A (P3-1, P3-2) | the retire-region range at three sites, and the as-of marker's stale-bullet count |
+| `95c1021` | A Fix B (P3-3, P3-4) | landed in round 5: a `date` stub so the batch stamp is a call count, and one test for a manifest that names no generation |
+| `7ee0d10` | A Fix C (P3-5, P3-6) | landed in round 5: the vector-test comment un-inverted, and the per-family fail-open disclosed in both docs |
 
-### The two findings
+### The two findings of Fix A
 
 **P3-1, the retire-region range.** `f67bec4` re-trued the byte-identity sentence
 after cut 1 by moving the end line from 227 to 225 and leaving the start at 95.
@@ -1095,3 +1106,104 @@ fail-first reproduces 7 of 11.
 `deploy-entrypoint-index-retire` and `deploy-entrypoint-drift`: **17 tests, 2
 files, all green** in 4.37 s. The four copies still hash `9e1e9bd1bb4d` over
 lines 93 to 225 after the commit, so the documentation change moved no code.
+
+## review round 5 fixes
+
+Round 5 ran two lenses over `14913f5`. Lens A (code review) returned 0 P0, 0 P1,
+1 P2, and 1 P3. R5-1 (P2): round 4's Fix B and Fix C were never implemented,
+because the round-4 report grew after the implementation spec was cut from a
+draft of it, and the spec is what got dispatched. R5-2 (P3): the `### Limitations`
+as-of marker said "Four of them" and the true count is five, the fifth being the
+object-or-string bullet. Lens B's round-4 cut, `test/deploy-entrypoint-index-retire.test.ts:103-114`,
+stays declined for the reason the round-4 record gives.
+
+Both round-5 reports, and both round-4 reports, were untracked and were lost with
+the scratchpad worktree when the host rebooted on 2026-09-06. This record is
+reconstructed from the coordinator's implementation spec, which carried the
+findings and the two uncovered mutations, not from the reports.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `95c1021` | R5-1, Fix B (round-4 P3-3, P3-4) | `date` stubbed to a call counter so the batch stamp is deterministic, and one test for a manifest that parses but names no generation |
+| `7ee0d10` | R5-1, Fix C (round-4 P3-5, P3-6) | the vector-test comment un-inverted, and the per-family fail-open disclosed in the PR body and in `### Limitations` |
+| this commit | R5-2, and the round-4 record | "Four of them" to "Five of them" naming the fifth, the round-4 record retold in full, and every live count the new test moves |
+
+### The two hardenings, and what each kills
+
+**The batch stamp.** The one-stamp assertion in the batch-mode helper test,
+`toHaveLength(1)` on `retired/`, passed a helper that stamped per call whenever
+the five moves fit in one wall-clock second, which is every run on this host.
+Measured in this round: the mutation, line 99's default expansion replaced with
+`_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"`, left the round-4 test
+file at 17 of 17 green. The file now writes a `date` stub on PATH next to
+`chown` and `gosu`, and the stub prints a count of its calls. A run's stamp is
+then the number of stamps the script asked for: one for the unmutated loop, five
+for the per-call helper, and the assertion fails the mutation on every run.
+
+**The reader's empty-list guard.** `if (out.length === 0) process.exit(1);` is
+what makes a manifest that parses but names no generation take the fail-closed
+path. Without it the reader prints `||`, which `[ -z ]` reads as non-empty, and
+the case pattern `*"|$_gen|"*` then matches nothing, so every generation on disk
+reads as dead. Nothing pinned it. One test seeds a manifest holding only the gc
+ledger and asserts the "no live generation read from" skip line and no `retired/`
+directory. It fails at `878174f` too, so fail-first is now 8 of 12 with the same
+four passing.
+
+**Fix C's location.** The per-family fail-open sentence went into the PR body's
+limitations and this doc's `### Limitations`, not into the reader's comment
+block in the four entrypoint copies. That is two edits with nothing to
+re-measure, against four the drift test cannot see, because `code()` drops every
+`#` line, and which would move the 93-to-225 retire region and its hash at every
+site in both docs that carries them. The entrypoints did not change in this
+round: all four still hash `9e1e9bd1bb4d` over lines 93 to 225, measured on each.
+
+### Mutations, re-run at `7ee0d10`
+
+Baseline 18 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four
+entrypoint copies with `perl -pi` and restored with `git checkout -- deploy`
+between runs, in a detached worktree at `14913f5` with the branch's test file
+copied in. The harness and per-run output are in the session scratchpad, which
+does not outlive a reboot, so this table is the record.
+
+| mutation | after round-3 fixes | after round-5 fixes | test that dies |
+|---|---|---|---|
+| m1 live filter never matches | 3 fail | 3 fail | moves-five, JSON-encoded values, substring neighbour |
+| m2 both fail-closed guards removed | 2 fail | **3 fail** | absent manifest, unparseable manifest, names-no-generation |
+| m3 shared helper clobbers `_sep` | 3 fail | 3 fail | the same three as m1 |
+| m4 `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| m5 per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| m6 batch destination scattered one file per directory | 1 fail | 1 fail | helper batch mode |
+| m7 doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+| m8 helper stamps per call instead of once for the run | **0 fail, survived** | **1 fail** | helper batch mode |
+| m9 reader's `out.length === 0` guard deleted | **0 fail, survived** | **1 fail** | names-no-generation |
+
+No mutation survives. The two "survived" cells were measured in this round
+against the round-4 test file, not read from the lost report. m6 and m8 differ in
+one thing: m6 appends the filename to the stamp, so it scatters on every run under
+any clock, and m8 is the same expansion without the suffix, so it scatters only
+when the clock ticks between calls.
+
+### Gates, measured at `7ee0d10`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1997 passed, 1 skipped (1998)**. **Exit 0.** The +1 is the new test. No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 4014 ms. |
+
+Fail-first, the branch's test file copied into the pristine `878174f` worktree:
+**8 of 12 fail**, read from `--reporter=verbose`. The four that pass are the
+positive control, the idempotent and flag-unset guards, and the helper's unset
+mode, the same four as every prior round.
+
+### The counts the new test moved
+
+Live counts changed in the PR body: "Eleven tests" and "eight index tests" to
+twelve and nine, "7 of the 11 fail" to 8 of 12, the mutation table's fail-closed
+row from 2 to 3 with two rows added for m8 and m9, and the `npm test` totals from
+1997 and 1996 to 1998 and 1997. The round-2, round-3, and round-4 records above
+are point-in-time measurements at named heads and keep their numbers, as the
+round-3 record says of the round-2 table.

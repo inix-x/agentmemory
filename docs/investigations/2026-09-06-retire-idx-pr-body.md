@@ -184,14 +184,14 @@ value is not read as consent to move an index.
 
 ## Tests
 
-Eleven tests in `test/deploy-entrypoint-index-retire.test.ts`: eight index tests,
+Twelve tests in `test/deploy-entrypoint-index-retire.test.ts`: nine index tests,
 two that pin the shared helper's two modes, and a positive control. They run
 against the real entrypoint rather than an extracted function, so the flag gate
 and the ordering ahead of the engine config are the ones that ship. The positive
 control asserts the already-shipped stream retire, so a "nothing was retired"
 result cannot be a script that died on line one.
 
-Run against unmodified `878174f` first: **7 of the 11 fail**, with the failure
+Run against unmodified `878174f` first: **8 of the 12 fail**, with the failure
 text read rather than assumed. Four pass there: the positive control, the two
 guard tests, and the helper's unset mode. The guards pass vacuously because
 nothing moves at all. The helper's unset mode is the shipped path the audit
@@ -202,26 +202,33 @@ dies:
 | mutation | result |
 |---|---|
 | live filter never matches | 3 tests fail |
-| fail-closed guards removed | 2 tests fail |
+| fail-closed guards removed | 3 tests fail |
 | shared helper clobbers a loop variable | 3 tests fail |
 | `\|` delimiters removed from the live test | 1 test fails |
 | per-file log line replaced with `:` | 1 test fails |
 | a batch retire scattered one file per directory | 1 test fails |
 | the entrypoints' doc pointer rewritten to a path that does not exist | 1 drift test fails |
+| a batch retire stamped per call instead of once for the run | 1 test fails |
+| the reader's empty-list guard deleted | 1 test fails |
 
-The last three were measured surviving before this round. Replacing the per-file
-log line with `:` in all four entrypoints left the **entire suite green**, 182
-files and 1993 tests, so nothing anywhere pinned that line; the same mutation now
-fails one test.
+The last two were measured surviving in review round 4. The per-call stamp
+survived because the one-stamp assertion could only catch it when the loop
+straddled a second boundary, so `date` is stubbed to a call counter and it now
+fails on every run. The deleted guard made a manifest that parses but names no
+generation read as "everything is dead", and nothing pinned it until one test
+did. The three before them were measured surviving before that. Replacing the
+per-file log line with `:` in all four entrypoints left the **entire suite
+green**, 182 files and 1993 tests, so nothing anywhere pinned that line; the
+same mutation now fails one test.
 
-The last one is worth calling out. The live test is an exact-element test against
+The delimiter row is worth calling out. The live test is an exact-element test against
 a pipe-delimited list, and until this branch nothing pinned the delimiters:
 rewriting the pattern as a substring test left every index test green. It no
 longer does. The failure is unreachable on today's ids, because `generateId`
 mints a fixed-length id until roughly 2059, so this is a fixture and not a bug
 report.
 
-Gates: `npm test` exit 0 (183 files: 182 passed, 1 skipped; 1997 tests: 1996
+Gates: `npm test` exit 0 (183 files: 182 passed, 1 skipped; 1998 tests: 1997
 passed, 1 skipped). `npx tsc --noEmit` at the pre-existing 29-error baseline,
 verified by running tsc on a detached worktree at `878174f` and diffing the
 sorted error lists rather than the counts: the diff is empty. `npm run build`
