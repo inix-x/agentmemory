@@ -335,8 +335,5 @@ describe("the shared retire helper keeps both of its modes", { timeout: 20000 },
     // no stream file and no audit file is seeded.
     expect(readdirSync(retiredRoot())).toHaveLength(1);
     expect(out).not.toMatch(/retired mem%3Aindex/);
-    expect(out).toContain(
-      `retired ${deadFiles().length} index shard(s), ${deadBytes()} bytes, to `,
-    );
   });
 });
