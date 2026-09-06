@@ -438,6 +438,75 @@ describe("readers resolve both shapes regardless of the flag (R10)", () => {
     expect((await run("batch")).flagged).toEqual((await run("legacy")).flagged);
   });
 
+  // R6, and a regression pin rather than a fail-first: it passes against the
+  // parent unmodified, and that is the point. Cascade reads mem:graph:obs-index
+  // since U3, and persistGraphDelta writes that index from the extraction event
+  // in both modes, so neither the provenance shape nor the batch-id cap can
+  // reach the flagging. This test is what would notice if that stopped being
+  // true -- the silent under-flagging KTD5 exists to prevent.
+  it("flags the identical row set under legacy and batch provenance", async () => {
+    const memory: Memory = {
+      id: "mem_old",
+      createdAt: "2026-03-01T00:00:00Z",
+      updatedAt: "2026-03-01T00:00:00Z",
+      type: "fact",
+      title: "old",
+      content: "",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 5,
+      version: 1,
+      isLatest: false,
+      sourceObservationIds: ["o2"],
+    };
+
+    // Structured fields populated, so the heuristic pass contributes rows too.
+    // The parent gave those rows legacy provenance even in batch mode; U2 gives
+    // them batch provenance. Cascade must not be able to tell either way.
+    const corpus = [
+      structuredObs("o1", "src/a.ts"),
+      structuredObs("o2", "src/b.ts"),
+      structuredObs("o3", "src/c.ts"),
+    ];
+
+    const run = async (mode: "batch" | "legacy") => {
+      kv = mockKV();
+      sdk = mockSdk({ looseTrigger: true });
+      registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+      registerCascadeFunction(sdk as never, kv as never);
+      setMode(mode);
+      await sdk.trigger("mem::graph-extract", { observations: corpus });
+      await kv.set("mem:memories", memory.id, memory);
+      const result = (await sdk.trigger("mem::cascade-update", {
+        supersededMemoryId: "mem_old",
+      })) as { flagged: unknown };
+      const all = await rows<GraphNode>("mem:graph:nodes");
+      const staleNames = all
+        .filter((n) => n.stale)
+        .map((n) => n.name)
+        .sort();
+      return {
+        flagged: result.flagged,
+        staleNames,
+        allNames: all.map((n) => n.name).sort(),
+      };
+    };
+
+    const batch = await run("batch");
+    const legacy = await run("legacy");
+
+    expect(batch.flagged).toEqual(legacy.flagged);
+    // Identity, not only count: two different row sets of the same size would
+    // pass a count comparison and be a real regression.
+    expect(batch.staleNames).toEqual(legacy.staleNames);
+    // And an absolute expectation, because parity alone cannot see a change
+    // that under-flags both modes equally. One extract touched every row, and
+    // the superseded memory cites an observation from it, so every row flags.
+    expect(batch.staleNames).toEqual(batch.allNames);
+    expect(batch.staleNames.length).toBeGreaterThan(2);
+  });
+
   it("a missing batch row resolves to no ids, logs once, and does not throw", async () => {
     const { logger } = await import("../src/logger.js");
     const node: GraphNode = {
