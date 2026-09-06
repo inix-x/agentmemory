@@ -1408,3 +1408,75 @@ reproduced the finding it fixes.
 
 The round-2 through round-5 records above are point-in-time measurements at named
 heads and keep their numbers, as the round-3 record says of the round-2 table.
+
+## review round 7 fixes
+
+Round 7 ran two lenses over `53f3b8c`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 2 P3, collapsing to one fix. Lens B (ponytail) returned SHIP AS-IS, with
+nothing to cut. Both findings were accepted. Both are stale numbers in the PR body
+that round 6's own code changes moved and round 6's propagation pass did not carry
+across. The shipped code, the tests, and this document are clean at that head, and
+each round-6 fix was re-verified by measurement rather than by reading the record.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `0171f63` | A R7-1 and R7-2, Fix A | one sentence and four table cells in the PR body, plus a paragraph naming why the four moved |
+| this commit | the record | this section |
+
+### The two findings
+
+**R7-1.** The PR body at `53f3b8c:109-113` said the selection logic, naming the
+manifest read among its three parts, is byte-identical from `1d6891d` to the
+current head. Fix A rewrote the body of `index_live_generations`, which is that
+read. Extracted from `a12dbdc` and from head, the two are not equal. The sentence
+names no head of its own, so it is a live claim under the discriminator this doc
+states at `:1296-1298`.
+
+The conclusion survives and no re-measurement is owed. The new reader tries the
+same index the old one tried and breaks on success, so it parses everything the
+old one parsed, and the 02:58:06Z numbers still describe the merged code. Only the
+stated ground failed, so the fix is wording.
+
+**R7-2.** Four rows of the PR body's mutation table at `53f3b8c:208-215` read 3, 3,
+1, and 1 where the round-6 table at `:1330-1342` reads 5, 5, 2, and 2. Round 6
+measured all four moves, recorded them here, and explained them at `:1353-1356`.
+Its propagation pass at `:1387-1395` then added the two new rows and retold the
+paragraph below them without truing these four cells. The direction is
+understatement, so the tests are stronger than the maintainer-facing table claimed.
+
+Both findings are the same class. Round 6 carried its code changes into this
+document but not into the PR body, which is the one artifact `pr-governance.md`
+requires the measured proof to live in.
+
+### Gates, measured at `53f3b8c`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1998 passed, 1 skipped (1999)**. **Exit 0.** No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 10481 ms. |
+
+Fail-first, the branch's index test file copied into a pristine `878174f`
+worktree: **10 of 13 fail**. The three that pass are the positive control, the
+flag-unset guard, and the helper's unset mode.
+
+### Mutations, re-run at `53f3b8c`
+
+m1 to m11 reproduce the round-6 table row for row, attribution included, and none
+survives. Two bound probes no prior round ran were added:
+
+| mutation | round 7 | test that dies |
+|---|---|---|
+| m12 retry bound tightened to `raw.length - 11` | **1 fail of 19** | rkyv trailer |
+| m13 retry bound removed entirely | **survives 19 of 19** | none |
+
+m12 shows the fixture pins the bound rather than clearing it. m13's survival is a
+settled residual and not a test gap. No strict prefix of a JSON object text ending
+at `}` is itself valid JSON, so an unbounded walk back finds the true body brace or
+nothing on any shape the engine writes. The bound is a cost guard, and a defence
+against a file holding a complete earlier JSON object followed by junk, which
+nothing in this repo writes. Pinning it from the loose side needs a contrived
+fixture that asserts nothing about the shipped path, and the tight side is pinned
+by m12.
