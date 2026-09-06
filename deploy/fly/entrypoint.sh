@@ -106,6 +106,86 @@ retire_matching_file() {
 retire_matching_file "$DATA_DIR/state_store.db" "mem:audit.bin"
 retire_matching_file "$DATA_DIR/state_store.db" "mem_audit.bin"
 
+# Lever b' of the memory-reduction loop, generalised. Index persistence mints a
+# generation per boot and the manifest-driven GC does not reclaim the prior one,
+# so a sandbox with 20 redeploys in a day carried six BM25 generations totalling
+# 1,104 MiB with one live at ~257 MiB: ~847 MiB of dead index, larger than any
+# single lever in the composition table (21:32Z census, 2026-09-06). Retiring a
+# named list cannot keep up with a per-boot growth term, so the selector is
+# "every generation the manifest does not name as live".
+#
+# A generation's shards are one scope each and the engine writes one file per
+# scope, so the names on disk are
+#   mem%3Aindex%3Abm25%3A<family>%3Aidx_<id>_<hex>%3A<NNNNN>.bin
+# with <family> bm25 or vectors and <hex> minted with the id. retire_scope
+# cannot spell that: it encodes a literal scope name, and neither the hex suffix
+# nor the shard number is known before the glob runs.
+#
+# The live ids are read from the two manifest keys BY NAME, never by grepping
+# the file for an id. src/state/index-persistence.ts stores the gc ledger under
+# "${manifestKey}:gc" in the manifest's own scope, so mem%3Aindex%3Abm25.bin
+# holds the manifest AND both ledgers and names every orphan alongside the live
+# one. A grep would refuse exactly what this flag exists to move.
+#
+# The engine writes a scope as rkyv::to_bytes(KeyStorage(serde_json::to_string(
+# scope_map))): the scope's JSON object as raw bytes from offset 0 then a short
+# rkyv trailer, so the JSON body ends at the last "}"
+# (docs/plans/2026-09-06-001-graph-memory-redesign-plan.md Appendix, verified on
+# both graph scope files to within one byte). Values are taken either as objects
+# or as JSON-encoded strings, because which one the engine writes is not pinned
+# anywhere in this repo and both cost one line here.
+index_live_generations() {
+    [ -f "$1" ] || return 1
+    node -e '
+const fs = require("fs");
+const raw = fs.readFileSync(process.argv[1]);
+const scope = JSON.parse(raw.subarray(0, raw.lastIndexOf(0x7d) + 1).toString("utf8"));
+const out = [];
+for (const key of ["data:manifest", "vectors:manifest"]) {
+  const value = scope[key];
+  if (value === undefined) continue;
+  const manifest = typeof value === "string" ? JSON.parse(value) : value;
+  if (manifest && typeof manifest.generation === "string") out.push(manifest.generation);
+}
+if (out.length === 0) process.exit(1);
+process.stdout.write("|" + out.join("|") + "|");
+' "$1" 2>/dev/null
+}
+
+# Fail closed. With no readable manifest nothing on disk can be told live from
+# dead, and retiring the live index costs a full-corpus rebuild, so an absent or
+# unparseable manifest moves nothing and says so once.
+retire_nonlive_index_generations() {
+    _live=$(index_live_generations "$1/mem%3Aindex%3Abm25.bin" || true)
+    if [ -z "$_live" ]; then
+        echo "agentmemory: index generation retire skipped, no live generation in mem%3Aindex%3Abm25.bin"
+        return 0
+    fi
+
+    # No subprocess per shard. A leaked store is hundreds of files and this runs
+    # on the boot path, so the id comes out by parameter expansion and the live
+    # test is a case against the pipe-delimited list.
+    _sep="%3A"
+    for _gf in "$1"/mem%3Aindex%3Abm25%3A*%3Aidx_*%3A*.bin; do
+        if [ -f "$_gf" ]; then
+            _gname=${_gf##*/}
+            _gbase=${_gname%.bin}
+            _gshardless=${_gbase%$_sep*}
+            _gen=${_gshardless##*$_sep}
+            case "$_live" in
+                *"|$_gen|"*) continue ;;
+            esac
+            retire_matching_file "$1" "$_gname"
+        fi
+    done
+}
+
+# The literal "true", the same shape as GRAPH_SCOPES_RETIRE_AT_BOOT, so a stray
+# value is not read as consent to move an index.
+if [ "${INDEX_GENERATIONS_RETIRE_AT_BOOT:-}" = "true" ]; then
+    retire_nonlive_index_generations "$DATA_DIR/state_store.db"
+fi
+
 cat > "$III_CONFIG" <<'EOF'
 workers:
   - name: iii-http
