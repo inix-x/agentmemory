@@ -154,13 +154,25 @@ const liveFiles = () => [
   shardName("vectors", LIVE_VEC, "00000"),
 ];
 
+// The engine pads the JSON body to a 4-byte boundary and appends rkyv's 8-byte
+// string root: the body length as a little-endian u32, then the negative relative
+// pointer. A body length ≡ 125 (mod 256) puts 0x7d in the length's low byte, so
+// the last "}" in the file is a trailer byte and not the body's closing brace.
+function rkyvFrame(body: Buffer): Buffer {
+  const pad = (4 - (body.length % 4)) % 4;
+  const root = Buffer.alloc(8);
+  root.writeUInt32LE(body.length, 0);
+  root.writeInt32LE(-(body.length + pad + 4), 4);
+  return Buffer.concat([body, Buffer.alloc(pad), root]);
+}
+
 // The engine writes a scope as its JSON object from offset 0 followed by a short
 // rkyv trailer, so the JSON body is data[0 .. rfind("}") + 1]. The trailer is
 // seeded here so the reader is exercised against the real shape and not against
 // clean JSON.
 function seedManifest(
   live: Record<string, string> = { "data:manifest": LIVE_BM25, "vectors:manifest": LIVE_VEC },
-  { encodeValues = false, trailer = true } = {},
+  { encodeValues = false, trailer = true, collide = false } = {},
 ) {
   const scope: Record<string, unknown> = {
     // The gc ledger shares this scope file, under `${manifestKey}:gc`. It names
@@ -182,11 +194,15 @@ function seedManifest(
     };
     scope[key] = encodeValues ? JSON.stringify(value) : value;
   }
+  if (collide) {
+    // `,"pad":""` costs 9 bytes, so the filler is what lands the body in the class.
+    const bare = Buffer.byteLength(JSON.stringify(scope)) + 9;
+    scope["pad"] = "x".repeat((125 - (bare % 256) + 256) % 256);
+  }
   const body = Buffer.from(JSON.stringify(scope), "utf8");
-  writeFileSync(
-    join(storeDir(), MANIFEST_FILE),
-    trailer ? Buffer.concat([body, Buffer.from([0, 1, 2, 3])]) : body,
-  );
+  let file = trailer ? Buffer.concat([body, Buffer.from([0, 1, 2, 3])]) : body;
+  if (collide) file = rkyvFrame(body);
+  writeFileSync(join(storeDir(), MANIFEST_FILE), file);
 }
 
 const genSize = (i: number) => 300 + i;
@@ -291,6 +307,21 @@ describe("entrypoint retires index generations the manifest does not name", { ti
       "index generation retire skipped, no live generation read from mem%3Aindex%3Abm25.bin",
     );
     expect(existsSync(retiredRoot())).toBe(false);
+  });
+
+  // The trailer encodes the body length, so a body length ≡ 125 (mod 256) puts
+  // 0x7d in the length's low byte and the file's last "}" is a trailer byte. The
+  // reader retries from the brace before it, so a healthy store in that class is
+  // read rather than skipped. The fixture sits at the tightest case: the body's
+  // brace lands exactly on the raw.length - 12 bound the retry stops at.
+  it("reads a manifest whose rkyv trailer carries a 0x7d", () => {
+    seedGenerations();
+    seedManifest(undefined, { collide: true });
+
+    const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
+
+    expect(retiredFiles()).toEqual(deadFiles().sort());
+    expect(out).not.toContain("index generation retire skipped");
   });
 
   // The gate is the literal "true", the same shape as GRAPH_SCOPES_RETIRE_AT_BOOT,

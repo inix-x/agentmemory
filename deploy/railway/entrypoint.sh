@@ -147,7 +147,14 @@ index_live_generations() {
     node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(process.argv[1]);
-const scope = JSON.parse(raw.subarray(0, raw.lastIndexOf(0x7d) + 1).toString("utf8"));
+// The trailer encodes the body length, so one of its bytes can be 0x7d and the
+// last "}" in the file is then not the body brace. The trailer is at most 11
+// bytes, so retry from the previous "}" while the candidate stays in that window.
+let scope;
+for (let i = raw.lastIndexOf(0x7d); i > 0 && i >= raw.length - 12; i = raw.lastIndexOf(0x7d, i - 1)) {
+  try { scope = JSON.parse(raw.subarray(0, i + 1).toString("utf8")); break; } catch {}
+}
+if (scope === undefined) process.exit(1);
 const out = [];
 for (const key of ["data:manifest", "vectors:manifest"]) {
   const value = scope[key];
@@ -166,6 +173,8 @@ process.stdout.write("|" + out.join("|") + "|");
 #
 # The two messages differ because the log line is the only signal: absent means a
 # fresh volume, present-but-unreadable means the on-disk shape assumption broke.
+# The retry above is what makes that second reading true: without it a healthy
+# file whose trailer happens to hold a 0x7d reads as a broken one.
 # The reader drops stderr, so the caller does the [ -f ] test, not an exit code.
 retire_nonlive_index_generations() {
     _manifest="$1/mem%3Aindex%3Abm25.bin"
