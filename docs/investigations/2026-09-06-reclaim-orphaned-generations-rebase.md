@@ -586,7 +586,7 @@ holds, and the PR body says only the object form has been. `270a42f` made the
 skip log distinguish its two cases. `f527c4d` deleted `_gbase`, so the retire loop's variables
 at head are `_live`, `_sep`, `_gf`, `_gname`, `_gshardless`, and `_gen`, still
 disjoint from the helper's, and `git grep _gbase` at head returns only the bullet
-below. `npm test` is green at head: 182 files and 1996 tests pass, with one file and
+below. `npm test` is green at head: 182 files and 1998 tests pass, with one file and
 one test skipped.
 
 - **This does not fix the leak.** `index-persistence.ts` still strands a
@@ -656,7 +656,7 @@ also wrong in practice, which was measured rather than argued.
 The 21:32Z census named `mtow4iaa` as the live generation. When the change ran on
 that same store at 02:59Z the next morning, the manifest named `mtorf55a`, and
 the code kept `mtorf55a`. A hardcoded list built from that census would have
-retired the live index and forced a full-corpus rebuild: `src/index.ts:488` sets
+retired the live index and forced a full-corpus rebuild: `src/index.ts:485` sets
 `needsRebuild = bm25Index.size === 0`, and `rebuildIndex` awaits an
 embedding-provider call per record across every observation in the corpus.
 

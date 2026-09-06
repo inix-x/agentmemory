@@ -356,7 +356,7 @@ describe("entrypoint retires index generations the manifest does not name", { ti
   //
   // Unreachable on today's ids, which is why it is a fixture and not a bug.
   // generateId mints idx_ + Date.now().toString(36) + _ + 12 hex, and the base-36
-  // timestamp is a fixed 9 characters until roughly 2059, so every id is the same
+  // timestamp is a fixed 8 characters until roughly 2059, so every id is the same
   // length and none is a strict prefix of another.
   it("retires a dead generation whose id neighbours a live id by substring", () => {
     const contained = LIVE_BM25.slice(0, -1);

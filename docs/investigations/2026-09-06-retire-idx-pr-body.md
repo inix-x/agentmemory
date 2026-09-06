@@ -56,9 +56,9 @@ nothing else from the sandbox experiment stack it was developed on: no
 - **The entrypoint now calls `node`** to parse the manifest, which it did not
   need before. It runs as root before the `gosu` drop, and `node:22-slim` is the
   base image in all four Dockerfiles, so `node` is on `PATH` at that point. A
-  future base-image change is the one thing that turns this into a silent no-op,
-  and even then the call exits non-zero, the live list is empty, and the run
-  takes the same fail-closed path.
+  future base-image change is the one thing that turns this into a no-op that
+  logs the skip line but does not name the cause, and even then the call exits
+  non-zero, the live list is empty, and the run takes the same fail-closed path.
 - **The 21:32Z sandbox figures below are the census's own rounded MiB.** The
   production figures are byte-exact from the diagnostics JSON. The two are not
   the same kind of measurement.
@@ -78,7 +78,7 @@ The 2026-09-06 21:32Z sandbox census named `mtow4iaa` as the live generation.
 When the change ran on that same store at 02:59Z the next morning, the manifest
 named `mtorf55a`, and the code kept `mtorf55a`. A hardcoded list built from that
 census would have retired the live index. That costs a full-corpus rebuild:
-`src/index.ts:488` sets `needsRebuild = bm25Index.size === 0`, and `rebuildIndex`
+`src/index.ts:485` sets `needsRebuild = bm25Index.size === 0`, and `rebuildIndex`
 awaits an embedding-provider call per record across every observation in the
 corpus.
 
