@@ -38,6 +38,11 @@ nothing else from the sandbox experiment stack it was developed on: no
   trailer breaks the reader in the fail-closed direction: the cost is a skipped
   retire, not a lost index. The entrypoint carries a `ponytail:` comment naming
   that ceiling and the upgrade path.
+- **The fail-closed guard is on the whole read, not per family.** The reader
+  skips the retire only when neither `data:manifest` nor `vectors:manifest`
+  yields a generation, so when one key is usable and the other is absent or
+  unreadable, that other family has no live id and every generation in it is
+  retired.
 - **On production the live/dead split has not been read from production's own
   manifest.** The 306.8 MiB figure below was computed from a store-diagnostics
   snapshot by grouping shard files under their generation, not by running the

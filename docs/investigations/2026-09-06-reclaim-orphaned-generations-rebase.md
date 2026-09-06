@@ -597,6 +597,11 @@ one test skipped.
   fixture shaped that way, including a trailer after the JSON body. If the real
   file parses differently the flag fails closed and moves nothing, which is the
   safe direction, but it would then be a no-op until the reader is corrected.
+- **The fail-closed guard is on the whole read, not per family.** The reader
+  skips the retire only when neither `data:manifest` nor `vectors:manifest`
+  yields a generation, so when one key is usable and the other is absent or
+  unreadable, that other family has no live id and every generation in it is
+  retired.
 - **Whether a scope value is an object or a JSON-encoded string is not pinned.**
   Both are handled and both are tested; neither has been observed on a real file.
 - **The 21:32Z figures are the census's own rounded MiB**, not a byte-exact read.

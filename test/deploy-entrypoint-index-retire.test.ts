@@ -310,8 +310,9 @@ describe("entrypoint retires index generations the manifest does not name", { ti
     expect(existsSync(retiredRoot())).toBe(false);
   });
 
-  // Both manifests are read, so the live vector generation survives even though
-  // the vector family has exactly one generation and no BM25 shard names it.
+  // Each family's live id comes from its own manifest key, and the fail-closed
+  // guard is on the whole read, not per family. A family whose key is missing
+  // has no live id, so its one generation is retired: the per-family fail-open.
   it("retires the vector generation when only the BM25 manifest names one", () => {
     seedGenerations();
     seedManifest({ "data:manifest": LIVE_BM25 });
