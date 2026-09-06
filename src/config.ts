@@ -423,6 +423,25 @@ export function isGraphIndexBackfillEnabled(): boolean {
   return getMergedEnv()["GRAPH_INDEX_BACKFILL"] === "true";
 }
 
+// KTD2. Batch provenance divides the growth term; it does not remove it.
+// mergeNode appends one batch id per extract that touches a row, so a row still
+// grows at 28 bytes per (extract, row) touch without bound, and a 9 MB scope
+// that regrows on a several-megabyte-per-hour term is not one that holds for a
+// week. The cap turns a slower unbounded term into a ceiling.
+//
+// 32 puts a row at about 1.1 KiB against the 236 B (node) and 242 B (edge) both
+// scopes measure with provenance removed. Read per call so the ceiling is
+// tunable without a redeploy, the same reason getGraphProvenanceMode is.
+export const GRAPH_ROW_BATCH_CAP_DEFAULT = 32;
+
+export function getGraphRowBatchCap(): number {
+  const n = safeParseInt(
+    getMergedEnv()["GRAPH_ROW_BATCH_CAP"],
+    GRAPH_ROW_BATCH_CAP_DEFAULT,
+  );
+  return n > 0 ? n : GRAPH_ROW_BATCH_CAP_DEFAULT;
+}
+
 export function getGraphProvenanceMode(): GraphProvenanceMode {
   return getMergedEnv()["GRAPH_PROVENANCE_MODE"] === "batch" ? "batch" : "legacy";
 }

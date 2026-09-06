@@ -16,7 +16,11 @@ import {
   GRAPH_EXTRACTION_SYSTEM,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
-import { isGraphExtractionEnabled, getGraphProvenanceMode } from "../config.js";
+import {
+  isGraphExtractionEnabled,
+  getGraphProvenanceMode,
+  getGraphRowBatchCap,
+} from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import {
@@ -746,6 +750,24 @@ function unionIds(...lists: Array<string[] | undefined>): string[] {
   return [...new Set(lists.flatMap((l) => l ?? []))];
 }
 
+// KTD2's ceiling. Keeps the most recent GRAPH_ROW_BATCH_CAP ids by dropping from
+// the front, which is oldest-first because unionIds preserves append order. The
+// survivors keep their relative order, which graph-provenance.ts:12-14 makes
+// part of the contract: retrieval scores by first-seen.
+//
+// The accepted regression, stated in KTD2 rather than discovered later: a row
+// touched by more than the cap resolves only its most recent batches through
+// graph-retrieval.ts, which uses that direction to dedupe and label rather than
+// for correctness. Cascade is exact regardless, because U3 made it read
+// mem:graph:obs-index instead of the row -- which is why KTD5 required U3 to
+// land before this cap, and it has.
+//
+// graph-store.ts caps mem:graph:obs-index the same way, with its own constant.
+function capBatchIds(ids: string[]): string[] {
+  const cap = getGraphRowBatchCap();
+  return ids.length > cap ? ids.slice(ids.length - cap) : ids;
+}
+
 function mergeNode(
   existing: GraphNode,
   incoming: GraphNode,
@@ -759,7 +781,9 @@ function mergeNode(
     updatedAt: capturedAt,
   };
   if (batchId) {
-    merged.sourceBatchIds = unionIds(existing.sourceBatchIds, [batchId]);
+    merged.sourceBatchIds = capBatchIds(
+      unionIds(existing.sourceBatchIds, [batchId]),
+    );
   } else {
     merged.sourceObservationIds = unionIds(
       existing.sourceObservationIds,
@@ -777,7 +801,9 @@ function mergeEdge(
 ): GraphEdge {
   const merged: GraphEdge = { ...existing };
   if (batchId) {
-    merged.sourceBatchIds = unionIds(existing.sourceBatchIds, [batchId]);
+    merged.sourceBatchIds = capBatchIds(
+      unionIds(existing.sourceBatchIds, [batchId]),
+    );
   } else {
     merged.sourceObservationIds = unionIds(existing.sourceObservationIds, obsIds);
   }

@@ -18,6 +18,8 @@ import type {
   GraphNode,
   Memory,
 } from "../src/types.js";
+import { GRAPH_ROW_BATCH_CAP_DEFAULT } from "../src/config.js";
+import { payloadByteLength } from "../src/state/frame-guard.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 
 // U3 of the memory-reduction ladder. Every LLM-extracted node and edge used to
@@ -148,6 +150,96 @@ describe("batch provenance is not gated on the LLM flag", () => {
     await sdk.trigger("mem::graph-extract", { observations: [obs("o1")] });
 
     expect(await rows("mem:graph:batches")).toHaveLength(0);
+  });
+});
+
+// KTD2. Batch provenance divides the growth term; the cap removes it. Without
+// the cap a row still grows one id per extract that touches it, without bound,
+// and a 9 MB scope that regrows on a several-megabyte-per-hour term does not
+// hold for a week.
+describe("a row's batch provenance has a ceiling", () => {
+  // Shaped the way both extractors stamp a row in batch mode, because
+  // persistGraphDelta writes a new row verbatim and only the merge path caps.
+  const node = (id: string, name: string, batchId: string): GraphNode => ({
+    id,
+    type: "concept",
+    name,
+    properties: {},
+    sourceObservationIds: [],
+    sourceBatchIds: [batchId],
+    createdAt: "2026-09-01T00:00:00Z",
+  });
+
+  const mergeAcross = async (batchIds: string[], obsPerBatch: number) => {
+    for (const batchId of batchIds) {
+      const obsIds = Array.from(
+        { length: obsPerBatch },
+        (_, i) => `obs_${batchId}_${i}`,
+      );
+      await persistGraphDelta(
+        kv as never,
+        [node("gn_fresh", "Alpha", batchId)],
+        [] as GraphEdge[],
+        obsIds,
+        batchId,
+      );
+    }
+    return (await rows<GraphNode>("mem:graph:nodes"))[0]!;
+  };
+
+  it("stops growing with batch size", async () => {
+    // Three extracts of 50 observations each. Legacy provenance unions all 150
+    // ids into the row; batch provenance adds three strings.
+    const row = await mergeAcross(["gb_1", "gb_2", "gb_3"], 50);
+
+    expect(row.sourceBatchIds).toEqual(["gb_1", "gb_2", "gb_3"]);
+    expect(row.sourceObservationIds).toEqual([]);
+  });
+
+  it("keeps the most recent GRAPH_ROW_BATCH_CAP ids, in order, under 1.5 KiB", async () => {
+    // The literal is the oracle, not the imported constant. Deriving the
+    // fixture from the constant makes the cap its own test: raising it raises
+    // the expectation with it and nothing can fail.
+    expect(GRAPH_ROW_BATCH_CAP_DEFAULT).toBe(32);
+    const cap = 32;
+    const batchIds = Array.from({ length: cap + 10 }, (_, i) => `gb_${i}`);
+
+    const row = await mergeAcross(batchIds, 1);
+
+    expect(row.sourceBatchIds).toHaveLength(cap);
+    // The most recent, and their relative order intact: graph-provenance.ts
+    // resolves inline ids then each batch's in batch order, and retrieval
+    // scores by first-seen, so the order is contract rather than incidental.
+    expect(row.sourceBatchIds).toEqual(batchIds.slice(10));
+    expect(payloadByteLength(row)).toBeLessThan(1536);
+  });
+
+  it("caps an edge row the same way", async () => {
+    const cap = 32;
+    const edge = (id: string, batchId: string): GraphEdge => ({
+      id,
+      type: "related_to",
+      sourceNodeId: "gn_a",
+      targetNodeId: "gn_b",
+      weight: 1,
+      sourceObservationIds: [],
+      sourceBatchIds: [batchId],
+      createdAt: "2026-09-01T00:00:00Z",
+    });
+    const batchIds = Array.from({ length: cap + 10 }, (_, i) => `gb_${i}`);
+    for (const batchId of batchIds) {
+      await persistGraphDelta(
+        kv as never,
+        [] as GraphNode[],
+        [edge("ge_fresh", batchId)],
+        [`obs_${batchId}`],
+        batchId,
+      );
+    }
+
+    const row = (await rows<GraphEdge>("mem:graph:edges"))[0]!;
+    expect(row.sourceBatchIds).toEqual(batchIds.slice(10));
+    expect(payloadByteLength(row)).toBeLessThan(1536);
   });
 });
 
