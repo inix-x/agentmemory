@@ -38,6 +38,25 @@ function stub(name: string) {
   writeFileSync(join(dir, "bin", name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 }
 
+// `date` counts its calls instead of reading the clock, so a retire stamp is
+// the number of times the script asked for one. A helper that stamps per call
+// then puts every file in its own directory on every run, and the one-stamp
+// assertion below fails it every time, not only when the loop straddles a
+// second boundary.
+function stubDate() {
+  writeFileSync(
+    join(dir, "bin", "date"),
+    [
+      "#!/bin/sh",
+      'n=$(($(cat "$HOME/.date-calls" 2>/dev/null || echo 0) + 1))',
+      'echo "$n" > "$HOME/.date-calls"',
+      'printf "20260906T%06dZ\\n" "$n"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+}
+
 function boot(extra: Record<string, string> = {}): string {
   const env = {
     PATH: `${join(dir, "bin")}:${process.env["PATH"] ?? "/usr/bin:/bin"}`,
@@ -74,6 +93,7 @@ beforeEach(() => {
   mkdirSync(storeDir(), { recursive: true });
   stub("chown");
   stub("gosu");
+  stubDate();
 });
 
 afterEach(() => {
@@ -254,6 +274,22 @@ describe("entrypoint retires index generations the manifest does not name", { ti
       "index generation retire skipped, no live generation read from mem%3Aindex%3Abm25.bin",
     );
     expect(out).not.toContain("no mem%3Aindex%3Abm25.bin on disk");
+    expect(existsSync(retiredRoot())).toBe(false);
+  });
+
+  // The reader's guard is on the whole read. A manifest that parses but names
+  // no generation must take the same skip as an unparseable one: without the
+  // guard the reader prints an empty list, which is non-empty to the shell, and
+  // every generation on disk reads as dead.
+  it("moves nothing when the manifest parses but names no generation", () => {
+    seedGenerations();
+    seedManifest({});
+
+    const out = boot({ INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" });
+
+    expect(out).toContain(
+      "index generation retire skipped, no live generation read from mem%3Aindex%3Abm25.bin",
+    );
     expect(existsSync(retiredRoot())).toBe(false);
   });
 
