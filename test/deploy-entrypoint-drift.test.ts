@@ -61,6 +61,8 @@ describe("deploy entrypoint drift", () => {
   // The entrypoints point at one doc rather than carrying six copies of its
   // prose. That pointer is a path, and code() strips every `#` line, so the
   // guard above cannot see it dangle. This can, and it names the path it lost.
+  // The target has to be committed, not merely present: a doc that exists only
+  // in a working tree resolves for whoever wrote it and for nobody else.
   it("the docs the entrypoints point at exist", () => {
     const missing = TARGETS.flatMap((t) =>
       [...files[t].matchAll(/docs\/\S+\.md/g)].map((m) => m[0]),
