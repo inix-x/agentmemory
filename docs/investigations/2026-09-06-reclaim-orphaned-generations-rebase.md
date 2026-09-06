@@ -677,7 +677,10 @@ The reader takes `data:manifest` and `vectors:manifest` by key name and reads
 The engine writes a scope as
 `rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`: the scope's JSON
 object as raw bytes from offset 0, then a short rkyv trailer. So the JSON body is
-`data[0 .. rfind("}") + 1]`, which is what `raw.lastIndexOf(0x7d) + 1` takes.
+`data[0 .. rfind("}") + 1]`, except that the trailer encodes the body length and
+one of its bytes can itself be `0x7d`. The reader takes the last `}` and, on a
+parse failure, retries from the one before it while the candidate stays within
+the last 12 bytes, which is the whole trailer.
 
 The derivation was first written up in the graph memory redesign plan's Appendix,
 verified there against both graph scope files to within one byte. It is restated
@@ -688,12 +691,15 @@ A value under a manifest key is read as an object or as a JSON-encoded string,
 because which one the engine writes is not pinned by a type in this repo. Both
 are handled and both are tested.
 
-**Ceiling.** `raw.lastIndexOf(0x7d)` is the only place in this repo coupled to
-the engine's on-disk scope format. Grepping `src/`, `test/`, and `scripts/` for a
-raw scope-file read returns this change and nothing else. An engine upgrade that
-changes the trailer breaks the reader in the fail-closed direction, so the cost
-is a skipped retire and not a lost index. The entrypoint carries a `ponytail:`
-marker naming that ceiling.
+**Ceiling.** The last-`}` scan is the only place in this repo coupled to the
+engine's on-disk scope format. Grepping `src/`, `test/`, and `scripts/` for a
+raw scope-file read returns this change and nothing else. The scan is not exact:
+the trailer encodes the body length, so one of its bytes can be `0x7d`, and the
+reader tolerates that by retrying from the previous `}` within the last 12
+bytes. That covers the trailer as it ships. An engine upgrade that changes the
+trailer still breaks the reader in the fail-closed direction, so the cost is a
+skipped retire and not a lost index. The entrypoint carries a `ponytail:` marker
+naming that ceiling.
 
 ---
 
@@ -1205,3 +1211,195 @@ row from 2 to 3 with two rows added for m8 and m9, and the `npm test` totals fro
 1997 and 1996 to 1998 and 1997. The round-2, round-3, and round-4 records above
 are point-in-time measurements at named heads and keep their numbers, as the
 round-3 record says of the round-2 table.
+
+## review round 6 fixes
+
+Round 6 ran two lenses over `77369a3`. Lens A (code review) returned 0 P0, 0 P1,
+0 P2, and 7 P3, grouped into four fixes: F1, the reader failing closed on a
+computable class of manifest body lengths under today's trailer; F2, a
+test-strength gap with a measured surviving mutation; F3 to F6, four doc or
+comment numbers and wordings; and F7, a stale phrase in a comment carried by all
+four entrypoint copies. Lens B (ponytail) returned SHIP AFTER 2 CUTS, worth -12
+lines. All seven findings and both cuts were accepted.
+
+For F1 the bounded retry was taken rather than the disclose-only alternative the
+report priced alongside it. A reader that skips a healthy store on every body
+length congruent to 125 modulo 256, and logs that skip as the on-disk shape
+assumption breaking, is a defect and not a documentation gap, and F7 moves a hash
+in the same round either way.
+
+Both round-6 reports are untracked, as every round's are, because `docs/` sits in
+`.git/info/exclude`.
+
+### Commits
+
+| commit | finding | what |
+|---|---|---|
+| `9270947` | A F1, Fix A | the reader retries from the previous `}` when a trailer byte is `0x7d`, and one test seeding a colliding body length |
+| `5b59f54` | A F2, Fix B | two assertions anchoring the idempotent test and pinning the no-directory contract |
+| `3f15d23` | B C1 | `stubDate` folded into `stub(name, body)`, with the bytes written unchanged |
+| `6e13296` | A F7, Fix D | "and graph" dropped from the helper contract comment in all four copies |
+| `eee66c3` | A F3 to F6, Fix C | a live test count, the `needsRebuild` citation at two sites, a stamp width, and the "silent no-op" wording |
+| `e596d00` | B C2 | the two round-5 rows dropped from the round-4 commits table |
+| this commit | the record | this section, the region ranges and hashes, and every live count the new test moves |
+
+`9270947` was reworded after `e596d00` landed, by an autosquash rebase that
+renumbered the five commits above it. The content diff against `77369a3` is
+byte-identical across that rewrite, checked by diffing it before and after.
+
+### F1's mechanism
+
+The engine frames a scope as the JSON body from offset 0, zero padding to a
+4-byte boundary, then rkyv's 8-byte string root holding the body length as a
+little-endian `u32` and a negative relative pointer, so the trailer encodes the
+length and one of its bytes can itself be `0x7d`. Computed over every body length
+from 1 to 70,000 with that layout, `lastIndexOf(0x7d)` lands in the trailer for
+**every length congruent to 125 modulo 256**, plus the two bands **32,000 to
+32,255** (the length's second byte) and **33,281 to 33,536** (the pointer's second
+byte): 783 of 70,000, and 1 in 256 outside the bands.
+
+The reader now retries from the previous `}` while the candidate index stays at
+or above `raw.length - 12`. The trailer is at most 11 bytes, 3 of padding plus the
+8-byte root, so the body's closing brace is always inside that window and the
+retry is bounded by construction rather than by a loop limit. The report's
+refutation of the correctness lens's "congruent to 131 modulo 256" class holds
+here too: the pointer is a multiple of 4 and `0x7d` is odd.
+
+The test seeds a 1405-byte body, congruent to 125 modulo 256, which frames to 1416
+bytes with the body's brace at 1404 and a trailer `0x7d` at 1408. That is the
+tightest case in the class, because `raw.length - 12` is 1404, exactly the body's
+brace, so the fixture pins the bound rather than clearing it. Driven through the
+real entrypoint at `77369a3` that fixture logged `index generation retire skipped,
+no live generation read from mem%3Aindex%3Abm25.bin` and moved nothing; after the
+fix the same fixture retired 5 shards and 1500 bytes.
+
+The reader's comment block was trued in the same commit. `:174-175` reads a
+present-but-unreadable manifest as the on-disk shape assumption breaking, which
+the retry is what makes true, and `:176-177` now says so.
+
+### The region ranges and hashes
+
+Fix A added 9 lines inside the retire region and Fix D changed one line above it,
+so both spans move. Measured on each of the four copies rather than on one and
+inferred:
+
+| span | `shasum` | what it is |
+|---|---|---|
+| 93 to 234 | `f23ea18a0733` | the retire region, identical on all four copies |
+| 89 to 234 | `be42b04fd45f` | the helper's comment block plus the region, identical on all four copies |
+
+`retire_matching_file() {` still opens at 93, the blank line that closes the region
+is 234, and `cat > "$III_CONFIG" <<'EOF'` is 235.
+
+Every site carrying the old `9e1e9bd1bb4d` or `5d9bb326252f` was checked against
+the discriminator this doc already uses: a sentence that names a head is a
+point-in-time record and keeps its numbers, and a sentence that says "at head"
+with no anchor is a live claim and gets trued. All six name a head, so none moves:
+
+- `:834`, in the round-2 record, which `:819` and `:830` anchor to `bcdb75b`.
+- `:975` and `:978`, in the round-3 record, describing what `f67bec4` corrected.
+- `:1035` and `:1037`, the round-3 gates, which `:1020` and `:1029` anchor to
+  `f67bec4`.
+- `:1071` to `:1074` and `:1077`, the round-4 P3-1 span table, which `:1065`
+  anchors to `06e0f98`.
+- `:1111`, the round-4 re-check, which `:1109` anchors to `ea76542`.
+- `:1164`, the round-5 statement that the entrypoints did not change in that
+  round, which `:1193` anchors to `7ee0d10`.
+
+The PR body carries neither hash. So the new pair lives only in the table above.
+
+That declines F7's cost line, which said the `5d9bb326252f` sites at the round-3
+gates and the round-4 span table move. Both record a measurement that was correct
+at the head it names, and the convention that keeps them is the one the end of the
+round-5 record states. Nothing there is a claim about the current head.
+
+### Mutations, re-run at `e596d00`
+
+Baseline 19 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four entrypoint
+copies with `git diff --numstat` confirming 4 files changed each time, both files
+run with `--reporter=verbose`, the copies restored with `git checkout -- deploy`
+and the tree checked clean before the next. Run in a detached worktree at
+`e596d00`, so the branch worktree was never mutated.
+
+| mutation | round 5 | round 6 | test that dies |
+|---|---|---|---|
+| m1 live filter never matches | 3 fail | **5 fail** | moves-five, JSON-encoded values, substring neighbour, idempotent, rkyv trailer |
+| m2 both fail-closed guards removed | 3 fail | 3 fail | absent manifest, unparseable manifest, names-no-generation |
+| m3 shared helper clobbers `_sep` | 3 fail | **5 fail** | the same five as m1 |
+| m4 `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| m5 per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| m6 batch destination scattered one file per directory | 1 fail | **2 fail** | helper batch mode, idempotent |
+| m7 doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+| m8 helper stamps per call instead of once for the run | 1 fail | **2 fail** | helper batch mode, idempotent |
+| m9 reader's `out.length === 0` guard deleted | 1 fail | 1 fail | names-no-generation |
+| m10 eager `mkdir` after the stamp line | **0 fail, survived** | **1 fail** | idempotent |
+| m11 the trailer retry removed | not run | **1 fail** | rkyv trailer |
+
+No mutation survives. m10 is the round-6 report's m10a. It was measured surviving
+19 of 19 against the test file before Fix B and dies after it, which is the
+measurement F2 rests on.
+
+m11 kills exactly one test and no other, which is the check that the retry changed
+no existing path. Every other fixture writes the four-byte stand-in trailer, which
+holds no `0x7d`, so the first `lastIndexOf` already lands on the body's brace and
+the retry never fires.
+
+The four strengthened rows are Fix A's and Fix B's doing rather than new
+mutations. The new trailer test and the now-anchored idempotent test both die
+under m1 and m3, and the idempotent test's directory-count assertion also catches
+m6 and m8.
+
+One harness correction, recorded because the first run of it read as a survivor.
+m6 was first encoded as `"${_retire_dest:-…}/$_name"`, which appends the filename
+outside the `:-` default and therefore nests one directory per file under the
+single stamp, leaving both `retiredFiles()` and the stamp count unchanged: 19 of
+19 green. That is not the mutation the round-5 record describes, which replaces
+the whole expansion and appends the name to the stamp itself, so each file gets
+its own stamp directory. Re-encoded that way it dies, 2 of 19. The survivor was
+the harness, not the tests.
+
+### Gates, measured at `e596d00`
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1998 passed, 1 skipped (1999)**. **Exit 0.** The +1 is Fix A's test. No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 6567 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays excluded.
+
+Fail-first, the branch's test file copied into a pristine `878174f` worktree:
+**10 of 13 fail**, read from `--reporter=verbose`. Three pass: the positive
+control, the flag-unset guard, and the helper's unset mode.
+
+The idempotent guard moved from the passing side to the failing side, and prior
+rounds had four passing rather than three for that reason. At `878174f` nothing is
+retired, so `after` is empty and Fix B's `toEqual(deadFiles().sort())` fails there.
+That flip is a second measurement that Fix B added a real anchor, independent of
+m10: the old test passed at a head where the feature does not exist.
+
+### The counts the new tests moved
+
+Fix A adds one test and Fix B adds two assertions to an existing one, so the file
+goes from twelve tests to thirteen and from nine index tests to ten. Live counts
+changed in the PR body: "Twelve tests" and "nine index tests" to thirteen and ten
+at `:191`, "8 of the 12 fail" to 10 of 13 and "Four pass" to "Three pass" at
+`:198-201`, two mutation rows added at `:217-218` with the paragraph below them
+retold at `:220-226`, and the `npm test` totals from 1998 and 1997 to 1999 and
+1998 at `:242`.
+
+Three prose sites now say the reader tolerates a `0x7d` inside the trailer: the PR
+body's format bullet at `:31-44`, this doc's format section at `:679-683`, and its
+ceiling paragraph at `:694-702`. The ceiling had read as if the last-`}` scan were
+exact, which round 2 settled only for the case of an engine upgrade changing the
+trailer. This is the trailer as it ships, so it narrows that paragraph rather than
+re-raising it.
+
+`eee66c3` had already trued the as-of marker's live count at `:589`, and it carries
+1998 rather than the 1997 the round-6 report named at `77369a3`, because Fix A's
+test had landed by the time that commit was written. Writing 1997 there would have
+reproduced the finding it fixes.
+
+The round-2 through round-5 records above are point-in-time measurements at named
+heads and keep their numbers, as the round-3 record says of the round-2 table.

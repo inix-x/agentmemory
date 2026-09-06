@@ -29,10 +29,14 @@ nothing else from the sandbox experiment stack it was developed on: no
   fact, once per boot, so the store sawtooths instead of growing without bound.
   The per-boot reclaim belongs in the gc ledger and is a separate change.
 - **The reader is coupled to the engine's on-disk scope format, and no type in
-  this repo pins that format.** `raw.lastIndexOf(0x7d)` takes the JSON body as
-  everything up to the last `}`, because the engine writes a scope as
+  this repo pins that format.** The reader takes the JSON body as everything up
+  to the last `}`, because the engine writes a scope as
   `rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`: the JSON object
-  from offset 0, then a short rkyv trailer. Grepping `src/`, `test/`, and
+  from offset 0, then a short rkyv trailer. That trailer encodes the body length,
+  so one of its bytes can itself be `0x7d`. The reader therefore retries from the
+  previous `}` while the candidate stays within the last 12 bytes, which is what
+  keeps a body length whose low byte is `0x7d` from reading as a broken file.
+  Grepping `src/`, `test/`, and
   `scripts/` for a raw scope-file read returns this change and nothing else, so
   this is the only such coupling in the repo. An engine upgrade that changes the
   trailer breaks the reader in the fail-closed direction: the cost is a skipped
@@ -184,17 +188,17 @@ value is not read as consent to move an index.
 
 ## Tests
 
-Twelve tests in `test/deploy-entrypoint-index-retire.test.ts`: nine index tests,
+Thirteen tests in `test/deploy-entrypoint-index-retire.test.ts`: ten index tests,
 two that pin the shared helper's two modes, and a positive control. They run
 against the real entrypoint rather than an extracted function, so the flag gate
 and the ordering ahead of the engine config are the ones that ship. The positive
 control asserts the already-shipped stream retire, so a "nothing was retired"
 result cannot be a script that died on line one.
 
-Run against unmodified `878174f` first: **8 of the 12 fail**, with the failure
-text read rather than assumed. Four pass there: the positive control, the two
-guard tests, and the helper's unset mode. The guards pass vacuously because
-nothing moves at all. The helper's unset mode is the shipped path the audit
+Run against unmodified `878174f` first: **10 of the 13 fail**, with the failure
+text read rather than assumed. Three pass there: the positive control, the
+flag-unset guard, and the helper's unset mode. That guard passes vacuously
+because nothing moves at all. The helper's unset mode is the shipped path the audit
 callers take, and it passes at `878174f` on purpose, because this branch must not
 change it; its proof is the mutation below, not the fail-first. Every mutation
 dies:
@@ -210,8 +214,15 @@ dies:
 | the entrypoints' doc pointer rewritten to a path that does not exist | 1 drift test fails |
 | a batch retire stamped per call instead of once for the run | 1 test fails |
 | the reader's empty-list guard deleted | 1 test fails |
+| a batch retire whose stamp directory is created eagerly | 1 test fails |
+| the reader's retry past a `0x7d` in the trailer removed | 1 test fails |
 
-The last two were measured surviving in review round 4. The per-call stamp
+The last two were measured surviving in review round 6. The eager `mkdir` left
+the idempotent test green, because that test read only the files under
+`retired/` and an empty stamp directory contributes none of them; two assertions
+now anchor it. Removing the retry restores the pre-fix reader and fails the one
+test that seeds a colliding body length. The two before them were measured
+surviving in review round 4. The per-call stamp
 survived because the one-stamp assertion could only catch it when the loop
 straddled a second boundary, so `date` is stubbed to a call counter and it now
 fails on every run. The deleted guard made a manifest that parses but names no
@@ -228,7 +239,7 @@ longer does. The failure is unreachable on today's ids, because `generateId`
 mints a fixed-length id until roughly 2059, so this is a fixture and not a bug
 report.
 
-Gates: `npm test` exit 0 (183 files: 182 passed, 1 skipped; 1998 tests: 1997
+Gates: `npm test` exit 0 (183 files: 182 passed, 1 skipped; 1999 tests: 1998
 passed, 1 skipped). `npx tsc --noEmit` at the pre-existing 29-error baseline,
 verified by running tsc on a detached worktree at `878174f` and diffing the
 sorted error lists rather than the counts: the diff is empty. `npm run build`
