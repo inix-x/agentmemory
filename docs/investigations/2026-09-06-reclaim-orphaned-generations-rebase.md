@@ -869,3 +869,151 @@ The four entrypoints are byte-identical over the whole retire region, lines 95 t
   `docs/investigations/`, which is excluded from git here, so they resolve
   locally and not for a reader of the branch. That is pre-existing, it applies to
   the PR body as well, and neither round-2 lens raised it.
+
+## review round 3 fixes
+
+Round 3 ran two lenses over `66e5996`. Lens B (ponytail, ULTRA) returned SHIP
+AFTER 3 CUTS, worth -13 lines. Lens A (code review) returned 0 P0, 0 P1, 0 P2,
+and 3 P3, all of them numbers in the two committed docs. Both reports are
+untracked, as the round-1 and round-2 reports are:
+`docs/investigations/2026-09-06-retire-idx-ponytail-review-r3.md` and
+`-code-review-r3.md`.
+
+### Commits
+
+| commit | lens | what |
+|---|---|---|
+| `403d13a` | B cut 1 | helper contract comment, six lines to four, all four entrypoints |
+| `37cfbaf` | B cuts 2 and 3 | duplicated summary-line assertion, and a comment the check cannot honour |
+| `f67bec4` | A P3-1, P3-2, P3-3 | three counts corrected across the two docs and one test comment |
+| `a6fe99c` | consequence of `37cfbaf` | two PR-body mutation counts re-trued, and the follow-up count replaced by its boundary |
+
+Follow-ups after `a12dbdc` at this head: **19**, by
+`git rev-list --count a12dbdc..HEAD`.
+
+### The three cuts
+
+**Cut 1, `403d13a`.** The comment above `retire_matching_file()` still ended by
+restating what the call site says with its reasons attached, because `7f2c10a`
+removed the `if` those two-and-a-half lines described and left them standing. The
+sentence now ends one clause early. This is comment, which `code()` normalises
+away, so `deploy-entrypoint-drift` cannot see it applied to three copies out of
+four. It was applied by hand to all four and re-checked by hash.
+
+**Cut 2, in `37cfbaf`.** The batch-mode helper test asserted the summary-line
+template character for character identically to "moves the five dead generations
+and leaves the live one", under the same setup. The two assertions above it, the
+one-stamp-directory count and the no-per-file-echo regex, are what make the batch
+test discriminating and they stay.
+
+**Cut 3, in `37cfbaf`.** The doc-pointer guard's comment claimed the target has to
+be committed rather than merely present. The check below it is `existsSync`,
+which reads the working tree, so nothing enforces that. The three lines above it
+stay.
+
+Lens A read the same two lines and called them accurate, as a requirement on the
+author rather than a claim about `existsSync`. The two readings do not conflict on
+the fact, only on whether a test comment should carry a requirement its test
+cannot check. Lens B's reading was taken. The requirement itself is not lost: it
+is stated here, and `docs/` being in `.git/info/exclude` means a new pointer's
+target is untracked and does not appear in `git status`, so an author adding one
+has to `git add -f` it.
+
+### The three counts
+
+**P3-1, "six copies of the prose" is five.** Measured at `a12dbdc` with
+`git grep -l` on three different phrases from the duplicated paragraph:
+
+```
+git grep -l '1,104 MiB'      a12dbdc  -> 4 entrypoints + index test = 5
+git grep -l '847 MiB'        a12dbdc  -> 4 entrypoints + index test = 5
+git grep -l 'rkyv::to_bytes' a12dbdc  -> 4 entrypoints + index test = 5
+```
+
+Four sites carried the claim and one of them is shipped test code. Where the
+claim is about carriers it now says five and names the index test as the fifth.
+Where it is about the entrypoints alone, which is the PR body's drift paragraph
+and the drift test's own comment, it says four. `git grep 'six copies'` over the
+tracked files returns nothing.
+
+**P3-2, the evidence window.** The paragraph said "six follow-up commits" when ten
+existed at the moment it was authored, and it anchored every sandbox number to
+`1d6891d`, which is not reachable from this branch. It now names `a12dbdc` as
+`1d6891d`'s rebased equivalent and the first commit of this PR, gives the
+02:58:06Z boot the numbers were read at, and points at `git diff a12dbdc..HEAD`
+so the byte-identity claim can be checked rather than trusted.
+
+`f67bec4` first replaced the count with "eighteen", predicting the head after one
+more commit. That prediction was never true at any head, which is the fourth time
+this integer has been wrong, so `a6fe99c` removed it and gave the boundary and the
+listing command instead. The measured count lives here, above, where a
+point-in-time number belongs.
+
+**P3-3, the rebase doc's own two errors.** The `### Limitations` block still
+listed `_gbase`, which `f527c4d` deleted. `git grep _gbase` at head returns
+exactly that one line. The block is a point-in-time record of `1d6891d`, so it
+keeps its bullets and gains an as-of marker naming three that read as durable
+claims about the code and are not.
+
+The byte-identity sentence paired `shasum` `9e1e9bd1bb4d` with lines 95 to 228.
+That hash is lines 95 to 227 at `66e5996`, and 228 was `cat > "$III_CONFIG"`,
+outside the retire region. Cut 1 moved the region up two lines, so the sentence
+now reads lines 95 to 225 at `13cb38b03420`.
+
+### What the cuts moved, and was re-trued
+
+Cut 2 removed the batch test's only reader of the two mutations that break
+selection, so both fall from 4 dying tests to 3. Every mutation still dies, and
+nothing was killed only by the deleted line, which is why the cut was sound. The
+two PR-body rows were corrected in `a6fe99c`. The round-2 mutation table above is
+a point-in-time record of that round and keeps its numbers.
+
+Cut 2 does not touch the fail-first record. Re-run at `878174f` with the branch's
+test file copied into an otherwise pristine worktree: **7 of 11 fail**, and the
+four that pass are the same four the PR body names, read from `--reporter=verbose`
+output rather than inferred.
+
+### The item priced and not taken
+
+Lens B priced folding the batch-mode test into the `L185` test at about -13 more
+lines and excluded it from its own count, calling it a consolidation of code that
+should exist rather than dead weight. It was not taken. It would drop the index
+test file from 11 tests to 10, which stales the fail-first record above, the named
+test in the transcript, and the mutation table's attribution for the batch row.
+
+### Mutations, re-run at `f67bec4`
+
+Baseline 17 tests across `deploy-entrypoint-index-retire` and
+`deploy-entrypoint-drift`, all green. Every mutation applied to all four
+entrypoint copies. Harness and per-run output in the round-3 scratchpad.
+
+| mutation | after round-2 fixes | after round-3 fixes | test that dies |
+|---|---|---|---|
+| live filter never matches | 4 fail | **3 fail** | moves-five, JSON-encoded values, substring neighbour |
+| both fail-closed guards removed | 2 fail | 2 fail | absent manifest, unparseable manifest |
+| shared helper clobbers `_sep` | 4 fail | **3 fail** | the same three |
+| `\|` delimiters removed | 1 fail | 1 fail | substring neighbour |
+| per-file log `echo` replaced with `:` | 1 fail | 1 fail | helper unset mode |
+| batch destination scattered one file per directory | 1 fail | 1 fail | helper batch mode |
+| doc pointer rewritten to a path that does not exist | 1 fail of 6 drift | 1 fail of 6 drift | drift path-exists |
+
+No mutation survives.
+
+### Gates, measured at `f67bec4` in a detached worktree
+
+| gate | result |
+|---|---|
+| `npm test` | Test Files **182 passed, 1 skipped (183)**. Tests **1996 passed, 1 skipped (1997)**. **Exit 0.** No failure to trace, and none of the known flakes appeared. |
+| `npx tsc --noEmit` | **29 errors** at head, **29** on a pristine `878174f` worktree, `diff` of the two sorted error lists **empty**. Exit 2 on both, which is the pre-existing baseline. |
+| `npm run build` | **Exit 0.** 20 files, 3.17 MB, 3706 ms. |
+
+`npm test` and not bare `vitest run`, so `test/integration.test.ts` stays
+excluded. The gates were run at `f67bec4`. `a6fe99c` and this section are
+documentation, and the only test that reads anything under `docs/` reads a path
+and not a file's contents.
+
+The four entrypoints are byte-identical over the whole retire region after cut 1,
+measured on each of the four rather than on one and inferred: lines 95 to 225,
+`shasum` `13cb38b03420` on railway, fly, render, and coolify. The helper's
+comment block plus the retire region, lines 89 to 224, agrees the same way at
+`e6957b99a290`.
