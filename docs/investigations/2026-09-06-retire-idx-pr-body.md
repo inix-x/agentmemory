@@ -106,11 +106,12 @@ rather than the five copies of the prose they used to carry.
 Its rebased equivalent in this PR is `a12dbdc`, the first commit here. Every
 sandbox number below was read off that deployment, which booted at 02:58:06Z.
 Everything after `a12dbdc` is review follow-up, authored three to five hours later
-and listed by `git log a12dbdc..HEAD`. The selection logic (the glob, the manifest
-read, the live filter) is byte-identical from `1d6891d` to the current head, so the
-numbers still describe the code being merged, and `git diff a12dbdc..HEAD` is the
-in-PR way to check it. What changed after the measurement is the logging, the
-destination stamp, and the shared helper.
+and listed by `git log a12dbdc..HEAD`. The glob and the live filter are
+byte-identical from `1d6891d` to the current head, and `git diff a12dbdc..HEAD` is
+the in-PR way to check that. The manifest read gained a bounded retry past a `0x7d`
+in the rkyv trailer, a strict superset of what it parsed before, so the numbers
+still describe the code being merged. What else changed after the measurement is
+the logging, the destination stamp, and the shared helper.
 
 **Sandbox, deployed and measured (experiment log tick 35, 2026-09-06 02:59Z).**
 The deployment of the change booted at 02:58:06Z and the worker registered 16 s
@@ -205,14 +206,14 @@ dies:
 
 | mutation | result |
 |---|---|
-| live filter never matches | 3 tests fail |
+| live filter never matches | 5 tests fail |
 | fail-closed guards removed | 3 tests fail |
-| shared helper clobbers a loop variable | 3 tests fail |
+| shared helper clobbers a loop variable | 5 tests fail |
 | `\|` delimiters removed from the live test | 1 test fails |
 | per-file log line replaced with `:` | 1 test fails |
-| a batch retire scattered one file per directory | 1 test fails |
+| a batch retire scattered one file per directory | 2 tests fail |
 | the entrypoints' doc pointer rewritten to a path that does not exist | 1 drift test fails |
-| a batch retire stamped per call instead of once for the run | 1 test fails |
+| a batch retire stamped per call instead of once for the run | 2 tests fail |
 | the reader's empty-list guard deleted | 1 test fails |
 | a batch retire whose stamp directory is created eagerly | 1 test fails |
 | the reader's retry past a `0x7d` in the trailer removed | 1 test fails |
@@ -232,6 +233,12 @@ did. The three before them were measured surviving before that. Replacing the
 per-file log line with `:` in all four entrypoints left the **entire suite
 green**, 182 files and 1993 tests, so nothing anywhere pinned that line; the
 same mutation now fails one test.
+
+Four rows above moved without a new mutation being written for them. The trailer
+test and the two idempotent assertions now also die under the live filter, the
+shared helper, the scattered destination, and the per-call stamp, which is why
+those rows read 5, 5, 2, and 2 rather than the 3, 3, 1, and 1 an earlier round
+measured.
 
 The delimiter row is worth calling out. The live test is an exact-element test against
 a pipe-delimited list, and until this branch nothing pinned the delimiters:
