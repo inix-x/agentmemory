@@ -9,7 +9,7 @@ parent: d41fa2a
 
 # U2 build record: bounded node cost
 
-Five commits on `feat/u2-bounded-graph-rows`, branched off U3's head `d41fa2a`
+Seven commits on `feat/u2-bounded-graph-rows`, branched off U3's head `d41fa2a`
 so the cascade rewiring KTD5 requires is already in place. Code and tests only:
 the one-time rewrite runs on the sandbox later. Not pushed, not deployed.
 
@@ -54,6 +54,8 @@ the one-time rewrite runs on the sandbox later. Not pushed, not deployed.
 | `e47717e` | `test(cascade): flag parity under legacy and batch provenance` | R6. A pin, and it passes on the parent. Compares flagged row identities and an absolute expected set, not only parity. |
 | `dd555e1` | `feat(graph): offline rewrite tool for the graph row scopes` | `scripts/graph-rewrite/rewrite.py`. Census parser plus a writer; emits three JSON streams; refuses on a changed `resetAt`. |
 | `0eab98f` | `feat(graph): load rewritten rows through the verbatim importer and swap at boot` | `mem::graph-rows-load` plus the entrypoint retirement, both on `GRAPH_ROWS_REWRITE_AT_BOOT`. Recomputes the three derived indexes. |
+| `f6d78d8` | `fix(graph): refuse a rewrite directory that is missing a row stream` | Review pass. The edges stream fell back to `[]`, so a nodes-only directory loaded, recomputed every degree to zero, and returned success -- on the path where the originals are already retired. |
+| `7676f81`, and this edit | `docs(u2)` | This record. |
 
 ## The cap default, and why 32
 
@@ -145,6 +147,7 @@ module; the entrypoint assertion fails on the absent flag.
 | drop the emitter's D2 refusal | `expected [Function] to throw an error` |
 | skip the loader's name-index recompute | the derived-index test dies |
 | drop the flag from one entrypoint | drift test dies on three assertions |
+| make the edges stream optional again | the missing-stream refusal dies |
 
 Two of these are worth naming. The cap-literal mutation only bites because the
 test asserts against a literal 32 with the constant pinned separately; an
@@ -219,9 +222,12 @@ control, not a disappointment.
    `GRAPH_ROWS_REWRITE_AT_BOOT=<dir>` and deploy. In the boot log expect six
    `agentmemory: retired mem%3Agraph%3A….bin, <bytes>` lines, then
    `Graph rows rewrite: loading from <dir>`, then
-   `Graph rows loaded from rewrite` with the counts. If the load reports zero
-   or errors on the first row, the write-to-absent-scope assumption is wrong
-   and the design needs the load to pre-create the scopes instead.
+   `Graph rows loaded from rewrite` with the counts. The signature to watch for
+   is the **absence** of that last line rather than an error in it: if a write
+   to a retired scope fails, the first `putGraphNodeRow` throws, the detached
+   trigger's catch logs `Graph rows rewrite failed to start`, and the success
+   line never appears. That would mean the write-to-absent-scope assumption is
+   wrong and the load has to pre-create the scopes instead.
 6. `GET /agentmemory/diagnostics/store` **immediately after boot**. Expect the
    six graph scopes under 64 MiB, against about 52 MiB projected. Record
    `byScope`.
