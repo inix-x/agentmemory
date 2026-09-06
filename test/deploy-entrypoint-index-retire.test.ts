@@ -109,9 +109,9 @@ describe("the harness reaches the retire steps", () => {
 // <family> is bm25 or vectors, <hex> is minted with the id, <NNNNN> is the shard
 // number. The diagnostics endpoint groups those names by splitting on [:_],
 // which is why byScope reports `mem:index:bm25:bm25:idx:mtj0pzb2`. That grouping
-// key is not a filename and matches nothing on disk. retire_scope cannot spell
-// these either: it encodes a literal scope name, and neither the hex suffix nor
-// the shard number is known before the glob runs.
+// key is not a filename and matches nothing on disk. That is why the loop calls
+// retire_matching_file, which takes a filename: neither the hex suffix nor the
+// shard number is known before the glob runs.
 const MANIFEST_FILE = "mem%3Aindex%3Abm25.bin";
 
 const LIVE_BM25 = "idx_mtow4iaa_1111aaaa2222";

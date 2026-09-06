@@ -493,11 +493,10 @@ that file for a generation id refuses exactly the generations this flag exists
 to move.** The reader takes `data:manifest` and `vectors:manifest` by key name
 and reads `generation` from each.
 
-The file format is documented in
-`docs/plans/2026-09-06-001-graph-memory-redesign-plan.md` Appendix: the engine
-writes a scope as `rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`,
-so the JSON body runs from offset 0 to the last `}`. That appendix verified the
-shape against both graph scope files to within one byte. Values are read as
+The file format was read off the scope files themselves: the engine writes a
+scope as `rkyv::to_bytes(KeyStorage(serde_json::to_string(scope_map)))`, so the
+JSON body runs from offset 0 to the last `}`. That shape was checked against both
+graph scope files and matched to within one byte. Values are read as
 either objects or JSON-encoded strings, because which the engine writes is not
 pinned by a type in this repo and handling both costs one line.
 
