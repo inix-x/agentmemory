@@ -89,9 +89,7 @@ retire_stream_files "$DATA_DIR/stream_store"
 # A caller retiring one named file leaves _retire_dest empty and gets its own
 # stamped directory and one log line, which is what the audit and graph retires
 # above want. A caller retiring many files at once sets _retire_dest to a single
-# stamp and reads _retire_count and _retire_bytes after its loop: the files land
-# in one directory whatever the clock does mid-loop, and the log gets one
-# summary line instead of one line per file.
+# stamp and reads _retire_count and _retire_bytes after its loop.
 retire_matching_file() {
     _dir="$1"
     _name="$2"
