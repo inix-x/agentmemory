@@ -12,8 +12,55 @@ the batches, the obs-index, and the three derived indexes, but never the
 snapshot. So `readSnapshot` returned null, `checkGraphEnumerable` read
 `totalNodes` as null, and it refused before the byte check.
 
-The refusal was correct as a fail-closed. It was uninformative: it reported a
-missing measurement, not a decision about the corpus.
+The refusal was correct as a fail-closed, and it reported a missing measurement
+rather than a decision about the corpus. It also does not last, which is the
+part the prototype doc did not reach. See the next section.
+
+## The defect re-opens a documented outage mechanism, measured on the sandbox
+
+The fail-closed only lasts until the first extract. `persistGraphDelta` reads
+the snapshot raw and, finding it absent, bootstraps an empty one
+(`src/functions/graph.ts:1110-1114`). That snapshot counts the rows that
+extract touched, carries no `resetAt`, and overwrites nothing because nothing
+was there. The guard then sizes a corpus of tens of thousands of rows from a
+count in the low hundreds, and opens.
+
+The comment directly above that code names this as the cause of a production
+outage: an unmarked empty snapshot let "a 414 MB graph scope look enumerable",
+retrieval enumerated the whole scope, the frame passed the websocket 100 MiB
+`maxPayload`, and the worker died in a loop. The fix distinguished a FAILED
+snapshot read, which stamps `resetAt` and stays closed, from a genuinely ABSENT
+one, described as "a cold start with nothing on disk".
+
+The boot swap breaks that second assumption. The entrypoint retires
+`mem:graph:snapshot` while the loader restores every other scope, so the
+snapshot is absent with a full corpus on disk. That case is neither of the two
+the dichotomy covers.
+
+Measured on the sandbox, which ran the swap at 02:16Z on 2026-09-07:
+
+| observation | value |
+|---|---|
+| rows the loader wrote at 02:17:37Z | 37,066 nodes, 77,980 edges |
+| `snapshotTotalNodes` after extracts, 02:36:56Z | 121 |
+| graph enumeration refusals in the retained sandbox log | 0 |
+| graph enumeration refusals on production, same window | 34 |
+
+Both stores run the same `mem::reflect` cycle, and the sandbox refuses
+`mem:semantic` eight times in that log while refusing the graph not once.
+Production, which has never run the swap, refuses the graph on every cycle. The
+sandbox's guard is open over a corpus 306 times larger than its snapshot
+claims.
+
+The consequence on that particular store is bounded, and saying so is part of
+the finding. U2's own rewrite made the rows small: the sandbox's write ledger
+reports `maxBytes` of 489 for a node and 369 for an edge, so enumerating all
+115,046 rows is tens of megabytes, under the 100 MiB payload ceiling. No
+re-registration appears in the log. The safety property is broken; this store
+happens to survive it because the unit that broke it also shrank the rows.
+
+Production is unaffected. It does not run the swap, its snapshot is continuous,
+and its guard refuses correctly.
 
 ## The fix
 
