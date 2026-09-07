@@ -4,7 +4,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { logger } from "../logger.js";
-import { graphWriter } from "./graph.js";
+import { buildSnapshotFromArrays, graphWriter, SNAPSHOT_KEY } from "./graph.js";
 import {
   putGraphEdgeRows,
   putGraphNodeRow,
@@ -148,8 +148,32 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
         stats.degrees++;
       }
 
+      // Last, and only once every row above is down. The entrypoint retires
+      // mem:graph:snapshot with the other five scopes, so without this the
+      // swap leaves no snapshot at all: readSnapshot returns null,
+      // checkGraphEnumerable reads totalNodes as null, and it refuses before
+      // the byte check for a missing measurement rather than on the corpus
+      // size. Built from the rows just loaded, so the counts and the measured
+      // per-row bytes describe what is actually on disk, and so a load that
+      // threw earlier leaves no snapshot overstating a corpus that never
+      // landed. resetAt is deliberately not carried across: the emitter
+      // dropped every pre-resetAt row, so the orphan condition the retired
+      // snapshot recorded is resolved, and carrying it would hold the guard
+      // shut on hasOrphanRows() for a reason that no longer exists.
+      const snapshot = buildSnapshotFromArrays(
+        nodeRows.map((r) => r.value),
+        edgeRows.map((r) => r.value),
+      );
+      await write(KV.graphSnapshot, SNAPSHOT_KEY, snapshot);
+
       const tookMs = Date.now() - started;
-      logger.info("Graph rows loaded from rewrite", { dir, ...stats, tookMs });
+      logger.info("Graph rows loaded from rewrite", {
+        dir,
+        ...stats,
+        totalNodes: snapshot.stats.totalNodes,
+        totalEdges: snapshot.stats.totalEdges,
+        tookMs,
+      });
       return { success: true, ...stats, tookMs };
     },
   );

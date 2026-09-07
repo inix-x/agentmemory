@@ -61,7 +61,7 @@ const SNAPSHOT_TOP_EDGES = DEFAULT_GRAPH_QUERY_LIMIT * 2;
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
-const SNAPSHOT_KEY = "current";
+export const SNAPSHOT_KEY = "current";
 
 // R2: the snapshot is bounded by bytes, not only by row counts. Row caps did not
 // hold it: 500 topNodes reached 14.2 MB because a row's size is unbounded, and
@@ -182,7 +182,7 @@ async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
   }
 }
 
-function buildSnapshotFromArrays(
+export function buildSnapshotFromArrays(
   nodes: GraphNode[],
   edges: GraphEdge[],
 ): GraphSnapshot {

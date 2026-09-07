@@ -11,7 +11,7 @@ vi.mock("../src/logger.js", () => ({
 import { registerGraphRowsLoadFunction } from "../src/functions/graph-rows-load.js";
 import { readAdj, readObsIndex } from "../src/state/graph-store.js";
 import { KV } from "../src/state/schema.js";
-import type { GraphNode } from "../src/types.js";
+import type { GraphNode, GraphSnapshot } from "../src/types.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 
 // The other half of GRAPH_ROWS_REWRITE_AT_BOOT. The entrypoint retired the six
@@ -181,6 +181,36 @@ describe("mem::graph-rows-load", () => {
 
     expect(result.success).toBe(false);
     expect(kv.store.get(KV.graphNodes)).toBeUndefined();
+    // A snapshot naming counts no row on disk backs is worse than no snapshot:
+    // checkGraphEnumerable would size the scopes from a corpus that never
+    // loaded. It is written last so a refusal leaves the scope absent.
+    expect(kv.store.get(KV.graphSnapshot)).toBeUndefined();
+  });
+
+  it("writes the snapshot from the loaded rows, without the resolved resetAt", async () => {
+    // The entrypoint retires mem:graph:snapshot with the other five scopes and
+    // the loader never put it back, so readSnapshot returned null and
+    // checkGraphEnumerable read totalNodes as null. It then refused before the
+    // byte check for a missing measurement rather than on the corpus size,
+    // which is the fail-closed P1 recorded (prototype doc :89).
+    const out = emit();
+
+    await sdk.trigger("mem::graph-rows-load", { dir: out });
+
+    const snap = kv.store.get(KV.graphSnapshot)!.get("current") as GraphSnapshot;
+    expect(snap.version).toBe(1);
+    expect(snap.stats.totalNodes).toBe(2);
+    expect(snap.stats.totalEdges).toBe(1);
+    // The guard sizes each scope as total * measured-per-row. Both must be
+    // present, or estimateScopeBytes falls back to the pre-rewrite calibrated
+    // floor and reads the bounded scopes as the ones the rewrite replaced.
+    expect(snap.stats.nodeRowBytes).toBeGreaterThan(0);
+    expect(snap.stats.edgeRowBytes).toBeGreaterThan(0);
+    // gn_orphan is pre-reset and the emitter dropped it, so the orphan
+    // condition the input snapshot recorded is resolved. Carrying resetAt
+    // through would keep hasOrphanRows() true and hold the guard shut for a
+    // reason that no longer exists.
+    expect(snap.resetAt).toBeUndefined();
   });
 });
 
