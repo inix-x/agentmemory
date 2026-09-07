@@ -46,11 +46,32 @@ Measured on the sandbox, which ran the swap at 02:16Z on 2026-09-07:
 | graph enumeration refusals in the retained sandbox log | 0 |
 | graph enumeration refusals on production, same window | 34 |
 
-Both stores run the same `mem::reflect` cycle, and the sandbox refuses
-`mem:semantic` eight times in that log while refusing the graph not once.
-Production, which has never run the swap, refuses the graph on every cycle. The
-sandbox's guard is open over a corpus 306 times larger than its snapshot
-claims.
+Both stores run the same `mem::reflect` cycle, `reflect.ts:192` calls
+`listGraphScopes`, and that function logs the refusal on every closed check.
+The sandbox refuses `mem:semantic` eight times in that log while refusing the
+graph not once. Production, which has never run the swap, refuses the graph on
+every cycle.
+
+Two explanations were ruled out before reading it as an open guard. Throttling
+does not apply: `ENUMERATION_WARN_INTERVAL_MS` is 60 seconds and the sandbox's
+reflect cycles sit two hours apart across ten hours. The check being
+unreachable does not apply either, since the same caller reaches the graph
+check right after the `mem:semantic` one on production, in the same second.
+
+The guard's own arithmetic confirms it. At the 02:36:56Z tick the snapshot
+carried 121 nodes, and 260 edges, taken from `topEdges`, which equals the live
+edge count while every node fits inside the 500-node cap.
+
+| check | value | result |
+|---|---|---|
+| node ceiling | 121 against 25,000 | passes |
+| node bytes | 0.52 MiB against 50 MiB | fits |
+| edge bytes | 0.75 MiB against 50 MiB | fits |
+| orphaned | `emptySnapshot()` sets no `resetAt` | false |
+| **enumerable** | | **true** |
+
+The store holds 37,066 nodes and 77,980 edges, roughly 300 times what the
+snapshot counts.
 
 The consequence on that particular store is bounded, and saying so is part of
 the finding. U2's own rewrite made the rows small: the sandbox's write ledger
