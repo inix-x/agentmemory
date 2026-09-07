@@ -244,4 +244,27 @@ describe("the boot swap flag", () => {
       expect(body.lastIndexOf("exec ")).toBeGreaterThan(guard);
     }
   });
+
+  it("surfaces a failed load trigger through bootWarn, not bootLog", () => {
+    // bootLog writes nothing unless boot-verbose is on; it buffers in memory
+    // (logger.ts:98-108). bootWarn always writes to stderr, and its own comment
+    // says warnings must surface "even when the rest of the boot log is
+    // suppressed" (logger.ts:110-116).
+    //
+    // The entrypoint has already retired the six graph scopes by the time this
+    // trigger runs, so a failure here leaves the store with no graph at all. On
+    // bootLog that is silent, which is how a sandbox boot on 2026-09-07 produced
+    // neither a load line nor a failure line and looked identical to a swap that
+    // never armed.
+    const src = readFileSync(
+      new URL("../src/index.ts", import.meta.url).pathname,
+      "utf8",
+    );
+    const at = src.indexOf("Graph rows rewrite failed to start");
+    expect(at).toBeGreaterThan(-1);
+    // The call wrapping that message, read backwards from it.
+    const call = src.slice(Math.max(0, at - 200), at);
+    expect(call).toContain("bootWarn(");
+    expect(call).not.toContain("bootLog(");
+  });
 });

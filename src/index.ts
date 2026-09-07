@@ -113,7 +113,7 @@ import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
-import { bootLog } from "./logger.js";
+import { bootLog, bootWarn } from "./logger.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -302,7 +302,12 @@ async function main() {
         payload: { dir: rewriteDir },
       })
       .catch((err: unknown) => {
-        bootLog(
+        // bootWarn, not bootLog. The entrypoint has already retired the six
+        // graph scopes by the time this runs, so a failure here leaves the
+        // store with no graph and nothing on disk to retry from. bootLog
+        // buffers in memory unless boot-verbose is on, which makes that
+        // outcome indistinguishable from a swap that never armed.
+        bootWarn(
           `Graph rows rewrite failed to start: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
