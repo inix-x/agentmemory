@@ -177,7 +177,8 @@ def rewrite(args):
     drop_orphans = args.mode == "drop"
 
     for key, record in parse_records(args.bin):
-        # The predicate the writer uses at graph.ts:850-857, string-compared.
+        # The predicate the writer uses at graph.ts:1149-1156 for nodes and
+        # graph.ts:1205-1212 for edges, string-compared.
         # KTD-R1: keep mode caps provenance on these rows rather than discarding
         # them, because on production the predicate covers 149,732 of 151,374
         # nodes -- a month of real graph -- while capping alone is 93% of the
