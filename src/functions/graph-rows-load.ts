@@ -172,18 +172,32 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
       // them from the kept rows in the same load, or a post-swap extract's
       // name-index lookup misses and it writes a duplicate row for every entity
       // the rewrite just kept.
+      //
+      // Pre-reset rows get no lookup entry. In keep mode a post-reset node and
+      // its pre-reset twin share a name, and the rebuild is last-write-wins in
+      // .bin order; the writer nulls any hit that resolves pre-reset
+      // (graph.ts:1149-1156), so a twin that won would cost a third row on the
+      // next touch. Leaving it out is the outcome the null produces, minus a
+      // kv.get. Degrees are unaffected: every edge still counts below.
+      const preReset = (row: { createdAt?: unknown }) =>
+        carriedResetAt !== undefined &&
+        typeof row.createdAt === "string" &&
+        row.createdAt < carriedResetAt;
       for (const { value } of nodeRows) {
+        if (preReset(value)) continue;
         await write(KV.graphNameIndex, `${value.type}|${value.name}`, value.id);
         stats.nameIndex++;
       }
       const degrees = new Map<string, number>();
       for (const { value } of edgeRows) {
-        await write(
-          KV.graphEdgeKey,
-          `${value.sourceNodeId}|${value.targetNodeId}|${value.type}`,
-          value.id,
-        );
-        stats.edgeKeys++;
+        if (!preReset(value)) {
+          await write(
+            KV.graphEdgeKey,
+            `${value.sourceNodeId}|${value.targetNodeId}|${value.type}`,
+            value.id,
+          );
+          stats.edgeKeys++;
+        }
         degrees.set(value.sourceNodeId, (degrees.get(value.sourceNodeId) ?? 0) + 1);
         degrees.set(value.targetNodeId, (degrees.get(value.targetNodeId) ?? 0) + 1);
       }

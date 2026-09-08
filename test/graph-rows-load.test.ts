@@ -85,6 +85,10 @@ const emit = (mode: "keep" | "drop" = "drop") => {
     gn_a: node("gn_a", "Alpha", "2026-09-03T00:00:00Z", ["o1"]),
     gn_b: node("gn_b", "Beta", "2026-09-03T00:00:00Z", ["o1"]),
     gn_orphan: node("gn_orphan", "Gone", "2026-09-01T00:00:00Z", ["o9"]),
+    // A pre-reset twin of Alpha, deliberately LAST in .bin order. The writer's
+    // reset path mints a fresh node for a name whose index hit is pre-reset
+    // (graph.ts:1144-1156), so on production every post-reset node has one.
+    gn_twin: node("gn_twin", "Alpha", "2026-09-01T00:00:00Z", ["o9"]),
   });
   const edges = writeBin("edges.bin", {
     ge_1: edge("ge_1", "gn_a", "gn_b", "2026-09-03T00:00:00Z"),
@@ -229,9 +233,28 @@ describe("mem::graph-rows-load", () => {
     await sdk.trigger("mem::graph-rows-load", { dir: out });
 
     const snap = kv.store.get(KV.graphSnapshot)!.get("current") as GraphSnapshot;
-    // Keep mode emitted gn_orphan too, so the corpus is the whole fixture.
-    expect(snap.stats.totalNodes).toBe(3);
+    // Keep mode emitted gn_orphan and gn_twin too, so the corpus is the whole
+    // fixture.
+    expect(snap.stats.totalNodes).toBe(4);
     expect(snap.resetAt).toBe(RESET_AT);
+  });
+
+  it("points the rebuilt name-index at the post-reset twin in keep mode", async () => {
+    // R7. The rebuild is last-write-wins in .bin order, and keep mode emits
+    // both twins. If the pre-reset id wins, the writer's next touch of Alpha
+    // hits it, nulls it (graph.ts:1149-1156), and creates a THIRD row, so the
+    // post-reset row stops being the merge target the plan says it is. A
+    // pre-reset row gets no index entry at all: the writer treats a pre-reset
+    // hit and a miss identically, minus one kv.get.
+    const out = emit("keep");
+
+    await sdk.trigger("mem::graph-rows-load", { dir: out });
+
+    const index = kv.store.get(KV.graphNameIndex)!;
+    expect(index.get("concept|Alpha")).toBe("gn_a");
+    expect(index.has("concept|Gone")).toBe(false);
+    // Degrees are unaffected: every edge still counts, whichever side it is on.
+    expect(kv.store.get(KV.graphNodeDegree)!.get("gn_a")).toBe(1);
   });
 
   it("refuses an emit whose two scopes name different modes", async () => {
