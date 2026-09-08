@@ -40,9 +40,10 @@ from datetime import datetime, timezone
 
 # One backfill batch row per this many distinct observation ids. 200,000 ids at
 # 28 bytes is about 5.3 MiB, comfortably under the 15 MiB SAFE_PAYLOAD_BYTES the
-# importer's guarded write checks. Unchunked, production's 306,791 ids would be
-# one 8.2 MiB row -- it would fit, but a single unbounded array under one key is
-# the shape U1 exists to prevent and there is no reason to rebuild it here.
+# importer's guarded write checks. Production stays under the chunk: the larger
+# scope cites 102,813 distinct ids and emits one row of about 2.8 MiB. The chunk
+# bounds the shape for a corpus that would exceed it, since a single unbounded
+# array under one key is what U1 exists to prevent.
 BATCH_CHUNK_DEFAULT = 200_000
 
 # Ceiling on (observation, row) pairs written to obs-index. Transposing the
