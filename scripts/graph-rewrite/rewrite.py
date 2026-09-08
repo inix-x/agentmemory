@@ -47,10 +47,18 @@ BATCH_CHUNK_DEFAULT = 200_000
 
 # Ceiling on (observation, row) pairs written to obs-index. Transposing the
 # reachable corpus in full is 33,767,235 pairs, about 902 MiB, which is the size
-# KTD2 rejects. Past the ceiling an entry is still created but its list is cut
-# short, and no reader can tell a short list from a complete one. That is
-# tolerable only while nothing reads obs-index; a backfill is owed before the
-# read path lands.
+# KTD2 rejects. The counter below is global and records are walked in .bin
+# order, so the ceiling cuts on a row-position prefix: an id first seen past it
+# gets no entry at all, an id already holding one stops collecting, and no
+# reader can tell a short list from a complete one.
+#
+# The read path already landed. cascade.ts:42 reads obs-index to flag rows
+# stale, so this is a live shortfall rather than a deferred one. On production's
+# keep-mode emit the ceiling reaches 7,335 of 151,374 node rows and 31,695 of
+# 282,724 edge rows; every row past the cut can never be flagged. A bounded
+# backfill that KTD2 accepts is owed before graph retrieval is restored. The
+# remedy cascade.ts names, mem::graph-index-backfill, rebuilds the full 902 MiB
+# transpose and is itself over that budget.
 MAX_OBS_PAIRS_DEFAULT = 2_000_000
 
 
