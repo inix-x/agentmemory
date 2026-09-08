@@ -36,8 +36,10 @@ const DEFAULT_MAX_ROWS = 5_000;
 // there is, so the catch-up transposes what it can and stops at a ceiling
 // rather than reproducing the 1.9 GiB shape.
 //
-// Partial is safe here because cascade asks per observation: an obsId either
-// has an entry, and the answer is exact, or it does not, and cascade says so.
+// Partial is not transparent to the reader. readObsIndex returns an empty
+// entry for a key the ceiling never wrote (graph-store.ts:227-236), so cascade
+// reads "no rows" for rows that exist and were cut. The ceiling caps what the
+// catch-up costs. It does not make the answer exact.
 const DEFAULT_MAX_PAIRS = 2_000_000;
 
 export type GraphIndexBackfillCursor = {
