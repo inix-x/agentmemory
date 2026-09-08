@@ -193,10 +193,12 @@ def rewrite(args):
             if obs_id not in obs_seen_set:
                 obs_seen_set.add(obs_id)
                 obs_seen.append(obs_id)
-            # No entry for an id first seen past the ceiling. A miss reads as
-            # empty (graph-store.ts readObsIndex), so the answer is the same
-            # and the row is not: in keep mode most of production's 306,791
-            # ids land here.
+            # No entry for an id first seen past the ceiling. readObsIndex
+            # (graph-store.ts:227-236) returns an empty entry for a miss, so a
+            # caller cannot tell "this observation touched no rows" from "the
+            # ceiling cut before this id", and on a populated store those are
+            # different answers. On the U2 emit 81,580 of the 106,025 cited ids
+            # get no entry at all.
             if pairs < args.max_obs_pairs:
                 entry = obs_index.setdefault(obs_id, {"nodes": [], "edges": []})
                 entry["nodes" if kind == "node" else "edges"].append(record["id"])
