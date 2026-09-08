@@ -92,6 +92,10 @@ const emit = (mode: "keep" | "drop" = "drop") => {
   });
   const edges = writeBin("edges.bin", {
     ge_1: edge("ge_1", "gn_a", "gn_b", "2026-09-03T00:00:00Z"),
+    // Pre-reset, between the two pre-reset nodes. Without it every edge in the
+    // suite is post-reset, so the loader's pre-reset edge branch never runs and
+    // nothing pins the degree count that sits outside it.
+    ge_old: edge("ge_old", "gn_orphan", "gn_twin", "2026-09-01T00:00:00Z"),
   });
   const out = join(dir, "out");
   for (const [scope, bin] of [
@@ -253,8 +257,19 @@ describe("mem::graph-rows-load", () => {
     const index = kv.store.get(KV.graphNameIndex)!;
     expect(index.get("concept|Alpha")).toBe("gn_a");
     expect(index.has("concept|Gone")).toBe(false);
+    // ge_old joins the two pre-reset nodes, so the edge-key rebuild skips it
+    // for the same reason the name-index skips gn_twin: a hit that resolves
+    // pre-reset costs a row the writer would otherwise merge into.
+    expect(
+      kv.store.get(KV.graphEdgeKey)!.has("gn_orphan|gn_twin|related_to"),
+    ).toBe(false);
     // Degrees are unaffected: every edge still counts, whichever side it is on.
     expect(kv.store.get(KV.graphNodeDegree)!.get("gn_a")).toBe(1);
+    // ge_old is the only edge touching gn_orphan, and it is the skipped one.
+    // This dies if degree counting is ever moved inside that guard, which in
+    // keep mode would zero the degree of every pre-reset node on a boot nobody
+    // is watching.
+    expect(kv.store.get(KV.graphNodeDegree)!.get("gn_orphan")).toBe(1);
   });
 
   it("refuses an emit whose two scopes name different modes", async () => {
