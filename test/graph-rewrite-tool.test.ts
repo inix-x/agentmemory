@@ -291,15 +291,18 @@ describe("the graph rewrite emitter", () => {
   it("truncates an obs-index entry past the ceiling without emitting fewer rows", () => {
     // The Risks case, and the reason the tool's original safety argument does
     // not survive keep mode. That argument was "an id either has an entry and
-    // the answer is exact, or it does not". False: the entry is created for
-    // every distinct id and only the appends are gated, so past the ceiling an
-    // id keeps a SHORT list no reader can tell from a complete one. Nothing
-    // reads obs-index until the origin plan's U3 read path lands, which is the
-    // only reason this is acceptable; a backfill is named follow-on work.
+    // the answer is exact, or it does not". False: past the ceiling an id
+    // that already has an entry keeps a SHORT list no reader can tell from a
+    // complete one. mem::cascade-update reads it today (cascade.ts:42) and
+    // warns only when every consulted entry is empty, so a short list flags
+    // a subset of the stale rows silently; a backfill is owed before that
+    // read is trusted. An id FIRST seen past the ceiling gets no entry: a miss
+    // reads as empty (graph-store.ts:231-235), the same answer, for no row.
     const bin = writeBin("nodes.bin", {
       gn_pre: node("gn_pre", "2026-09-01T00:00:00Z", ["o1"]),
       gn_1: node("gn_1", "2026-09-03T00:00:00Z", ["o1"]),
       gn_2: node("gn_2", "2026-09-04T00:00:00Z", ["o1"]),
+      gn_3: node("gn_3", "2026-09-05T00:00:00Z", ["o2"]),
     });
 
     const summary = run([
@@ -312,7 +315,7 @@ describe("the graph rewrite emitter", () => {
 
     expect(summary.pairCeilingHit).toBe(true);
     // R1 holds regardless: the ceiling bounds the transpose, never the rows.
-    expect(summary.kept).toBe(3);
+    expect(summary.kept).toBe(4);
     expect(summary.dropped).toBe(0);
 
     const obsIndex = readOut<
@@ -321,6 +324,17 @@ describe("the graph rewrite emitter", () => {
     const o1 = obsIndex.find((e) => e.key === "o1")!;
     // Two of the three rows citing o1, and no marker saying so.
     expect(o1.value.nodes).toHaveLength(2);
-    expect(readOut<unknown[]>("nodes.rows.json")).toHaveLength(3);
+    // o2 was first cited past the ceiling: no row, rather than an empty one.
+    // On production that is most of 306,791 ids, tens of MiB in a rollout
+    // whose whole point is the byte count.
+    expect(obsIndex.find((e) => e.key === "o2")).toBeUndefined();
+    expect(readOut<unknown[]>("nodes.rows.json")).toHaveLength(4);
+    // The batch stream still names o2: batches derive from the ids, not the
+    // pairs, and the row citing it still has to resolve to its batch.
+    const batches = readOut<Array<{ observationIds: string[] }>>(
+      "nodes.batches.json",
+    );
+    expect(batches.flatMap((b) => b.observationIds)).toContain("o2");
+    expect(summary.observationIds).toBe(2);
   });
 });

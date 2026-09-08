@@ -162,6 +162,7 @@ def rewrite(args):
     kept = []
     dropped = 0
     obs_seen = []
+    obs_seen_set = set()
     obs_index = {}
     pairs = 0
     pair_ceiling_hit = False
@@ -179,13 +180,16 @@ def rewrite(args):
             continue
         row_obs = record.get("sourceObservationIds") or []
         for obs_id in row_obs:
-            if obs_id not in obs_index:
-                obs_index[obs_id] = {"nodes": [], "edges": []}
+            if obs_id not in obs_seen_set:
+                obs_seen_set.add(obs_id)
                 obs_seen.append(obs_id)
+            # No entry for an id first seen past the ceiling. A miss reads as
+            # empty (graph-store.ts readObsIndex), so the answer is the same
+            # and the row is not: in keep mode most of production's 306,791
+            # ids land here.
             if pairs < args.max_obs_pairs:
-                obs_index[obs_id]["nodes" if kind == "node" else "edges"].append(
-                    record["id"]
-                )
+                entry = obs_index.setdefault(obs_id, {"nodes": [], "edges": []})
+                entry["nodes" if kind == "node" else "edges"].append(record["id"])
                 pairs += 1
             else:
                 pair_ceiling_hit = True
