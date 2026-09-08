@@ -192,7 +192,7 @@ describe("mem::graph-rows-load", () => {
     expect(kv.store.get(KV.graphSnapshot)).toBeUndefined();
   });
 
-  it("writes the snapshot from the loaded rows, without the resolved resetAt", async () => {
+  it("writes the snapshot from the loaded rows, dropping a resolved resetAt", async () => {
     // The entrypoint retires mem:graph:snapshot with the other five scopes and
     // the loader never put it back, so readSnapshot returned null and
     // checkGraphEnumerable read totalNodes as null. It then refused before the
@@ -211,11 +211,46 @@ describe("mem::graph-rows-load", () => {
     // floor and reads the bounded scopes as the ones the rewrite replaced.
     expect(snap.stats.nodeRowBytes).toBeGreaterThan(0);
     expect(snap.stats.edgeRowBytes).toBeGreaterThan(0);
-    // gn_orphan is pre-reset and the emitter dropped it, so the orphan
+    // gn_orphan is pre-reset and drop mode discarded it, so the orphan
     // condition the input snapshot recorded is resolved. Carrying resetAt
     // through would keep hasOrphanRows() true and hold the guard shut for a
-    // reason that no longer exists.
+    // reason that no longer exists. True in drop mode only, hence the pin.
     expect(snap.resetAt).toBeUndefined();
+  });
+
+  it("carries resetAt through a keep-mode load", async () => {
+    // KTD-R8. The premise above -- "the emitter dropped every pre-resetAt row"
+    // -- is false in keep mode, which emits them all. Dropping the stamp there
+    // would widen the writer's merge target from the 1,642 post-reset rows to
+    // all 151,374 and let it regrow the provenance this rollout just capped,
+    // breaking R7 silently on the boot path.
+    const out = emit("keep");
+
+    await sdk.trigger("mem::graph-rows-load", { dir: out });
+
+    const snap = kv.store.get(KV.graphSnapshot)!.get("current") as GraphSnapshot;
+    // Keep mode emitted gn_orphan too, so the corpus is the whole fixture.
+    expect(snap.stats.totalNodes).toBe(3);
+    expect(snap.resetAt).toBe(RESET_AT);
+  });
+
+  it("refuses a directory whose summary names no mode, rather than assuming drop", async () => {
+    // The failure direction matters more than the check. Defaulting a missing
+    // signal to drop-mode behaviour IS the R7 break above, silently, on a boot
+    // nobody is watching. Same refusal class as a missing row stream: a
+    // directory that cannot say which mode produced it is a wrong directory.
+    const out = emit("keep");
+    rmSync(join(out, "nodes.summary.json"));
+
+    const result = (await sdk.trigger("mem::graph-rows-load", {
+      dir: out,
+    })) as { success: boolean };
+
+    expect(result.success).toBe(false);
+    // Refused before writing anything, so there is no half-loaded store and
+    // no snapshot overstating a corpus that never landed.
+    expect(kv.store.get(KV.graphNodes)).toBeUndefined();
+    expect(kv.store.get(KV.graphSnapshot)).toBeUndefined();
   });
 });
 

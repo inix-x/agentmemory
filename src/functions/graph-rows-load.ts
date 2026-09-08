@@ -59,6 +59,9 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
 
       let nodeRows: Stream<GraphNode>;
       let edgeRows: Stream<GraphEdge>;
+      // KTD-R8. Set when the emit was produced in keep mode, and written onto
+      // the snapshot below.
+      let carriedResetAt: string | undefined;
       try {
         // Both streams are required, not one required and one optional. This
         // runs after the entrypoint retired the six originals, so a run that
@@ -68,6 +71,34 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
         // one means a truncated or wrong directory, and that is a refusal.
         nodeRows = readStream<Stream<GraphNode>>(dir, "nodes.rows.json");
         edgeRows = readStream<Stream<GraphEdge>>(dir, "edges.rows.json");
+
+        // The mode signal is required for the same reason and read here, before
+        // anything is written, so a refusal leaves the store untouched. It is
+        // NOT optional-with-a-drop-default: treating a missing signal as drop
+        // is exactly the silent R7 break KTD-R8 exists to stop, and it would
+        // land on a boot with nobody watching. A summary with no mode is a
+        // pre-U1 emit, which this rollout does not reuse.
+        const summaries = (["nodes", "edges"] as const).map((scope) => {
+          const s = readStream<{ mode?: unknown; resetAt?: unknown }>(
+            dir,
+            `${scope}.summary.json`,
+          );
+          if (s.mode !== "keep" && s.mode !== "drop") {
+            throw new Error(`${scope}.summary.json names no rewrite mode`);
+          }
+          return s;
+        });
+        // Carry if EITHER scope was emitted in keep mode. The two are always
+        // run together, and the asymmetry is deliberate: carrying a stamp that
+        // was not needed only holds the enumeration guard shut, while failing
+        // to carry one that was widens the writer's merge target to every row.
+        const keep = summaries.find((s) => s.mode === "keep");
+        if (keep) {
+          if (typeof keep.resetAt !== "string") {
+            throw new Error("keep-mode summary carries no resetAt to preserve");
+          }
+          carriedResetAt = keep.resetAt;
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error("Graph rows load failed to read its input", { dir, message });
@@ -156,15 +187,25 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
       // size. Built from the rows just loaded, so the counts and the measured
       // per-row bytes describe what is actually on disk, and so a load that
       // threw earlier leaves no snapshot overstating a corpus that never
-      // landed. resetAt is deliberately not carried across: the emitter
-      // dropped every pre-resetAt row, so the orphan condition the retired
-      // snapshot recorded is resolved, and carrying it would hold the guard
-      // shut on hasOrphanRows() for a reason that no longer exists.
+      // landed.
+      //
+      // Whether resetAt survives is the emitter's call, not this function's
+      // (KTD-R8). In drop mode it does not: every pre-resetAt row was
+      // discarded, so the orphan condition the retired snapshot recorded is
+      // resolved and carrying the stamp would hold hasOrphanRows() shut for a
+      // reason that no longer exists. In keep mode that premise is false --
+      // those rows are all still here -- and dropping the stamp would widen
+      // the writer's merge target from 1,642 rows to all 151,374, letting it
+      // regrow the provenance the rewrite just capped.
       const snapshot = buildSnapshotFromArrays(
         nodeRows.map((r) => r.value),
         edgeRows.map((r) => r.value),
       );
-      await write(KV.graphSnapshot, SNAPSHOT_KEY, snapshot);
+      await write(
+        KV.graphSnapshot,
+        SNAPSHOT_KEY,
+        carriedResetAt ? { ...snapshot, resetAt: carriedResetAt } : snapshot,
+      );
 
       const tookMs = Date.now() - started;
       logger.info("Graph rows loaded from rewrite", {
