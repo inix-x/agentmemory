@@ -96,12 +96,8 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
         if (summaries[0].mode !== summaries[1].mode) {
           throw new Error("nodes and edges were emitted in different modes");
         }
-        // Carry if EITHER scope was emitted in keep mode. The two are always
-        // run together, and the asymmetry is deliberate: carrying a stamp that
-        // was not needed only holds the enumeration guard shut, while failing
-        // to carry one that was widens the writer's merge target to every row.
-        const keep = summaries.find((s) => s.mode === "keep");
-        if (keep) {
+        const [keep] = summaries;
+        if (keep.mode === "keep") {
           // The consumers' own predicate (hasOrphanRows, graph.ts:303): an
           // empty string is a string, and it would turn the narrowing off.
           if (
@@ -222,8 +218,12 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
       // resolved and carrying the stamp would hold hasOrphanRows() shut for a
       // reason that no longer exists. In keep mode that premise is false --
       // those rows are all still here -- and dropping the stamp would widen
-      // the writer's merge target from 1,642 rows to all 151,374, letting it
-      // regrow the provenance the rewrite just capped.
+      // the writer's merge target from 1,642 rows to all 151,374, which is
+      // the R7 change this rollout promises not to make. (It is not what
+      // keeps provenance bounded: KTD-R6's batch mode does that on its own,
+      // graph.ts:783-793, stamp or no stamp.) Nor does the stamp change what
+      // the reader can enumerate: the node ceiling and the byte budget refuse
+      // this corpus either way.
       const snapshot = buildSnapshotFromArrays(
         nodeRows.map((r) => r.value),
         edgeRows.map((r) => r.value),
