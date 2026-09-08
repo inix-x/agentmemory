@@ -234,6 +234,43 @@ describe("mem::graph-rows-load", () => {
     expect(snap.resetAt).toBe(RESET_AT);
   });
 
+  it("refuses an emit whose two scopes name different modes", async () => {
+    // The missing-stream refusal above exists because nodes without edges is
+    // a store with every degree at zero. Keep nodes over drop edges is the
+    // same store: 151,374 nodes against post-reset edges only. A silent
+    // accept is one forgotten --mode flag away, since keep is the default and
+    // U2 runs the tool once per scope.
+    const out = emit("keep");
+    const path = join(out, "edges.summary.json");
+    const summary = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...summary, mode: "drop" }));
+
+    const result = (await sdk.trigger("mem::graph-rows-load", {
+      dir: out,
+    })) as { success: boolean };
+
+    expect(result.success).toBe(false);
+    expect(kv.store.get(KV.graphNodes)).toBeUndefined();
+  });
+
+  it("refuses a keep-mode summary whose resetAt is not a parseable stamp", async () => {
+    // hasOrphanRows (graph.ts:303) and the writer's narrowing (graph.ts:1151)
+    // both need a stamp that parses. An empty string is a string, passes a
+    // typeof check, and turns both off: the exact R7 break the guard is for,
+    // reached through the guard.
+    const out = emit("keep");
+    const path = join(out, "nodes.summary.json");
+    const summary = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...summary, resetAt: "" }));
+
+    const result = (await sdk.trigger("mem::graph-rows-load", {
+      dir: out,
+    })) as { success: boolean };
+
+    expect(result.success).toBe(false);
+    expect(kv.store.get(KV.graphSnapshot)).toBeUndefined();
+  });
+
   it("refuses a directory whose summary names no mode, rather than assuming drop", async () => {
     // The failure direction matters more than the check. Defaulting a missing
     // signal to drop-mode behaviour IS the R7 break above, silently, on a boot

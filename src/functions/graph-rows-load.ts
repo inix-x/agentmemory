@@ -22,6 +22,7 @@ import type { GraphBatch, GraphEdge, GraphNode } from "../types.js";
 //   <dir>/edges.rows.json        [{ key, value }]
 //   <dir>/<scope>.batches.json   [GraphBatch]
 //   <dir>/<scope>.obs-index.json [{ key, value }]
+//   <dir>/<scope>.summary.json   { mode, resetAt, ... }, required (KTD-R8)
 
 type Stream<T> = Array<{ key: string; value: T }>;
 
@@ -88,14 +89,26 @@ export function registerGraphRowsLoadFunction(sdk: ISdk, kv: StateKV): void {
           }
           return s;
         });
+        // Two scopes computed against different corpora is the store the
+        // missing-stream refusal above exists to stop: keep nodes over drop
+        // edges lands 149,732 nodes at degree zero. One forgotten --mode flag
+        // produces it, since keep is the default and U2 runs the tool per scope.
+        if (summaries[0].mode !== summaries[1].mode) {
+          throw new Error("nodes and edges were emitted in different modes");
+        }
         // Carry if EITHER scope was emitted in keep mode. The two are always
         // run together, and the asymmetry is deliberate: carrying a stamp that
         // was not needed only holds the enumeration guard shut, while failing
         // to carry one that was widens the writer's merge target to every row.
         const keep = summaries.find((s) => s.mode === "keep");
         if (keep) {
-          if (typeof keep.resetAt !== "string") {
-            throw new Error("keep-mode summary carries no resetAt to preserve");
+          // The consumers' own predicate (hasOrphanRows, graph.ts:303): an
+          // empty string is a string, and it would turn the narrowing off.
+          if (
+            typeof keep.resetAt !== "string" ||
+            !(Date.parse(keep.resetAt) > 0)
+          ) {
+            throw new Error("keep-mode summary carries no usable resetAt");
           }
           carriedResetAt = keep.resetAt;
         }
