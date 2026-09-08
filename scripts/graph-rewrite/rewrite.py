@@ -11,6 +11,7 @@ longer reaches. See KTD-R1.
     rows.json        the rewritten mem:graph:nodes / mem:graph:edges records
     batches.json     the mem:graph:batches rows those records point at
     obs-index.json   the mem:graph:obs-index entries U3's readers need
+    summary.json     counts, the mode, and resetAt; the loader refuses without it
 
 It never writes a .bin. Nothing outside the engine writes the engine's format,
 which is the risk class KTD3 removes rather than tests against.
@@ -46,8 +47,10 @@ BATCH_CHUNK_DEFAULT = 200_000
 
 # Ceiling on (observation, row) pairs written to obs-index. Transposing the
 # reachable corpus in full is 33,767,235 pairs, about 902 MiB, which is the size
-# KTD2 rejects. Partial is safe because every reader asks per observation: an id
-# either has an entry and the answer is exact, or it does not.
+# KTD2 rejects. Past the ceiling an entry is still created but its list is cut
+# short, and no reader can tell a short list from a complete one. That is
+# tolerable only while nothing reads obs-index; a backfill is owed before the
+# read path lands.
 MAX_OBS_PAIRS_DEFAULT = 2_000_000
 
 
