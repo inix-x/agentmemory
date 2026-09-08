@@ -29,12 +29,12 @@ const DEFAULT_MAX_ROWS = 5_000;
 
 // The obs-index ceiling, and the one number in this file worth arguing about.
 // KTD2 rejects transposing sourceObservationIds as the index's construction:
-// the reachable corpus holds 33,767,235 pairs, about 902 MiB, because 237 rows
-// cite each of 306,791 observations. Going forward the index is built from the
+// the reachable corpus holds 72,972,070 pairs, about 1.9 GiB, because 688 rows
+// cite each of 106,025 observations on average. Going forward the index is built from the
 // extraction event and is linear in observations instead. But a row already on
 // disk has no event behind it, and its inline array is the only provenance
 // there is, so the catch-up transposes what it can and stops at a ceiling
-// rather than reproducing the 902 MiB shape.
+// rather than reproducing the 1.9 GiB shape.
 //
 // Partial is safe here because cascade asks per observation: an obsId either
 // has an entry, and the answer is exact, or it does not, and cascade says so.
