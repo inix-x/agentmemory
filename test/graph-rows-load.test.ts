@@ -73,7 +73,11 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const emit = () => {
+// The emitter's default is keep (KTD-R1), so drop is passed explicitly rather
+// than relied on. Every assertion below about gn_orphan being absent is an
+// assertion about drop mode, and a silent default flip would turn them into
+// assertions about nothing.
+const emit = (mode: "keep" | "drop" = "drop") => {
   const snap = writeBin("snap.bin", {
     current: { version: 1, resetAt: RESET_AT },
   });
@@ -96,6 +100,7 @@ const emit = () => {
       "--bin", bin,
       "--snapshot", snap,
       "--out", out,
+      "--mode", mode,
     ]);
   }
   return out;

@@ -62,11 +62,10 @@ describe("the graph rewrite emitter", () => {
   const snapshot = () =>
     writeBin("snap.bin", { current: { version: 1, resetAt: RESET_AT } });
 
-  it("keeps every reachable row and drops every orphan", () => {
-    // mem::graph-reset leaves every row on disk and stamps resetAt; extract
-    // then treats anything older as an orphan. Production's split is 112,428
-    // orphan nodes against 37,039 reachable.
-    const bin = writeBin("nodes.bin", {
+  // Rows either side of the stamp. Both modes read this same fixture, which is
+  // what makes the two counts comparable.
+  const splitBin = () =>
+    writeBin("nodes.bin", {
       gn_pre1: node("gn_pre1", "2026-09-01T00:00:00Z", ["o1"]),
       gn_pre2: node("gn_pre2", "2026-09-02T19:50:03.636Z", ["o2"]),
       gn_at: node("gn_at", RESET_AT, ["o3"]),
@@ -74,15 +73,61 @@ describe("the graph rewrite emitter", () => {
       gn_post2: node("gn_post2", "2026-09-04T00:00:00Z", ["o5"]),
     });
 
+  it("keeps every row by default and caps provenance on all of them", () => {
+    // KTD-R1. Dropping is what the tool used to do by default; on production
+    // that predicate discards 149,732 of 151,374 nodes, a month of real graph.
+    // Capping alone is 93% of the memory win, so keep is the default and drop
+    // is the option. No --mode here on purpose: the default is the thing the
+    // rollout depends on, so the default is what this pins.
     const summary = run([
       "--scope", "nodes",
-      "--bin", bin,
+      "--bin", splitBin(),
       "--snapshot", snapshot(),
       "--out", join(dir, "out"),
     ]);
 
+    expect(summary.mode).toBe("keep");
+    expect(summary.kept).toBe(5);
+    expect(summary.dropped).toBe(0);
+    expect(summary.resetAt).toBe(RESET_AT);
+
+    const rows = readOut<
+      Array<{
+        key: string;
+        value: { sourceObservationIds: string[]; sourceBatchIds: string[] };
+      }>
+    >("nodes.rows.json");
+    expect(rows.map((r) => r.key).sort()).toEqual([
+      "gn_at",
+      "gn_post1",
+      "gn_post2",
+      "gn_pre1",
+      "gn_pre2",
+    ]);
+    // R2. Every row, including the ones drop mode would have discarded, sheds
+    // its observation ids and carries a batch reference instead.
+    for (const r of rows) {
+      expect(r.value.sourceObservationIds).toEqual([]);
+      expect(r.value.sourceBatchIds.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("drops every orphan in drop mode, reproducing the pre-U1 counts", () => {
+    // mem::graph-reset leaves every row on disk and stamps resetAt; extract
+    // then treats anything older as an orphan. Production's split is 112,428
+    // orphan nodes against 37,039 reachable. Behaviour kept reachable because
+    // it is still correct after a real reset; this pins it unchanged.
+    const summary = run([
+      "--scope", "nodes",
+      "--bin", splitBin(),
+      "--snapshot", snapshot(),
+      "--out", join(dir, "out"),
+      "--mode", "drop",
+    ]);
+
     // The predicate is createdAt < resetAt, so a row stamped exactly at the
     // reset is reachable. That boundary is the whole split.
+    expect(summary.mode).toBe("drop");
     expect(summary.kept).toBe(3);
     expect(summary.dropped).toBe(2);
     expect(summary.resetAt).toBe(RESET_AT);
@@ -241,5 +286,41 @@ describe("the graph rewrite emitter", () => {
     expect(summary.obsIndexPairs).toBe(2);
     // The batch stream is unaffected: it is derived from the ids, not the pairs.
     expect(summary.observationIds).toBe(3);
+  });
+
+  it("truncates an obs-index entry past the ceiling without emitting fewer rows", () => {
+    // The Risks case, and the reason the tool's original safety argument does
+    // not survive keep mode. That argument was "an id either has an entry and
+    // the answer is exact, or it does not". False: the entry is created for
+    // every distinct id and only the appends are gated, so past the ceiling an
+    // id keeps a SHORT list no reader can tell from a complete one. Nothing
+    // reads obs-index until the origin plan's U3 read path lands, which is the
+    // only reason this is acceptable; a backfill is named follow-on work.
+    const bin = writeBin("nodes.bin", {
+      gn_pre: node("gn_pre", "2026-09-01T00:00:00Z", ["o1"]),
+      gn_1: node("gn_1", "2026-09-03T00:00:00Z", ["o1"]),
+      gn_2: node("gn_2", "2026-09-04T00:00:00Z", ["o1"]),
+    });
+
+    const summary = run([
+      "--scope", "nodes",
+      "--bin", bin,
+      "--snapshot", snapshot(),
+      "--out", join(dir, "out"),
+      "--max-obs-pairs", "2",
+    ]);
+
+    expect(summary.pairCeilingHit).toBe(true);
+    // R1 holds regardless: the ceiling bounds the transpose, never the rows.
+    expect(summary.kept).toBe(3);
+    expect(summary.dropped).toBe(0);
+
+    const obsIndex = readOut<
+      Array<{ key: string; value: { nodes: string[] } }>
+    >("nodes.obs-index.json");
+    const o1 = obsIndex.find((e) => e.key === "o1")!;
+    // Two of the three rows citing o1, and no marker saying so.
+    expect(o1.value.nodes).toHaveLength(2);
+    expect(readOut<unknown[]>("nodes.rows.json")).toHaveLength(3);
   });
 });

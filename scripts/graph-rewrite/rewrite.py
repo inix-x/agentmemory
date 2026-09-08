@@ -2,9 +2,11 @@
 """Offline rewrite of the graph row scopes. KTD3: parse offline, let the engine
 write.
 
-Reads a scope .bin, keeps the records the live snapshot still reaches, replaces
-their observation-id provenance with a bounded backfill batch reference, and
-emits three JSON streams for the verbatim row importer to load:
+Reads a scope .bin, replaces each record's observation-id provenance with a
+bounded backfill batch reference, and emits three JSON streams for the verbatim
+row importer to load. Which records survive is the --mode choice: keep (the
+default) emits every row, drop also discards the ones the live snapshot no
+longer reaches. See KTD-R1.
 
     rows.json        the rewritten mem:graph:nodes / mem:graph:edges records
     batches.json     the mem:graph:batches rows those records point at
@@ -22,7 +24,11 @@ machine and each record is parsed on its own.
 
 Usage:
     rewrite.py --scope nodes --bin <path>.bin --snapshot <snapshot>.bin --out <dir>
-               [--expect-reset-at <iso>] [--batch-chunk N] [--max-obs-pairs N]
+               [--mode keep|drop] [--expect-reset-at <iso>] [--batch-chunk N]
+               [--max-obs-pairs N]
+
+The summary names the mode it ran in, and the loader reads that to decide
+whether to carry resetAt forward (KTD-R8).
 """
 
 import argparse
@@ -156,11 +162,16 @@ def rewrite(args):
     obs_index = {}
     pairs = 0
     pair_ceiling_hit = False
+    drop_orphans = args.mode == "drop"
 
     for key, record in parse_records(args.bin):
-        created = record.get("createdAt", "")
         # The predicate the writer uses at graph.ts:850-857, string-compared.
-        if created < reset_at:
+        # KTD-R1: keep mode caps provenance on these rows rather than discarding
+        # them, because on production the predicate covers 149,732 of 151,374
+        # nodes -- a month of real graph -- while capping alone is 93% of the
+        # memory win. Drop stays reachable because it is still correct after a
+        # real reset.
+        if drop_orphans and record.get("createdAt", "") < reset_at:
             dropped += 1
             continue
         row_obs = record.get("sourceObservationIds") or []
@@ -222,6 +233,7 @@ def rewrite(args):
 
     summary = {
         "scope": args.scope,
+        "mode": args.mode,
         "resetAt": reset_at,
         "kept": len(rows),
         "dropped": dropped,
@@ -247,6 +259,13 @@ def main(argv=None):
     ap.add_argument("--bin", required=True, help="the scope .bin to read")
     ap.add_argument("--snapshot", required=True, help="the mem:graph:snapshot scope file")
     ap.add_argument("--out", required=True, help="directory for the JSON streams")
+    ap.add_argument(
+        "--mode",
+        choices=["keep", "drop"],
+        default="keep",
+        help="keep (default): cap provenance on every row. drop: also discard "
+        "rows created before the snapshot's resetAt, the pre-U1 behavior.",
+    )
     ap.add_argument("--expect-reset-at", default=None)
     ap.add_argument("--batch-chunk", type=int, default=BATCH_CHUNK_DEFAULT)
     ap.add_argument("--max-obs-pairs", type=int, default=MAX_OBS_PAIRS_DEFAULT)
