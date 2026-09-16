@@ -422,12 +422,13 @@ setting to the repo root and repoint `dockerfilePath` accordingly.
 **Approach.** The current Dockerfile has two `COPY` lines, neither touching
 `src/`, and no build step. It installs the published package from npm, which is
 why `/opt/agentmemory/src` does not exist in the image and the deployed version
-is 0.9.28. Change the build context to the repo root, copy the manifest and
-lockfile, run `npm ci`, copy the source, run `npm run build` (`tsdown`), and point
-the `agentmemory` bin at the built `dist/cli.mjs`. Prefer a multi-stage build so
-dev dependencies do not ship. Add `.dockerignore` to keep `node_modules`,
-`.git`, `dist`, and `eval/` out of the upload. Drop the vestigial `overrides`
-block per KTD8, then verify the resolved `iii-sdk` rather than assuming.
+is 0.9.28. Use the KTD6 source-build procedure: repository-root context, copy
+`package.json`, install with npm 11.19.0 and `npm install` (the repository does
+not commit a lockfile), copy source, build, then `npm pack`. Install that
+tarball into `/opt/agentmemory` in the runtime stage, carrying the package
+security overrides into the runtime manifest. Preserve the entrypoint
+install layout and verify the resolved `iii-sdk` version. `.dockerignore`
+excludes local dependencies, git metadata, build output, and evaluation data.
 
 Note that `dist/` is gitignored, so the image must build it and must never expect
 a prebuilt copy.
@@ -493,7 +494,7 @@ detects it.
 
 **Approach.** The engine is spawned detached and already has a `child.on("exit")`
 handler that captures the exit code, the signal, and up to 16KB of stderr, then
-logs under `vlog` and returns. Past a 60-second startup grace, report the death on
+logs under `vlog` and returns. Past a 5-second startup grace, report the death on
 `console.error` with that stderr and exit non-zero. Deaths inside the grace keep
 the existing path, which renders a better startup message.
 
@@ -604,28 +605,24 @@ the event loop still runs.
 claimed no health test file existed; that claim was wrong and acting on it
 destroyed the file once already.
 
-**Approach.** `registerHealthMonitor` currently ends `collectHealth` with a
-persist and a return. Add an in-memory consecutive-critical counter. **Increment
-and evaluate it before the `await kv.set(KV.health, "latest", snapshot)` call at
-`monitor.ts:94`, never after** — that persist is not raced against any timeout,
-and during the real outage `state::set` hung for 180 seconds, so a counter behind
-it would never advance during the failure it exists to catch (KTD7). On reaching
-the threshold, log a clear reason and exit so `ON_FAILURE` restarts.
+**Approach.** Keep escalation gated on consecutive KV probe failures and arm
+it only after a healthy KV probe has been observed. Decide before the snapshot
+persist, so a stalled write cannot postpone the decision. CPU, event-loop,
+connection, and memory severity must not increment this counter.
 
-Reuse the existing SIGTERM `shutdown` path at `src/index.ts:629-630` rather than
-calling `process.exit` directly, so the KV store flushes. Fall back to a hard
-exit only if shutdown does not complete within a grace window.
-
-Gate the whole behaviour behind an environment flag, default **off**, matching
-U2's disabled-by-default posture and KTD5.
+With `AGENTMEMORY_HEALTH_ESCALATE` enabled, ten consecutive failures after
+arming request SIGTERM; force a nonzero exit after 15 seconds if shutdown
+stalls. Railway uses `ALWAYS`, because successful graceful shutdown exits zero.
+The feature remains off by default.
 
 **Test Scenarios.**
-- N consecutive critical snapshots trigger exactly one escalation.
-- A single healthy snapshot between criticals resets the counter.
-- With the flag off, no escalation occurs regardless of snapshot status.
-- The counter advances when the persist is slow or rejects. This is the
-  regression test for KTD7 and the one most likely to be got wrong.
-- Escalation runs the graceful shutdown path, not a bare `process.exit`.
+- Failures before any healthy KV probe never arm escalation.
+- Ten consecutive KV failures after arming trigger exactly one escalation.
+- A healthy KV probe resets the counter.
+- Critical memory/CPU/lag with healthy KV never escalates.
+- With the flag off, no escalation occurs.
+- The decision precedes snapshot persistence, including stalled writes.
+- Escalation requests graceful shutdown before the forced-exit fallback.
 
 **Verification.** `npm test`. Assert on the escalation decision, not on a real
 process exit.

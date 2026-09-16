@@ -39,10 +39,10 @@ describe("deploy entrypoint drift", () => {
   // reason lives in deploy/railway/entrypoint.sh next to the value, so deleting
   // this test cannot lose it.
   it("only railway disables iii-observability", () => {
-    expect(files.railway).toMatch(/enabled: false/);
+    expect(code(files.railway)).toMatch(/enabled: false/);
     for (const t of ["fly", "render", "coolify"] as const) {
-      expect(files[t]).toMatch(/enabled: true/);
-      expect(files[t]).not.toMatch(/enabled: false/);
+      expect(code(files[t])).toMatch(/enabled: true/);
+      expect(code(files[t])).not.toMatch(/enabled: false/);
     }
   });
 
