@@ -38,12 +38,13 @@ export function bumpEscalation(
   state: EscalationState,
   threshold: number,
 ): boolean {
-  const stalled = snapshot.kvConnectivity?.status === "error";
-  if (!stalled) {
+  const status = snapshot.kvConnectivity?.status;
+  if (status === "ok") {
     state.hasSeenHealthyKvProbe = true;
     state.consecutiveKvProbeFailures = 0;
     return false;
   }
+  if (status !== "error") return false;
   if (!state.hasSeenHealthyKvProbe) return false;
   state.consecutiveKvProbeFailures += 1;
   if (state.escalated || state.consecutiveKvProbeFailures < threshold) return false;

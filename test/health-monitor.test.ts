@@ -18,6 +18,13 @@ function snap(over: Partial<HealthSnapshot> = {}): HealthSnapshot {
 }
 
 const stalled = () => snap({ kvConnectivity: { status: "error", error: "kv_probe_failed" } });
+const noSignalProbes: Array<[string, unknown]> = [
+  ["absent", undefined],
+  ["null", null],
+  ["missing status", {}],
+  ["unknown status", { status: "pending" }],
+  ["malformed status", { status: 123 }],
+];
 
 function fresh(): EscalationState {
   return { consecutiveKvProbeFailures: 0, hasSeenHealthyKvProbe: false, escalated: false };
@@ -48,6 +55,15 @@ describe("bumpEscalation arming", () => {
     bumpEscalation(snap(), state, 3);
     expect(state.hasSeenHealthyKvProbe).toBe(true);
   });
+
+  it.each(noSignalProbes)("does not arm from %s probe data or subsequent errors", (_label, probe) => {
+    const state = fresh();
+    expect(bumpEscalation(snap({ kvConnectivity: probe as HealthSnapshot["kvConnectivity"] }), state, 3)).toBe(false);
+    for (let i = 0; i < 10; i++) {
+      expect(bumpEscalation(stalled(), state, 3)).toBe(false);
+    }
+    expect(state).toEqual(fresh());
+  });
 });
 
 describe("bumpEscalation gating", () => {
@@ -65,6 +81,16 @@ describe("bumpEscalation gating", () => {
     bumpEscalation(snap(), state, 3);
     expect(state.consecutiveKvProbeFailures).toBe(0);
     expect(bumpEscalation(stalled(), state, 3)).toBe(false);
+  });
+
+  it.each(noSignalProbes)("preserves an existing failure streak across %s probe data", (_label, probe) => {
+    const state = hasSeenHealthyKvProbe();
+    bumpEscalation(stalled(), state, 3);
+    bumpEscalation(stalled(), state, 3);
+    const before = { ...state };
+    expect(bumpEscalation(snap({ kvConnectivity: probe as HealthSnapshot["kvConnectivity"] }), state, 3)).toBe(false);
+    expect(state).toEqual(before);
+    expect(bumpEscalation(stalled(), state, 3)).toBe(true);
   });
 
   it("escalates at most once per process", () => {

@@ -22,8 +22,11 @@ function child() {
 
 const source = readFileSync("src/cli.ts", "utf8");
 const functionStart = source.indexOf("function createEngineExitHandler(");
+expect(functionStart, "CLI createEngineExitHandler source marker").toBeGreaterThanOrEqual(0);
 const functionEnd = source.indexOf("const ENGINE_STARTUP_GRACE_MS", functionStart);
+expect(functionEnd, "CLI engine startup grace source marker").toBeGreaterThan(functionStart);
 const graceEnd = source.indexOf(";", functionEnd) + 1;
+expect(graceEnd, "CLI engine startup grace declaration terminator").toBeGreaterThan(functionEnd);
 const compiledSpawn = transpileModule(source.slice(functionStart, graceEnd), {}).outputText;
 
 // Run the CLI's actual spawn function without executing its command dispatcher.
