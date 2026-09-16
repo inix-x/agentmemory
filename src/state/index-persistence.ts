@@ -551,13 +551,20 @@ export class IndexPersistence {
         continue;
       }
       const stranded: IndexGcLedger["generations"][number]["shards"] = [];
-      for (const shard of entry.shards) {
-        try {
-          await this.kv.delete(shard.scope, shard.key);
-          reclaimedPaths.push(statePath(shard.scope, shard.key));
-        } catch {
-          failed += 1;
-          stranded.push(shard);
+      for (let offset = 0; offset < entry.shards.length; offset += 8) {
+        const batch = entry.shards.slice(offset, offset + 8);
+        const deleted = await Promise.all(batch.map(async shard => {
+          try {
+            await this.kv.delete(shard.scope, shard.key);
+            return true;
+          } catch { return false; }
+        }));
+        for (const [index, shard] of batch.entries()) {
+          if (deleted[index]) reclaimedPaths.push(statePath(shard.scope, shard.key));
+          else {
+            failed += 1;
+            stranded.push(shard);
+          }
         }
       }
       if (stranded.length > 0) {

@@ -93,7 +93,7 @@ export function createEngineLogForwarder(
         pending = pending.slice(newline + 1);
         newline = pending.indexOf("\n");
       }
-      if (pending.length >= maxLineBytes) {
+      if (Buffer.byteLength(pending, "utf8") >= maxLineBytes) {
         emitRecord(pending);
         pending = "";
       }

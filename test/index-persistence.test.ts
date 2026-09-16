@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { IndexPersistence } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
-import type { CompressedObservation } from "../src/types.js";
+import type { AuditEntry, CompressedObservation } from "../src/types.js";
 
 const BM25_SCOPE = "mem:index:bm25";
 const BM25_LEGACY_KEY = "data";
@@ -627,6 +627,77 @@ describe("IndexPersistence", () => {
     ).load();
     expect(loaded.bm25!.search("bravo").length).toBe(1);
     await expect(kv.get(oldShardScope, "data")).resolves.toBeNull();
+  });
+
+  it("bounds concurrent reclaim deletes and retries failures without touching live or future shards", async () => {
+    await new IndexPersistence(kv as never, makeBm25("obs_live", "live snapshot"), null, {
+      createGeneration: () => "gen_live",
+    }).save();
+    const live = await getBm25Manifest(kv);
+    const retired = Array.from({ length: 19 }, (_, i) => ({ scope: `retired:${i}`, key: "data" }));
+    const future = { scope: "future:0", key: "data" };
+    for (const shard of [...retired, future]) await kv.set(shard.scope, shard.key, "shard");
+    const gcKey = `${BM25_MANIFEST_KEY}:gc`;
+    const ledger = {
+      v: 1,
+      generations: [
+        { generation: "gen_old", shards: retired },
+        { generation: "gen_live", shards: live.shards.map(({ scope, key }) => ({ scope, key })) },
+        { generation: "gen_future", shards: [future] },
+      ],
+    };
+    await kv.set(BM25_SCOPE, gcKey, ledger);
+    const failedScopes = new Set([retired[1].scope, retired[10].scope]);
+    const pending: Array<() => void> = [];
+    let active = 0;
+    let peak = 0;
+    const boundedKv = {
+      ...kv,
+      delete: vi.fn(async (scope: string, key: string) => {
+        active++;
+        peak = Math.max(peak, active);
+        try {
+          await new Promise<void>(resolve => pending.push(resolve));
+          if (failedScopes.has(scope)) throw new Error("retry delete");
+          await kv.delete(scope, key);
+        } finally { active--; }
+      }),
+    };
+    const loading = new IndexPersistence(boundedKv as never, new SearchIndex(), null).load();
+    for (const size of [8, 8, 3]) {
+      await vi.waitFor(() => expect(pending).toHaveLength(size));
+      expect(active).toBe(size);
+      for (const resolve of pending.splice(0).reverse()) resolve();
+    }
+    const loaded = await loading;
+    expect(peak).toBe(8);
+    expect(loaded.bm25!.search("live")).toHaveLength(1);
+    expect(boundedKv.delete.mock.calls.map(([scope, key]) => ({ scope, key }))).toEqual(retired);
+    expect(await kv.get(BM25_SCOPE, gcKey)).toEqual({
+      v: 1,
+      generations: [
+        { generation: "gen_old", shards: [retired[1], retired[10]] },
+        ...ledger.generations.slice(1),
+      ],
+    });
+    const sweeps = (await kv.list<AuditEntry>("mem:audit"))
+      .filter(entry => entry.details.reason === "generation_reclaim");
+    expect(sweeps).toHaveLength(1);
+    expect(sweeps[0].details).toMatchObject({ evicted: 17, failed: 2 });
+    expect(sweeps[0].targetIds).toEqual(retired
+      .filter(shard => !failedScopes.has(shard.scope))
+      .map(shard => `${shard.scope}/${shard.key}`));
+
+    const retryKv = { ...kv, delete: vi.fn(kv.delete) };
+    await new IndexPersistence(retryKv as never, new SearchIndex(), null).load();
+    expect(retryKv.delete.mock.calls).toEqual([
+      [retired[1].scope, "data"], [retired[10].scope, "data"],
+    ]);
+    expect(await kv.get(BM25_SCOPE, gcKey)).toEqual({ v: 1, generations: ledger.generations.slice(1) });
+    for (const shard of retired) expect(await kv.get(shard.scope, shard.key)).toBeNull();
+    for (const shard of [...live.shards, future]) {
+      expect(await kv.get(shard.scope, shard.key)).not.toBeNull();
+    }
   });
 
   it("reclaims the previous vector generation when the vector manifest read fails (#1115)", async () => {

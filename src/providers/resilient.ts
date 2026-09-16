@@ -73,12 +73,17 @@ export class ResilientProvider implements MemoryProvider {
     }
     await this.gate.acquire();
     try {
-      const result = await fn();
-      this.breaker.recordSuccess();
-      return result;
-    } catch (err) {
-      if (!isRateLimited(err)) this.breaker.recordFailure();
-      throw err;
+      if (!this.breaker.isAllowed) {
+        throw new Error("circuit_breaker_open");
+      }
+      try {
+        const result = await fn();
+        this.breaker.recordSuccess();
+        return result;
+      } catch (err) {
+        if (!isRateLimited(err)) this.breaker.recordFailure();
+        throw err;
+      }
     } finally {
       // In `finally` so a throw cannot leak the slot and deadlock every call
       // queued behind it.

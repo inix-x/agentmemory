@@ -152,6 +152,14 @@ describe("engine log forwarder", () => {
     expect(h.lines).toEqual(["[engine] 0123456789abcdefghij"]);
   });
 
+  it("flushes a partial UTF-8 record at its byte limit", () => {
+    const h = harness({ maxLineBytes: 6 });
+    h.push("☃");
+    expect(h.lines).toEqual([]);
+    h.push("☃");
+    expect(h.lines).toEqual(["[engine] ☃☃"]);
+  });
+
   it("ships ceilings that bound a firehose without operator action", () => {
     expect(ENGINE_LOG_MAX_TOTAL_BYTES).toBe(32 * 1024 * 1024);
     expect(ENGINE_LOG_MAX_BYTES_PER_SECOND).toBe(64 * 1024);

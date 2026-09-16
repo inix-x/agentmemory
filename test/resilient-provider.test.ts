@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { ResilientProvider } from "../src/providers/resilient.js";
 import type { MemoryProvider } from "../src/types.js";
 
@@ -65,6 +65,38 @@ describe("ResilientProvider concurrency", () => {
 
     expect(settled).toHaveLength(5);
     expect(settled.filter((s) => s.status === "fulfilled")).toHaveLength(3);
+  });
+
+  it("rejects queued calls when earlier failures open the breaker without recording new failures", async () => {
+    const inner = countingProvider(async n => {
+      if (n <= 3) throw new Error("upstream exploded");
+      return "recovered";
+    });
+    const provider = new ResilientProvider(inner, { maxConcurrent: 1 });
+    let now = 1000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now++);
+    try {
+      const settled = await Promise.allSettled(
+        Array.from({ length: 6 }, (_, i) => i % 2
+          ? provider.summarize("sys", "user") : provider.compress("sys", "user")),
+      );
+
+      expect(inner.calls).toBe(3);
+      expect(settled.map(result => result.status === "rejected" ? result.reason.message : result.value)).toEqual([
+        "upstream exploded", "upstream exploded", "upstream exploded",
+        "circuit_breaker_open", "circuit_breaker_open", "circuit_breaker_open",
+      ]);
+      expect(provider.circuitState).toEqual({
+        state: "open", failures: 3, lastFailureAt: 1002, openedAt: 1002,
+      });
+
+      now = 31_002;
+      await expect(provider.compress("sys", "user")).resolves.toBe("recovered");
+      expect(inner.calls).toBe(4);
+      expect(provider.circuitState.state).toBe("closed");
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
 
