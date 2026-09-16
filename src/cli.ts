@@ -55,6 +55,7 @@ import {
   type RemoveOptions,
 } from "./cli/remove-plan.js";
 import { createEngineLogForwarder } from "./cli/engine-log.js";
+import { watchDockerEngine } from "./cli/docker-engine.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
@@ -917,6 +918,7 @@ type StartupFailure = {
 };
 
 let startupFailure: StartupFailure | null = null;
+let stopDockerEngineWatch: (() => void) | undefined;
 
 // Off by default. The engine's own stdout is the only place a frame's
 // `function_id` exists, but an unbounded log path here once wrote 137 GB
@@ -948,6 +950,7 @@ function spawnEngineBackground(
   bin: string,
   spawnArgs: string[],
   label: string,
+  composeFile?: string,
 ): ChildProcess {
   vlog(`spawn: ${bin} ${spawnArgs.join(" ")}`);
   const child = spawn(bin, spawnArgs, {
@@ -973,8 +976,13 @@ function spawnEngineBackground(
     stderrChunks.push(slice);
     stderrBytes += slice.length;
   });
-  child.on("exit", (code, signal) => {
+  const onEngineExit = (
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    containerStopped = false,
+  ) => {
     const abnormal =
+      containerStopped ||
       (code !== null && code !== 0) || (code === null && signal !== null);
     if (abnormal) {
       const stderr = Buffer.concat(stderrChunks).toString("utf-8");
@@ -1015,6 +1023,27 @@ function spawnEngineBackground(
         }
       }
     }
+  };
+  child.on("exit", (code, signal) => {
+    if (isDocker && composeFile && code === 0) {
+      stopDockerEngineWatch?.();
+      stderrChunks.length = 0;
+      stderrBytes = 0;
+      stopDockerEngineWatch = watchDockerEngine(
+        bin,
+        composeFile,
+        (containerCode) => onEngineExit(containerCode, null, true),
+        (error) => {
+          console.error(`[agentmemory] Docker engine supervision unavailable: ${error.message}`);
+        },
+      );
+      return;
+    }
+    onEngineExit(code, signal);
+  });
+  child.on("error", (error) => {
+    stderrChunks.push(Buffer.from(error.message).subarray(0, MAX_STDERR_CAPTURE - stderrBytes));
+    onEngineExit(1, null);
   });
   child.unref();
   return child;
@@ -1190,6 +1219,7 @@ async function startEngine(): Promise<boolean> {
       dockerBin,
       ["compose", "-f", composeFile, "up", "-d"],
       "iii-engine via Docker",
+      composeFile,
     );
     s.stop("Docker compose started");
     return true;
@@ -2731,6 +2761,7 @@ async function stopDockerEngine(composeFile: string, port: number): Promise<void
     );
     process.exit(1);
   }
+  stopDockerEngineWatch?.();
   const ok = runCommand(
     dockerBin,
     ["compose", "-f", composeFile, "rm", "-s", "-f", ...ownServices],
