@@ -5,6 +5,8 @@ import { execFile, spawn } from "node:child_process";
 import { transpileModule } from "typescript";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { watchDockerEngine } from "../src/cli/docker-engine.js";
+import { createStartupStderrCapture } from "../src/cli/startup-stderr.js";
+import { dockerComposeArgs } from "../src/cli/engine-launch.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
 
@@ -19,32 +21,35 @@ function child() {
 }
 
 const source = readFileSync("src/cli.ts", "utf8");
-const functionStart = source.indexOf("function spawnEngineBackground(");
+const functionStart = source.indexOf("function createEngineExitHandler(");
 const functionEnd = source.indexOf("const ENGINE_STARTUP_GRACE_MS", functionStart);
 const graceEnd = source.indexOf(";", functionEnd) + 1;
 const compiledSpawn = transpileModule(source.slice(functionStart, graceEnd), {}).outputText;
 
 // Run the CLI's actual spawn function without executing its command dispatcher.
-function cliSpawn() {
+function cliSpawn(logEnabled = false) {
   const exit = vi.fn();
   const clearState = vi.fn();
+  const writePid = vi.fn();
+  const clearPid = vi.fn();
+  const attachLog = vi.fn();
   const env: Record<string, string> = {};
-  const factory = new Function("spawn", "watchDockerEngine", "process", "clearEngineState", `
+  const factory = new Function("spawn", "watchDockerEngine", "process", "clearEngineState", "writeEnginePidfile", "clearEnginePidfile", "createStartupStderrCapture", "ENGINE_LOG_ENABLED", "attachEngineLog", `
     const vlog = () => {};
-    const writeEnginePidfile = () => {};
-    const clearEnginePidfile = () => {};
-    const ENGINE_LOG_ENABLED = false;
     const IS_VERBOSE = false;
     let startupFailure = null;
     let stopDockerEngineWatch;
+    let activeStartupStderr = createStartupStderrCapture();
     ${compiledSpawn}
     return {
       start: spawnEngineBackground,
+      watch: startDockerEngineWatch,
       failure: () => startupFailure,
       stop: () => stopDockerEngineWatch?.(),
+      stderr: () => activeStartupStderr.text(),
     };
   `);
-  return { ...factory(spawn, watchDockerEngine, { env, exit }, clearState), exit, env, clearState };
+  return { ...factory(spawn, watchDockerEngine, { env, exit }, clearState, writePid, clearPid, createStartupStderrCapture, logEnabled, attachLog), exit, env, clearState, writePid, clearPid, attachLog };
 }
 
 type LookupCallback = (error: Error | null, stdout: string, stderr: string) => void;
@@ -82,7 +87,7 @@ function startDocker() {
   vi.mocked(spawn).mockReturnValueOnce(compose as never).mockReturnValueOnce(observer as never);
   const cli = cliSpawn();
   cleanups.push(cli.stop);
-  cli.start("docker", ["compose", "-f", "/own/compose.yml", "up", "-d"], "iii-engine via Docker", "/own/compose.yml");
+  cli.start("docker", dockerComposeArgs("/own/compose.yml", "agentmemory-3121", ["up", "-d"]), "iii-engine via Docker", "/own/invocation", { composeFile: "/own/compose.yml", projectName: "agentmemory-3121" });
   return { compose, observer, cli };
 }
 
@@ -154,13 +159,14 @@ describe("Docker engine lifetime supervision", () => {
     expect(cli.exit).not.toHaveBeenCalled();
     expect(cli.clearState).not.toHaveBeenCalled();
     expect(execFile).toHaveBeenCalledWith("docker", [
-      "compose", "-f", "/own/compose.yml", "ps", "--all", "--quiet", "iii-engine",
-    ], expect.objectContaining({ timeout: 5000 }), expect.any(Function));
+      "compose", "-p", "agentmemory-3121", "-f", "/own/compose.yml", "ps", "--all", "--quiet", "iii-engine",
+    ], expect.objectContaining({ timeout: 5000, cwd: "/own/invocation" }), expect.any(Function));
     expect(spawn).toHaveBeenLastCalledWith("docker", ["wait", "a".repeat(64)], expect.anything());
     vi.setSystemTime(6000);
     containerExit(observer, code);
     expect(cli.exit).toHaveBeenCalledWith(1);
-    expect(cli.clearState).toHaveBeenCalledOnce();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
     expect(cli.failure()).toMatchObject({ kind: "docker-crashed" });
   });
 
@@ -171,6 +177,8 @@ describe("Docker engine lifetime supervision", () => {
     containerExit(observer, 137);
     expect(cli.failure()).toMatchObject({ kind: "docker-crashed", stderr: "process exited with code 137" });
     expect(cli.exit).not.toHaveBeenCalled();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
   });
 
   it("preserves compose startup failures without starting an observer", () => {
@@ -180,6 +188,24 @@ describe("Docker engine lifetime supervision", () => {
     expect(cli.failure()).toMatchObject({ kind: "docker-crashed", stderr: "image pull failed" });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(cli.exit).not.toHaveBeenCalled();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
+  });
+
+  it.each(["exit", "error"])("retains Docker ownership after a slow compose %s failure without declaring container death", (failure) => {
+    const { compose, cli } = startDocker();
+    vi.setSystemTime(20_000);
+    if (failure === "exit") {
+      compose.stderr.emit("data", Buffer.from("image pull failed"));
+      compose.emit("exit", 1, null);
+    } else {
+      compose.emit("error", new Error("spawn ENOENT"));
+    }
+    expect(cli.failure()).toMatchObject({ kind: "docker-crashed" });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(cli.exit).not.toHaveBeenCalled();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
   });
 
   it("captures a Docker spawn error instead of leaving an unhandled error event", () => {
@@ -187,6 +213,7 @@ describe("Docker engine lifetime supervision", () => {
     compose.emit("error", new Error("spawn ENOENT"));
     expect(cli.failure()).toMatchObject({ kind: "docker-crashed", stderr: "spawn ENOENT" });
     expect(cli.exit).not.toHaveBeenCalled();
+    expect(cli.clearState).not.toHaveBeenCalled();
   });
 
   it("honors the engine-death opt-out", () => {
@@ -196,7 +223,8 @@ describe("Docker engine lifetime supervision", () => {
     vi.setSystemTime(6000);
     containerExit(observer, 137);
     expect(cli.exit).not.toHaveBeenCalled();
-    expect(cli.clearState).toHaveBeenCalledOnce();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
   });
 
   it.each(["spawn", "exit", "output"])("reports observer %s errors without declaring the engine dead", (failure) => {
@@ -260,5 +288,108 @@ describe("Docker engine lifetime supervision", () => {
     observer.emit("close", null, "SIGTERM");
     expect(cli.exit).not.toHaveBeenCalled();
     expect(console.error).not.toHaveBeenCalled();
+  });
+});
+
+describe("native engine launch and stderr capture", () => {
+  it.each([false, true])("preserves native cwd, bounded stderr and fatal cleanup with log forwarding %s", logEnabled => {
+    const engine = child();
+    vi.mocked(spawn).mockReturnValueOnce(engine as never);
+    const cli = cliSpawn(logEnabled);
+    cli.start("iii", ["--config", "/native/runtime.yaml"], "iii-engine", "/native/cwd");
+    expect(spawn).toHaveBeenCalledWith("iii", ["--config", "/native/runtime.yaml"], expect.objectContaining({
+      cwd: "/native/cwd",
+      stdio: ["ignore", logEnabled ? "pipe" : "ignore", "pipe"],
+    }));
+    expect(cli.writePid).toHaveBeenCalledWith(engine.pid);
+    expect(cli.attachLog).toHaveBeenCalledTimes(logEnabled ? 2 : 0);
+    engine.stderr.emit("data", Buffer.alloc(20 * 1024, "x"));
+    engine.stderr.emit("data", Buffer.from("discarded"));
+    expect(cli.stderr()).toBe("x".repeat(16 * 1024));
+    vi.setSystemTime(6000);
+    engine.emit("exit", 1, null);
+    expect(cli.failure()).toMatchObject({ kind: "engine-crashed", stderr: "x".repeat(16 * 1024) });
+    expect(cli.clearPid).toHaveBeenCalledOnce();
+    expect(cli.clearState).toHaveBeenCalledOnce();
+    expect(cli.exit).toHaveBeenCalledWith(1);
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it("retains each launch's stderr while exposing the latest capture for startup timeouts", () => {
+    const first = child();
+    const second = child();
+    vi.mocked(spawn).mockReturnValueOnce(first as never).mockReturnValueOnce(second as never);
+    const cli = cliSpawn();
+    cli.start("iii", [], "iii-engine", "/first");
+    first.stderr.emit("data", Buffer.from("first startup error"));
+    cli.start("iii", [], "iii-engine", "/second");
+    second.stderr.emit("data", Buffer.from("second startup output"));
+    first.emit("exit", 1, null);
+    expect(cli.failure()).toMatchObject({ stderr: "first startup error" });
+    expect(cli.stderr()).toBe("second startup output");
+  });
+});
+
+describe("resumed Docker engine supervision", () => {
+  it.each([0, 137])("watches the verified ID without compose access and handles later exit %i", code => {
+    const observer = child();
+    vi.mocked(spawn).mockReturnValueOnce(observer as never);
+    const cli = cliSpawn();
+    cleanups.push(cli.stop);
+    cli.watch("docker", { containerId: "b".repeat(64) });
+    expect(execFile).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledWith("docker", ["wait", "b".repeat(64)], expect.anything());
+    vi.setSystemTime(6000);
+    containerExit(observer, code);
+    expect(cli.exit).toHaveBeenCalledWith(1);
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.clearPid).not.toHaveBeenCalled();
+  });
+
+  it("honors the opt-out for a resumed engine", () => {
+    const observer = child();
+    vi.mocked(spawn).mockReturnValueOnce(observer as never);
+    const cli = cliSpawn();
+    cleanups.push(cli.stop);
+    cli.env.AGENTMEMORY_EXIT_ON_ENGINE_DEATH = "0";
+    cli.watch("docker", { containerId: "b".repeat(64) });
+    vi.setSystemTime(6000);
+    containerExit(observer, 137);
+    expect(cli.exit).not.toHaveBeenCalled();
+    expect(cli.clearState).not.toHaveBeenCalled();
+    expect(cli.failure()).toMatchObject({ kind: "docker-crashed" });
+  });
+
+  it("replaces an old observer without stopping either container or reporting cancellation as death", () => {
+    const first = child();
+    const second = child();
+    vi.mocked(spawn).mockReturnValueOnce(first as never).mockReturnValueOnce(second as never);
+    const cli = cliSpawn();
+    cleanups.push(cli.stop);
+    cli.watch("docker", { containerId: "a".repeat(64) });
+    cli.watch("docker", { containerId: "b".repeat(64) });
+    expect(first.kill).toHaveBeenCalledOnce();
+    vi.setSystemTime(6000);
+    first.emit("close", null, "SIGTERM");
+    expect(cli.exit).not.toHaveBeenCalled();
+    expect(console.error).not.toHaveBeenCalled();
+    cli.stop();
+    expect(second.kill).toHaveBeenCalledOnce();
+    second.emit("close", null, "SIGTERM");
+    expect(cli.exit).not.toHaveBeenCalled();
+    expect(execFile).not.toHaveBeenCalled();
+    expect(vi.mocked(spawn).mock.calls.every(([, args]) => args?.[0] === "wait")).toBe(true);
+  });
+
+  it("rejects invalid direct IDs without starting a Docker command", () => {
+    const cli = cliSpawn();
+    const before = process.listenerCount("exit");
+    cleanups.push(cli.stop);
+    cli.watch("docker", { containerId: "not-a-container-id" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(execFile).not.toHaveBeenCalled();
+    expect(cli.exit).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("exactly one iii-engine"));
+    expect(process.listenerCount("exit")).toBe(before);
   });
 });

@@ -236,3 +236,9 @@ console.log(JSON.stringify({forcedGc:await command('Runtime.evaluate',{expressio
 await command('Runtime.evaluate',{expression:'setTimeout(() => process.getBuiltinModule("inspector").close(), 100)'});
 ws.close();
 ```
+
+## Docker ownership integration validation
+
+After integrating main's instance ownership handling, Node 22.23.2 passed 1,870 tests (one skipped), including 58 focused Docker/startup/launch tests; build and generated skill checks passed. TypeScript retained the same 30 normalized diagnostics as before the merge. Fresh Docker lookup uses the launch project and working directory, resumed engines use their validated container ID, Docker failures preserve ownership metadata, and intentional stop cancels supervision first.
+
+A separate live smoke used the actual merged watcher on Docker Engine 29.4.0 and Node 25.9.0 with Alpine 3.22 (`sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce`). Two projects sharing one Compose file verified project-scoped lookup; direct-ID observation reported exit 7, while the scoped observer reported exit 0. Explicit cancellation and observer-parent exit left containers running; parent exit reaped the Docker wait process. Both disposable projects were then removed and label-scoped read-back was empty. Containers had no network, ports or host mounts and a 32 MiB limit. This verifies the Docker watcher; full CLI death-policy behavior has local regression coverage, not a live iii-engine restart test. The recorded Railway measurements above were not rerun for this integration.

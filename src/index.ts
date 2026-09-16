@@ -102,18 +102,12 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
+import { runtimeMetadataPath } from "./runtime-paths.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { dirname } from "node:path";
 
-// #640 + #474: the worker process (this file) is spawned by iii-exec
-// inside the engine. When `agentmemory stop` kills only the engine pid,
-// this worker can survive (detached spawn, signal not propagated, or a
-// wrapper script keeps it running) and reconnects to the next engine as
-// a duplicate worker. Write the worker pid alongside iii.pid so
-// `agentmemory stop` can reap us too.
 function workerPidfilePath(): string {
-  return join(homedir(), ".agentmemory", "worker.pid");
+  return runtimeMetadataPath("worker.pid");
 }
 function writeWorkerPidfile(): void {
   try {
@@ -548,9 +542,8 @@ async function main() {
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
 
-  const viewerPort = config.restPort + 2;
   const viewerServer = startViewerServer(
-    viewerPort,
+    config.viewerPort,
     kv,
     sdk,
     secret,
