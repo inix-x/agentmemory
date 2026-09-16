@@ -81,7 +81,7 @@ At the end of steady-state sampling, redeploy the exact candidate image with san
 
 ### Exact test-only allocation module
 
-In an isolated source export, save the following as `src/repro-runtime.ts` and add `import "./repro-runtime.js";` to `src/index.ts` before building. This import belongs only in the disposable experiment build, never in the application PR. The module is inert until its control file requests allocations.
+In an isolated source export, save the following as `src/repro-runtime.ts` and add `import "./repro-runtime.js";` to `src/index.ts` before building. This import belongs only in the disposable experiment build, never in the application PR. The module collects diagnostics every second and adds bulk allocations only when its control file requests them.
 
 ```typescript
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
@@ -175,6 +175,22 @@ Record 48 file-cache polls, two seconds apart; include memory.stat.
 Unlink only that test file.
 Record 48 cache-recovery polls, two seconds apart.
 Verify cgroup occupancy can independently enter/recover while heap stays healthy.
+```
+
+The file-cache sampler reads `memory.stat` directly for each poll, separately from the unchanged allocation module. Save this exact helper as `/tmp/cache-samples.mjs` and run `node /tmp/cache-samples.mjs` inside the disposable container after recovery:
+
+```javascript
+import {readFileSync,openSync,writeSync,closeSync,unlinkSync} from 'node:fs';
+const secret=readFileSync('/data/.hmac','utf8').trim();
+const headers={authorization:`Bearer ${secret}`,'content-type':'application/json'};
+const request=async(path,body)=>{const at=new Date().toISOString();const response=await fetch('http://127.0.0.1:3111/agentmemory/'+path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(15000)});return {at,status:response.status,body:await response.json()};};
+const sample=async(phase,n)=>{const health=await request('health');const livez=await request('livez');const observe=await request('observe',{hookType:'PostToolUse',sessionId:'health-repro-cache',project:'health-repro',cwd:'/synthetic',timestamp:new Date().toISOString(),data:{tool_name:'Read',tool_input:{file_path:'/synthetic/cache-'+phase+'-'+n+'.txt'},tool_response:'Synthetic cache capacity sample'}});console.log(JSON.stringify({phase,n,deploymentId:process.env.RAILWAY_DEPLOYMENT_ID,health,livez,observe,diagnostics:JSON.parse(readFileSync('/tmp/health-repro-diagnostics.json','utf8')),memoryStat:readFileSync('/sys/fs/cgroup/memory.stat','utf8')}));};
+await sample('before',0);
+const fd=openSync('/tmp/health-repro-cache.bin','w');const buffer=Buffer.alloc(1024*1024,0x5a);
+for(let n=0;n<512;n++)writeSync(fd,buffer);closeSync(fd);
+for(let n=0;n<48;n++){await sample('file-cache',n);await new Promise(r=>setTimeout(r,2000));}
+unlinkSync('/tmp/health-repro-cache.bin');
+for(let n=0;n<48;n++){await sample('cache-recovery',n);await new Promise(r=>setTimeout(r,2000));}
 ```
 
 The corrected GC helper runs only inside the disposable container. It opens the worker's loopback inspector, collects dead test allocations, records memory and closes the inspector. Save as `/tmp/force-gc.mjs`:
