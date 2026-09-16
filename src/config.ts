@@ -603,3 +603,12 @@ export function loadFallbackConfig(): FallbackConfig {
     });
   return { providers };
 }
+
+// The live extract writes per-observation entries to mem:graph:obs-index on
+// every extraction. The scope grew from 109 MB to 511 MB in 7 days and
+// accounts for 81% of post-U2 memory growth. Disabled by default; set
+// GRAPH_OBS_INDEX_WRITES=true to re-enable. Read per call so it is tunable
+// without a redeploy.
+export function isObsIndexWriteEnabled(): boolean {
+  return getMergedEnv()["GRAPH_OBS_INDEX_WRITES"] === "true";
+}

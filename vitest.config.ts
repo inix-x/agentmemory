@@ -16,6 +16,9 @@ export default defineConfig({
     env: {
       HOME: testHome,
       USERPROFILE: testHome,
+      // Tests that exercise obs-index behavior need writes enabled.
+      // Production default is off (disabled to stop unbounded growth).
+      GRAPH_OBS_INDEX_WRITES: "true",
     },
   },
 });

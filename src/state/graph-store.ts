@@ -1,6 +1,7 @@
 import { KV } from "./schema.js";
 import type { StateKV } from "./kv.js";
 import type { GraphEdge, GraphNode } from "../types.js";
+import { isObsIndexWriteEnabled } from "../config.js";
 
 // U3. The three append-only indexes that let the search path answer without
 // enumerating mem:graph:nodes or mem:graph:edges. Retrieval has four entry
@@ -138,6 +139,7 @@ export function recordRowObservations(
   rowId: string,
   kind: "node" | "edge",
 ): void {
+  if (!isObsIndexWriteEnabled()) return;
   for (const obsId of obsIds) {
     const slot = obsSlot(delta, obsId);
     if (kind === "node") slot.nodes.add(rowId);

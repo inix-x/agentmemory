@@ -385,4 +385,16 @@ describe("export-import keeps the indexes with the rows", () => {
     ]);
     expect(kv.store.get(KV.graphNodes)!.size).toBe(0);
   });
+
+  it("recordRowObservations is a no-op when GRAPH_OBS_INDEX_WRITES is unset", () => {
+    const saved = process.env["GRAPH_OBS_INDEX_WRITES"];
+    try {
+      delete process.env["GRAPH_OBS_INDEX_WRITES"];
+      const delta = newIndexDelta();
+      recordRowObservations(delta, ["obs_1", "obs_2"], "gn_a", "node");
+      expect(delta.obs.size).toBe(0);
+    } finally {
+      if (saved !== undefined) process.env["GRAPH_OBS_INDEX_WRITES"] = saved;
+    }
+  });
 });
