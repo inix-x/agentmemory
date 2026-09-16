@@ -218,6 +218,24 @@ export interface FunctionMetrics {
   avgQualityScore: number;
 }
 
+export interface MemoryEvaluation {
+  source: "heap" | "rss" | "cgroup-max" | "cgroup-high";
+  path?: string;
+  usedBytes?: number;
+  limitBytes?: number;
+  percent?: number;
+  severity: "healthy" | "degraded" | "critical";
+  available: boolean;
+  transition?: "entering" | "recovering" | "unavailable";
+  samples?: number;
+  requiredSamples?: number;
+}
+
+export interface CgroupMemory {
+  status: "available" | "partial" | "unavailable" | "unsupported";
+  levels: Array<{ path: string; current?: number; max?: number; high?: number }>;
+}
+
 export interface HealthSnapshot {
   connectionState: string;
   workers: Array<{ id: string; name: string; status: string }>;
@@ -227,6 +245,8 @@ export interface HealthSnapshot {
     rss: number;
     external: number;
     heapSizeLimit?: number;
+    cgroup?: CgroupMemory;
+    evaluations?: MemoryEvaluation[];
   };
   cpu: { userMicros: number; systemMicros: number; percent: number };
   eventLoopLagMs: number;

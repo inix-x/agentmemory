@@ -870,6 +870,11 @@
     .gauge-bar { flex: 1; height: 6px; background: var(--bg-inset); overflow: hidden; }
     .gauge-fill { height: 100%; transition: width 0.5s; }
     .gauge-label { width: 90px; font-size: 10px; color: var(--ink-muted); font-family: var(--font-ui); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+    .memory-gauge .gauge { flex-wrap: wrap; }
+    .memory-gauge .gauge-label { width: 130px; }
+    .memory-gauge .gauge-value { width: auto; min-width: 155px; }
+    .memory-detail { font-size: 11px; color: var(--ink-muted); overflow-wrap: anywhere; margin: 4px 0 8px; }
+    @media (max-width: 600px) { .memory-gauge .gauge-value { width: 100%; } }
     .gauge-value { width: 70px; font-size: 11px; color: var(--ink); text-align: right; font-family: var(--font-mono); }
 
     .obs-type-icon { font-size: 16px; margin-right: 4px; }
@@ -1202,6 +1207,11 @@
     // into sentences; unknown slugs render as-is.
     function humanizeHealthFlag(f) {
       var m;
+      var memoryLabels = { heap: 'V8 heap', rss: 'RSS budget', 'cgroup-max': 'Container limit', 'cgroup-high': 'Container throttle' };
+      if ((m = /^memory_(warn|critical)_(heap|rss|cgroup-max|cgroup-high)(.*?)_(\d+%|unavailable)$/.exec(f)))
+        return memoryLabels[m[2]] + (m[3] ? ' (' + m[3] + ')' : '') + ': ' + (m[1] === 'critical' ? 'critical' : 'elevated') + ', ' + (m[4] === 'unavailable' ? 'measurement unavailable' : m[4] + ' of budget') + '.';
+      if ((m = /^memory_(entering|recovering|unavailable)_(heap|rss|cgroup-max|cgroup-high)(.*)$/.exec(f)))
+        return memoryLabels[m[2]] + (m[3] ? ' (' + m[3] + ')' : '') + ': ' + ({ entering: 'Critical pending', recovering: 'Recovery pending', unavailable: 'Measurement unavailable' })[m[1]] + '.';
       if ((m = /^memory_heap_tight_(\d+)%_rss(\d+)mb$/.exec(f)))
         return 'Heap is running tight: ' + m[1] + '% of allocated heap in use (process memory ' + m[2] + ' MB). Informational — Node grows the heap on demand.';
       if ((m = /^memory_(warn|critical)_(\d+)%_rss(\d+)mb$/.exec(f)))
@@ -1467,6 +1477,29 @@
       }
     }
 
+    function renderMemoryResources(memory) {
+      var labels = { heap: 'Heap', rss: 'RSS budget', 'cgroup-max': 'Container limit', 'cgroup-high': 'Container throttle' };
+      var colors = { healthy: 'var(--green)', degraded: 'var(--yellow)', critical: 'var(--red)' };
+      var transitions = { entering: 'Critical pending', recovering: 'Recovery pending', unavailable: 'Measurement unavailable' };
+      var html = '<div class="memory-gauge">';
+      var evaluations = Array.isArray(memory.evaluations) ? memory.evaluations : [];
+      evaluations.forEach(function(item) {
+        var available = item.available && Number.isFinite(item.percent) && item.percent >= 0 && Number.isFinite(item.usedBytes) && Number.isFinite(item.limitBytes) && item.limitBytes > 0;
+        var percent = available ? item.percent : 0;
+        var color = colors[item.severity] || 'var(--ink-muted)';
+        var value = available ? Math.round(item.usedBytes / 1024 / 1024) + ' / ' + Math.round(item.limitBytes / 1024 / 1024) + ' MiB · ' + percent.toFixed(1) + '%' : 'Unavailable';
+        html += '<div class="gauge"><span class="gauge-label">' + (labels[item.source] || 'Memory') + '</span><div class="gauge-bar"><div class="gauge-fill" style="width:' + Math.min(100, percent) + '%;background:' + color + '"></div></div><span class="gauge-value">' + value + '</span></div>';
+        var detail = transitions[item.transition] || '';
+        if (item.path) detail += (detail ? ' · ' : '') + item.path;
+        if (detail) html += '<div class="memory-detail" style="color:' + color + '">' + esc(detail) + '</div>';
+      });
+      if (!evaluations.length) html += '<div class="memory-detail">Memory pressure unavailable</div>';
+      if (memory.cgroup && memory.cgroup.status !== 'available') html += '<div class="memory-detail">Container measurements: ' + esc(memory.cgroup.status) + '</div>';
+      html += '<div class="memory-detail">Heap: ' + Math.round((memory.heapUsed || 0) / 1024 / 1024) + ' MiB · RSS: ' + Math.round((memory.rss || 0) / 1024 / 1024) + ' MiB';
+      if (memory.external) html += ' · External: ' + Math.round(memory.external / 1024 / 1024) + ' MiB';
+      return html + '</div></div>';
+    }
+
     async function loadDashboard() {
       var el = document.getElementById('view-dashboard');
       if (!state.dashboard.loaded) el.innerHTML = '<div class="loading">Loading dashboard...</div>';
@@ -1575,26 +1608,7 @@
 
       if (snap.memory || snap.cpu) {
         html += '<div class="card" style="margin-bottom:16px"><div class="card-title">System Resources</div>';
-        if (snap.memory) {
-          var heapUsed = Math.round((snap.memory.heapUsed || 0) / 1024 / 1024);
-          var heapTotal = Math.round((snap.memory.heapTotal || 0) / 1024 / 1024);
-          var rss = Math.round((snap.memory.rss || 0) / 1024 / 1024);
-          var limitBytes = snap.memory.heapSizeLimit || 0;
-          var ceilingBytes = limitBytes > 0 ? limitBytes : (snap.memory.heapTotal || 0);
-          var heapCeiling = Math.round(ceilingBytes / 1024 / 1024);
-          // Percentage off raw bytes so the gauge agrees with evaluateHealth,
-          // which never sees the MB rounding used for the label.
-          var heapPercent = ceilingBytes > 0 ? ((snap.memory.heapUsed || 0) / ceilingBytes) * 100 : 0;
-          var heapPct = Math.round(heapPercent);
-          var rssAboveFloor = rss >= 512;
-          var heapColor = (heapPercent > 80 && rssAboveFloor) ? 'var(--red)' : (heapPercent > 60 && rssAboveFloor) ? 'var(--yellow)' : 'var(--green)';
-          html += '<div class="gauge"><span class="gauge-label">Heap</span><div class="gauge-bar"><div class="gauge-fill" style="width:' + heapPct + '%;background:' + heapColor + '"></div></div><span class="gauge-value">' + heapUsed + ' / ' + heapCeiling + ' MB</span></div>';
-          html += '<div class="gauge"><span class="gauge-label">RSS</span><div class="gauge-bar"><div class="gauge-fill" style="width:' + Math.min(100, Math.round(rss / 512 * 100)) + '%;background:var(--blue)"></div></div><span class="gauge-value">' + rss + ' MB</span></div>';
-          if (snap.memory.external) {
-            var ext = Math.round(snap.memory.external / 1024 / 1024);
-            html += '<div class="gauge"><span class="gauge-label">External</span><div class="gauge-bar"><div class="gauge-fill" style="width:' + Math.min(100, Math.round(ext / 128 * 100)) + '%;background:var(--purple)"></div></div><span class="gauge-value">' + ext + ' MB</span></div>';
-          }
-        }
+        if (snap.memory) html += renderMemoryResources(snap.memory);
         if (snap.cpu) {
           var cpuPct = snap.cpu.percent || 0;
           var cpuColor = cpuPct > 80 ? 'var(--red)' : cpuPct > 50 ? 'var(--yellow)' : 'var(--green)';

@@ -4,12 +4,14 @@ import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { evaluateHealth } from "./thresholds.js";
+import {
+  collectCgroupMemory, evaluateMemory, holdMemoryCritical, readMemoryConfig,
+  type MemoryConfig, type MemoryHoldState,
+} from "./memory.js";
 
 export interface EscalationState {
-  /** Consecutive snapshots whose KV probe failed. Reset by any healthy probe. */
-  consecutiveStalls: number;
-  /** Set once a healthy KV probe has been seen. Nothing escalates before then. */
-  armed: boolean;
+  consecutiveKvProbeFailures: number;
+  hasSeenHealthyKvProbe: boolean;
   escalated: boolean;
 }
 
@@ -21,7 +23,7 @@ export interface EscalationState {
  * lag, CPU, memory), so gating on the aggregate would let a CPU spike during a
  * consolidation pass kill a process that is not wedged at all.
  *
- * `armed` mirrors the shell watchdog's "wait for a first success" rule. Without
+ * `hasSeenHealthyKvProbe` mirrors the shell watchdog's "wait for a first success" rule. Without
  * it, a store that is already stalled at boot escalates on the first minute of
  * every container life, which spends the platform's restart budget in minutes
  * and ends at a stopped deployment.
@@ -38,13 +40,13 @@ export function bumpEscalation(
 ): boolean {
   const stalled = snapshot.kvConnectivity?.status === "error";
   if (!stalled) {
-    state.armed = true;
-    state.consecutiveStalls = 0;
+    state.hasSeenHealthyKvProbe = true;
+    state.consecutiveKvProbeFailures = 0;
     return false;
   }
-  if (!state.armed) return false;
-  state.consecutiveStalls += 1;
-  if (state.escalated || state.consecutiveStalls < threshold) return false;
+  if (!state.hasSeenHealthyKvProbe) return false;
+  state.consecutiveKvProbeFailures += 1;
+  if (state.escalated || state.consecutiveKvProbeFailures < threshold) return false;
   state.escalated = true;
   return true;
 }
@@ -52,10 +54,32 @@ export function bumpEscalation(
 export function registerHealthMonitor(
   sdk: ISdk,
   kv: StateKV,
+  config: Partial<MemoryConfig> = {},
 ): { stop: () => void } {
+  const memoryConfig = readMemoryConfig(process.env, config);
+  const memoryStates = new Map<string, MemoryHoldState>();
+  let sequence = 0;
+  let acceptedSequence = 0;
+  let stopped = false;
+  let pendingSnapshot: HealthSnapshot | undefined;
+  let persisting = false;
+
+  async function persistLatest(snapshot: HealthSnapshot): Promise<void> {
+    pendingSnapshot = snapshot;
+    if (persisting) return;
+    persisting = true;
+    try {
+      while (pendingSnapshot && !stopped) {
+        const next = pendingSnapshot;
+        pendingSnapshot = undefined;
+        await kv.set(KV.health, "latest", next).catch(() => {});
+      }
+    } finally { persisting = false; }
+  }
+
   const escalationState: EscalationState = {
-    consecutiveStalls: 0,
-    armed: false,
+    consecutiveKvProbeFailures: 0,
+    hasSeenHealthyKvProbe: false,
     escalated: false,
   };
   // Default off. Enabling this arms an automatic process-killer, so it stays
@@ -95,7 +119,8 @@ export function registerHealthMonitor(
     });
   }
 
-  async function collectHealth(): Promise<HealthSnapshot> {
+  async function collectHealth(): Promise<void> {
+    const sampleSequence = ++sequence;
     const mem = process.memoryUsage();
     const currentCpu = process.cpuUsage();
     const now = Date.now();
@@ -109,6 +134,7 @@ export function registerHealthMonitor(
     prevCpuUsage = currentCpu;
     prevCpuTime = now;
 
+    const cgroup = await collectCgroupMemory();
     const startMark = performance.now();
     await new Promise((resolve) => setImmediate(resolve));
     const eventLoopLagMs = performance.now() - startMark;
@@ -159,6 +185,7 @@ export function registerHealthMonitor(
         rss: mem.rss,
         external: mem.external,
         heapSizeLimit: getHeapStatistics().heap_size_limit,
+        cgroup,
       },
       cpu: {
         userMicros: currentCpu.user,
@@ -172,7 +199,13 @@ export function registerHealthMonitor(
       alerts: [],
     };
 
-    const evaluated = evaluateHealth(snapshot);
+    if (stopped || sampleSequence <= acceptedSequence) return;
+    acceptedSequence = sampleSequence;
+    const memoryEvaluations = holdMemoryCritical(
+      evaluateMemory(snapshot.memory, memoryConfig), memoryStates, memoryConfig.memoryHoldSamples,
+    );
+    snapshot.memory.evaluations = memoryEvaluations;
+    const evaluated = evaluateHealth(snapshot, memoryConfig, memoryEvaluations);
     snapshot.status = evaluated.status;
     snapshot.alerts = evaluated.alerts;
     snapshot.notes = evaluated.notes;
@@ -182,8 +215,7 @@ export function registerHealthMonitor(
       escalate(snapshot.alerts);
     }
 
-    await kv.set(KV.health, "latest", snapshot).catch(() => {});
-    return snapshot;
+    await persistLatest(snapshot);
   }
 
   collectHealth().catch(() => {});
@@ -193,7 +225,7 @@ export function registerHealthMonitor(
   interval.unref();
 
   return {
-    stop: () => clearInterval(interval),
+    stop: () => { stopped = true; clearInterval(interval); },
   };
 }
 

@@ -1,13 +1,12 @@
+import { evaluateMemory, MEMORY_DEFAULTS } from "./memory.js";
+import type { MemoryConfig } from "./memory.js";
 import type { HealthSnapshot } from "../types.js";
 
-interface ThresholdConfig {
+interface ThresholdConfig extends Omit<MemoryConfig, "memoryHoldSamples"> {
   eventLoopLagWarnMs: number;
   eventLoopLagCriticalMs: number;
   cpuWarnPercent: number;
   cpuCriticalPercent: number;
-  memoryWarnPercent: number;
-  memoryCriticalPercent: number;
-  memoryRssFloorBytes: number;
 }
 
 const DEFAULTS: ThresholdConfig = {
@@ -15,14 +14,13 @@ const DEFAULTS: ThresholdConfig = {
   eventLoopLagCriticalMs: 500,
   cpuWarnPercent: 80,
   cpuCriticalPercent: 90,
-  memoryWarnPercent: 80,
-  memoryCriticalPercent: 95,
-  memoryRssFloorBytes: 512 * 1024 * 1024,
+  ...MEMORY_DEFAULTS,
 };
 
 export function evaluateHealth(
   snapshot: HealthSnapshot,
   config: Partial<ThresholdConfig> = {},
+  memoryEvaluations = evaluateMemory(snapshot.memory, { ...DEFAULTS, ...config }),
 ): { status: "healthy" | "degraded" | "critical"; alerts: string[]; notes: string[] } {
   const cfg = { ...DEFAULTS, ...config };
   const alerts: string[] = [];
@@ -77,26 +75,15 @@ export function evaluateHealth(
     degraded = true;
   }
 
-  // heapTotal is what V8 has committed so far, not what it may grow to, and V8
-  // sizes it to demand — so a healthy busy process sits near 100% of it
-  // permanently. Measure against heap_size_limit when the snapshot carries it.
-  const heapCeiling =
-    snapshot.memory.heapSizeLimit && snapshot.memory.heapSizeLimit > 0
-      ? snapshot.memory.heapSizeLimit
-      : snapshot.memory.heapTotal;
-  const memPercent =
-    heapCeiling > 0 ? (snapshot.memory.heapUsed / heapCeiling) * 100 : 0;
-  const rss = snapshot.memory.rss ?? 0;
-  const rssAboveFloor = rss >= cfg.memoryRssFloorBytes;
-  const memMb = Math.round(rss / (1024 * 1024));
-  if (memPercent > cfg.memoryCriticalPercent && rssAboveFloor) {
-    alerts.push(`memory_critical_${Math.round(memPercent)}%_rss${memMb}mb`);
-    critical = true;
-  } else if (memPercent > cfg.memoryWarnPercent && rssAboveFloor) {
-    alerts.push(`memory_warn_${Math.round(memPercent)}%_rss${memMb}mb`);
-    degraded = true;
-  } else if (memPercent > cfg.memoryWarnPercent) {
-    notes.push(`memory_heap_tight_${Math.round(memPercent)}%_rss${memMb}mb`);
+  for (const evaluation of memoryEvaluations) {
+    const signal = `${evaluation.source}${evaluation.path ?? ""}`;
+    if (!evaluation.available) notes.push(`memory_unavailable_${signal}`);
+    if (evaluation.transition) notes.push(`memory_${evaluation.transition}_${signal}`);
+    if (evaluation.severity === "critical") critical = true;
+    if (evaluation.severity === "degraded") degraded = true;
+    if (evaluation.severity !== "healthy") {
+      alerts.push(`memory_${evaluation.severity === "critical" ? "critical" : "warn"}_${signal}_${evaluation.percent === undefined ? "unavailable" : `${Math.round(evaluation.percent)}%`}`);
+    }
   }
 
   const status = critical ? "critical" : degraded ? "degraded" : "healthy";

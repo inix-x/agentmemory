@@ -1,44 +1,80 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 
-// The dashboard used to recompute heapUsed / heapTotal client-side, which is
-// the same over-reporting the health thresholds had: heapTotal is what V8 has
-// committed, not what it may grow to. The gauge now measures against
-// heapSizeLimit, and it divides raw byte values so it cannot disagree with
-// evaluateHealth over a rounding step.
-//
-// Asserting on the emitted source rather than running the gauge follows
-// viewer-graph-cooldown and viewer-memories-sort: the viewer ships as one
-// HTML file with inline JS, so there is no module to import and execute.
-describe("viewer heap gauge", () => {
-  const viewer = readFileSync("src/viewer/index.html", "utf-8");
-
-  it("measures against the V8 heap limit, falling back to heapTotal", () => {
-    expect(viewer).toMatch(/limitBytes\s*=\s*snap\.memory\.heapSizeLimit\s*\|\|\s*0/);
-    expect(viewer).toMatch(
-      /ceilingBytes\s*=\s*limitBytes\s*>\s*0\s*\?\s*limitBytes\s*:\s*\(snap\.memory\.heapTotal\s*\|\|\s*0\)/,
-    );
+const viewer = readFileSync("src/viewer/index.html", "utf8");
+function render(memory: Record<string, unknown>): string {
+  const start = viewer.indexOf("    function renderMemoryResources(memory) {");
+  const end = viewer.indexOf("\n    }", start) + 6;
+  expect(start).toBeGreaterThan(-1);
+  return runInNewContext(`${viewer.slice(start, end)}; renderMemoryResources(memory)`, {
+    memory,
+    esc: (s: unknown) => String(s).replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[c]),
   });
+}
+const mb = 1024 * 1024;
+const base = { heapUsed: 45 * mb, heapTotal: 46 * mb, rss: 511.5 * mb };
+const evaluation = {
+  source: "heap", usedBytes: 45 * mb, limitBytes: 100 * mb,
+  percent: 45, severity: "healthy", available: true,
+};
 
-  it("computes the percentage from raw bytes, not the MB-rounded label values", () => {
-    expect(viewer).toMatch(
-      /heapPercent\s*=\s*ceilingBytes\s*>\s*0\s*\?\s*\(\(snap\.memory\.heapUsed\s*\|\|\s*0\)\s*\/\s*ceilingBytes\)\s*\*\s*100/,
-    );
-    // The old form divided two already-rounded MB numbers.
-    expect(viewer).not.toMatch(/heapPct\s*=\s*heapTotal\s*>\s*0\s*\?\s*Math\.round\(\(heapUsed\s*\/\s*heapTotal\)/);
+describe("viewer memory resources", () => {
+  it("uses server severity even when RSS rounds across the former floor", () => {
+    const html = render({ ...base, evaluations: [{ ...evaluation, percent: 80.4, severity: "degraded" }] });
+    expect(html).toContain("var(--yellow)");
+    expect(html).toContain("80.4%");
+    expect(html).not.toContain("var(--red)");
   });
-
-  it("picks the gauge colour on the unrounded percentage", () => {
-    // Rounding first put the gauge a whole point out of step with
-    // evaluateHealth, which compares the raw value: at 80.4% health warns
-    // while a rounded 80 left the bar on the lower colour.
-    expect(viewer).toMatch(/heapPct\s*=\s*Math\.round\(heapPercent\)/);
-    expect(viewer).toMatch(/heapColor\s*=\s*\(heapPercent\s*>\s*80\s*&&\s*rssAboveFloor\)/);
-    expect(viewer).toMatch(/\(heapPercent\s*>\s*60\s*&&\s*rssAboveFloor\)/);
+  it("shows held recovery as critical rather than recoloring a low percentage", () => {
+    const html = render({ ...base, evaluations: [{ ...evaluation, severity: "critical", transition: "recovering" }] });
+    expect(html).toContain("var(--red)");
+    expect(html).toContain("Recovery pending");
   });
+  it("shows entering critical as pending and caps only the drawn width", () => {
+    const html = render({ ...base, evaluations: [{ ...evaluation, percent: 102.2, severity: "degraded", transition: "entering" }] });
+    expect(html).toContain("width:100%");
+    expect(html).toContain("102.2%");
+    expect(html).toContain("Critical pending");
+  });
+  it("renders old snapshots without an invented pressure limit", () => {
+    const html = render(base);
+    expect(html).toContain("Memory pressure unavailable");
+    expect(html).toContain("Heap: 45 MiB");
+    expect(html).not.toContain("var(--red)");
+  });
+  it("keeps unavailable latched signals visible and escapes their path", () => {
+    const html = render({ ...base, evaluations: [{ source: "cgroup-max", path: '<img src=x onerror=alert(1)>', severity: "critical", available: false, transition: "unavailable" }] });
+    expect(html).toContain("var(--red)");
+    expect(html).toContain("Measurement unavailable");
+    expect(html).toContain("&lt;img");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("NaN");
+  });
+  it("identifies the cgroup soft limit separately", () => {
+    expect(render({ ...base, evaluations: [{ ...evaluation, source: "cgroup-high", severity: "degraded" }] })).toContain("Container throttle");
+  });
+});
 
-  it("rounds only for the displayed label", () => {
-    expect(viewer).toMatch(/heapCeiling\s*=\s*Math\.round\(ceilingBytes\s*\/\s*1024\s*\/\s*1024\)/);
-    expect(viewer).toMatch(/\+\s*heapUsed\s*\+\s*' \/ '\s*\+\s*heapCeiling\s*\+\s*' MB/);
+
+describe("viewer memory alerts", () => {
+  const start = viewer.indexOf("    function humanizeHealthFlag(f) {");
+  const end = viewer.indexOf("\n    }", start) + 6;
+  const humanize = (f: string) => runInNewContext(`${viewer.slice(start, end)}; humanizeHealthFlag(f)`, { f });
+  it.each([
+    ["memory_critical_heap_96%", "V8 heap", "96%"],
+    ["memory_warn_cgroup-high/_110%", "Container throttle", "110%"],
+    ["memory_entering_rss", "RSS budget", "Critical pending"],
+    ["memory_recovering_heap", "V8 heap", "Recovery pending"],
+    ["memory_unavailable_cgroup-max/parent", "Container limit", "Measurement unavailable"],
+  ])("describes %s", (slug, source, detail) => {
+    expect(humanize(slug)).toContain(source);
+    expect(humanize(slug)).toContain(detail);
+    expect(humanize(slug)).not.toBe(slug);
+  });
+  it("keeps legacy snapshots readable", () => {
+    expect(humanize("memory_critical_97%_rss557mb")).toContain("process memory 557 MB");
   });
 });

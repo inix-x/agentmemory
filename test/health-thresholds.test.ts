@@ -17,159 +17,56 @@ function snap(over: Partial<HealthSnapshot> = {}): HealthSnapshot {
   };
 }
 
-describe("evaluateHealth memory severity", () => {
-  it("stays healthy when heap fills a tiny steady-state process (issue #158)", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 45 * 1024 * 1024,
-        heapTotal: 46 * 1024 * 1024,
-        rss: 120 * 1024 * 1024,
-        external: 0,
-      },
-    });
-    const { status, alerts, notes } = evaluateHealth(s);
-    expect(status).toBe("healthy");
-    expect(alerts.find((a) => a.startsWith("memory_critical_"))).toBeUndefined();
-    expect(alerts.find((a) => a.startsWith("memory_warn_"))).toBeUndefined();
-    expect(alerts.find((a) => a.startsWith("memory_heap_tight_"))).toBeUndefined();
-    expect(notes.find((n) => n.startsWith("memory_heap_tight_"))).toBeDefined();
+describe("independent real memory budgets", () => {
+  it.each([
+    [390_771_624, 404_930_560, 6_492_782_592],
+    [267_970_328, 277_663_744, 2_197_815_296],
+  ])("keeps the reported committed heap %s healthy", (heapUsed, heapTotal, heapSizeLimit) => {
+    expect(evaluateHealth(snap({ memory: { heapUsed, heapTotal, heapSizeLimit, rss: 600_000_000, external: 0 } })).status).toBe("healthy");
   });
 
-  it("goes critical when heap ratio is high AND RSS is above the floor", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 970 * 1024 * 1024,
-        heapTotal: 1000 * 1024 * 1024,
-        rss: 1100 * 1024 * 1024,
-        external: 0,
-      },
-    });
-    const { status, alerts } = evaluateHealth(s);
-    expect(status).toBe("critical");
-    expect(alerts.some((a) => a.startsWith("memory_critical_"))).toBe(true);
+  it("does not invent a budget for old snapshots", () => {
+    const result = evaluateHealth(snap({ memory: { heapUsed: 970, heapTotal: 1000, rss: 900_000_000, external: 0 } }));
+    expect(result.status).toBe("healthy");
+    expect(result.notes).toContain("memory_unavailable_heap");
   });
 
-  it("records heap_tight in the warn band when RSS is below the floor", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 85 * 1024 * 1024,
-        heapTotal: 100 * 1024 * 1024,
-        rss: 50 * 1024 * 1024,
-        external: 0,
-      },
-    });
-    const { status, alerts, notes } = evaluateHealth(s);
-    expect(status).toBe("healthy");
-    expect(notes.some((n) => n.startsWith("memory_heap_tight_"))).toBe(true);
-    expect(alerts.some((a) => a.startsWith("memory_heap_tight_"))).toBe(false);
-    expect(alerts.some((a) => a.startsWith("memory_warn_"))).toBe(false);
-    expect(alerts.some((a) => a.startsWith("memory_critical_"))).toBe(false);
+  it.each([[80, "healthy"], [81, "degraded"], [95, "degraded"], [96, "critical"]])("evaluates small heaps at %s percent without an RSS floor", (heapUsed, expected) => {
+    expect(evaluateHealth(snap({ memory: { heapUsed: Number(heapUsed), heapTotal: 100, heapSizeLimit: 100, rss: 200, external: 0 } })).status).toBe(expected);
   });
 
-  it("goes degraded when heap is above warn AND RSS is above the floor", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 850 * 1024 * 1024,
-        heapTotal: 1000 * 1024 * 1024,
-        rss: 900 * 1024 * 1024,
-        external: 0,
-      },
-    });
-    const { status, alerts } = evaluateHealth(s, { memoryRssFloorBytes: 800 * 1024 * 1024 });
-    expect(status).toBe("degraded");
-    expect(alerts.some((a) => a.startsWith("memory_warn_"))).toBe(true);
+  it("keeps heap and cgroup signals independent", () => {
+    const memory = { heapUsed: 96, heapTotal: 100, heapSizeLimit: 100, rss: 200, external: 0, cgroup: { status: "available" as const, levels: [{ path: "/", current: 100, max: 1000 }] } };
+    expect(evaluateHealth(snap({ memory })).status).toBe("critical");
+    memory.heapUsed = 10;
+    memory.cgroup.levels[0].current = 960;
+    expect(evaluateHealth(snap({ memory })).status).toBe("critical");
   });
 
-  it("respects caller-supplied memoryRssFloorBytes", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 98,
-        heapTotal: 100,
-        rss: 50 * 1024 * 1024,
-        external: 0,
-      },
-    });
-    const loose = evaluateHealth(s, { memoryRssFloorBytes: 10 * 1024 * 1024 });
-    expect(loose.status).toBe("critical");
-    const strict = evaluateHealth(s, { memoryRssFloorBytes: 1024 * 1024 * 1024 });
-    expect(strict.status).toBe("healthy");
+  it("reports memory.high as warning even beyond its boundary", () => {
+    const result = evaluateHealth(snap({ memory: { heapUsed: 1, heapTotal: 100, external: 0, rss: 2, cgroup: { status: "available", levels: [{ path: "/", current: 110, high: 100 }] } } }));
+    expect(result.status).toBe("degraded");
+    expect(result.alerts).toContain("memory_warn_cgroup-high/_110%");
+  });
+
+  it("evaluates an explicit RSS budget alongside low cgroup occupancy", () => {
+    const result = evaluateHealth(snap({ memory: { heapUsed: 1, heapTotal: 100, external: 0, rss: 110, cgroup: { status: "available", levels: [{ path: "/", current: 110, max: 1000 }] } } }), { memoryRssBudgetBytes: 100 });
+    expect(result.status).toBe("critical");
+    expect(result.alerts).toContain("memory_critical_rss_110%");
+  });
+
+  it.each([0, -1, Infinity, NaN])("rejects invalid V8 limit %s", heapSizeLimit => {
+    expect(evaluateHealth(snap({ memory: { heapUsed: 99, heapTotal: 100, heapSizeLimit, rss: 1_000_000_000, external: 0 } })).status).toBe("healthy");
   });
 });
 
-describe("evaluateHealth memory severity — denominator", () => {
-  const LIMIT_6192MB = 6192 * 1024 * 1024;
-
-  it("stays healthy when a busy process fills its committed heap but sits far below the V8 limit", () => {
-    // Captured from a live deployment: this process reported
-    // memory_critical_97% while using 6% of the heap it may grow to.
-    const s = snap({
-      memory: {
-        heapUsed: 390_771_624,
-        heapTotal: 404_930_560,
-        rss: 584_327_168,
-        external: 6_566_392,
-        heapSizeLimit: LIMIT_6192MB,
-      },
-    });
-
-    const { status, alerts } = evaluateHealth(s);
-
-    expect(status).toBe("healthy");
-    expect(alerts.find((a) => a.startsWith("memory_critical_"))).toBeUndefined();
-    expect(alerts.find((a) => a.startsWith("memory_warn_"))).toBeUndefined();
-  });
-
-  it("reports the percentage against the limit, not against the committed heap", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 390_771_624,
-        heapTotal: 404_930_560,
-        rss: 584_327_168,
-        external: 0,
-        heapSizeLimit: LIMIT_6192MB,
-      },
-    });
-
-    // Widen the band so the alert fires as a warn either way and the rendered
-    // percentage is the only thing under test.
-    const { alerts } = evaluateHealth(s, {
-      memoryWarnPercent: 1,
-      memoryCriticalPercent: 99,
-    });
-    const warn = alerts.find((a) => a.startsWith("memory_warn_"));
-
-    // 390771624 / 6492782592 = 6%, not 390771624 / 404930560 = 97%.
-    expect(warn).toBe("memory_warn_6%_rss557mb");
-  });
-
-  it("still goes critical when the heap genuinely approaches the V8 limit", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 6_200_000_000,
-        heapTotal: 6_300_000_000,
-        rss: 6_800_000_000,
-        external: 0,
-        heapSizeLimit: LIMIT_6192MB,
-      },
-    });
-
-    const { status, alerts } = evaluateHealth(s);
-
-    expect(status).toBe("critical");
-    expect(alerts.some((a) => a.startsWith("memory_critical_"))).toBe(true);
-  });
-
-  it("falls back to the committed heap when heapSizeLimit is absent", () => {
-    const s = snap({
-      memory: {
-        heapUsed: 970 * 1024 * 1024,
-        heapTotal: 1000 * 1024 * 1024,
-        rss: 1100 * 1024 * 1024,
-        external: 0,
-      },
-    });
-
-    expect(evaluateHealth(s).status).toBe("critical");
+describe("non-memory signals", () => {
+  it.each([
+    { cpu: { userMicros: 0, systemMicros: 0, percent: 91 } },
+    { eventLoopLagMs: 501 },
+    { connectionState: "failed" },
+  ])("keeps critical conditions immediate during memory entry: %s", other => {
+    expect(evaluateHealth(snap(other), {}, [{ source: "heap", available: true, percent: 99, severity: "degraded", transition: "entering" }]).status).toBe("critical");
   });
 });
 
