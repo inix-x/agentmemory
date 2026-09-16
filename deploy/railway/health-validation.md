@@ -81,7 +81,7 @@ At the end of steady-state sampling, redeploy the exact candidate image with san
 
 ### Exact test-only allocation module
 
-In an isolated source export, save the following as `src/repro-runtime.ts` and add `import "./repro-runtime.js";` to `src/index.ts` before building. This import belongs only in the disposable experiment build, never in the application PR. The module collects diagnostics every second and adds bulk allocations only when its control file requests them.
+The following is the frozen module used for the recorded measurements and workload hash above. In an isolated source export, save it as `src/repro-runtime.ts`, apply the required publication patch below, then add `import "./repro-runtime.js";` to `src/index.ts` before building. This import belongs only in the disposable experiment build, never in the application PR. The module collects diagnostics every second and adds bulk allocations only when its control file requests them.
 
 ```typescript
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
@@ -109,6 +109,32 @@ setInterval(() => {
   writeFileSync('/tmp/health-repro-diagnostics.json',JSON.stringify({timestamp:new Date().toISOString(),deploymentId:process.env.RAILWAY_DEPLOYMENT_ID,variant:process.env.HEALTH_REPRO_VARIANT,pid:process.pid,node:process.version,versions:process.versions,nodeOptions:process.env.NODE_OPTIONS,memory:process.memoryUsage(),heapSizeLimit:getHeapStatistics().heap_size_limit,allocations:{heapElements:heap.length * 1024 * 1024,nativeBytes:native?.length||0,churnElements:churn.length,siblingPid:child?.pid},cgroup,processes,mountinfo:read('/proc/self/mountinfo')?.split('\n').filter(l=>l.includes('cgroup'))}));
 }, 1000).unref();
 ```
+
+### Required diagnostics publication patch for new runs
+
+The measured module truncates the diagnostics file while rewriting it, so another process can read partial JSON. Before building any new experiment, run this patch in its isolated source export. It writes diagnostics to a temporary file in the same directory, then atomically renames it over the reader-visible path. All diagnostics readers then receive a complete previous or current snapshot.
+
+This changes only diagnostics publication. The original module, hash and recorded measurements above remain historical evidence; the patched module has a different hash and has not been measured in those runs. Record the printed hash with each new run and use the patched module consistently across its variants.
+
+```sh
+node --input-type=module <<'NODE'
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const file = 'src/repro-runtime.ts';
+let source = readFileSync(file, 'utf8');
+if (createHash('sha256').update(source).digest('hex') !== 'f8ace48d97343665518729861de6506deb80cdff7142489266382cce27676f9e') {
+  throw new Error('Expected the exact measured allocation module before patching');
+}
+source = source
+  .replace('writeFileSync, readdirSync', 'writeFileSync, renameSync, readdirSync')
+  .replace("writeFileSync('/tmp/health-repro-diagnostics.json',", "writeFileSync('/tmp/health-repro-diagnostics.next',")
+  .replace('\n}, 1000).unref();', "\n  renameSync('/tmp/health-repro-diagnostics.next', '/tmp/health-repro-diagnostics.json');\n}, 1000).unref();");
+writeFileSync(file, source);
+console.log('Atomic-publication workload SHA-256:', createHash('sha256').update(source).digest('hex'));
+NODE
+```
+
+### Steady-state sampler
 
 Save the following as `/tmp/health-repro-sample.mjs` inside the sandbox container. It reads authentication locally and prints only response/diagnostic evidence.
 
