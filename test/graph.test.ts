@@ -765,4 +765,27 @@ describe("Graph Functions", () => {
       expect(listCalls).toBe(0);
     });
   });
+
+  it("graph-extract is a no-op when GRAPH_WRITES_ENABLED is unset", async () => {
+    const saved = process.env["GRAPH_WRITES_ENABLED"];
+    try {
+      delete process.env["GRAPH_WRITES_ENABLED"];
+      const result = (await sdk.trigger("mem::graph-extract", {
+        observations: [
+          {
+            id: "obs_gated",
+            title: "should be skipped",
+            narrative: "no-op",
+            concepts: ["gate-test"],
+            type: "discovery",
+          },
+        ],
+      })) as { success: boolean; skipped?: boolean };
+      expect(result.success).toBe(true);
+      expect(result.skipped).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env["GRAPH_WRITES_ENABLED"] = saved;
+      else delete process.env["GRAPH_WRITES_ENABLED"];
+    }
+  });
 });

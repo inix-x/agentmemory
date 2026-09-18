@@ -612,3 +612,11 @@ export function loadFallbackConfig(): FallbackConfig {
 export function isObsIndexWriteEnabled(): boolean {
   return getMergedEnv()["GRAPH_OBS_INDEX_WRITES"] === "true";
 }
+
+// Gate ALL graph writes (heuristic + LLM extraction + persist). The iii
+// engine holds every KV entry in Go heap; 211k nodes + 431k edges = ~2.3 GB
+// of anonymous memory that grows without bound. Disabled by default; set
+// GRAPH_WRITES_ENABLED=true to re-enable.
+export function isGraphWriteEnabled(): boolean {
+  return getMergedEnv()["GRAPH_WRITES_ENABLED"] === "true";
+}

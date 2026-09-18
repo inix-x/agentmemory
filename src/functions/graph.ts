@@ -18,6 +18,7 @@ import {
 } from "../prompts/graph-extraction.js";
 import {
   isGraphExtractionEnabled,
+  isGraphWriteEnabled,
   getGraphProvenanceMode,
   getGraphRowBatchCap,
 } from "../config.js";
@@ -1345,6 +1346,10 @@ export function registerGraphFunction(
 ): void {
   sdk.registerFunction("mem::graph-extract",
     async (data: { observations: CompressedObservation[] }) => {
+      if (!isGraphWriteEnabled()) {
+        return { success: true, skipped: true, reason: "GRAPH_WRITES_ENABLED is not set" };
+      }
+
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
