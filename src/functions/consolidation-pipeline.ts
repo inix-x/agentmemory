@@ -28,6 +28,7 @@ function applyDecay(
     strength: number;
     lastAccessedAt?: string;
     updatedAt: string;
+    lastDecayedAt?: string;
   }>,
   decayDays: number,
 ): void {
@@ -35,14 +36,19 @@ function applyDecay(
   const now = Date.now();
   for (const item of items) {
     const lastAccess = item.lastAccessedAt || item.updatedAt;
-    const daysSince =
-      (now - new Date(lastAccess).getTime()) / (1000 * 60 * 60 * 24);
+    const lastAccessTime = new Date(lastAccess).getTime();
+    const lastDecayedTime = item.lastDecayedAt
+      ? new Date(item.lastDecayedAt).getTime()
+      : -Infinity;
+    const anchor = Math.max(lastAccessTime, lastDecayedTime);
+    const daysSince = (now - anchor) / (1000 * 60 * 60 * 24);
     if (daysSince > decayDays) {
       const decayPeriods = Math.floor(daysSince / decayDays);
       item.strength = Math.max(
         0.1,
         item.strength * Math.pow(0.9, decayPeriods),
       );
+      item.lastDecayedAt = new Date(now).toISOString();
     }
   }
 }
@@ -263,6 +269,35 @@ async function trimRunRows(kv: StateKV): Promise<void> {
   for (const stale of runs.slice(MAX_RUN_ROWS)) {
     await kv.delete(KV.consolidationRuns, stale.runId).catch(() => undefined);
   }
+}
+
+const DECAY_STRENGTH_EPSILON = 1e-9;
+
+function strengthChanged(before: number, after: number): boolean {
+  return Math.abs(after - before) > DECAY_STRENGTH_EPSILON;
+}
+
+async function decayAndWriteChanged<
+  T extends {
+    id: string;
+    strength: number;
+    lastAccessedAt?: string;
+    updatedAt: string;
+    lastDecayedAt?: string;
+  },
+>(
+  kv: StateKV,
+  scope: string,
+  items: T[],
+  decayDays: number,
+): Promise<{ scanned: number; written: number }> {
+  const before = items.map((item) => item.strength);
+  applyDecay(items, decayDays);
+  const dirty = items.filter((item, i) => strengthChanged(before[i], item.strength));
+  for (const item of dirty) {
+    await kv.set(scope, item.id, item);
+  }
+  return { scanned: items.length, written: dirty.length };
 }
 
 export function registerConsolidationPipelineFunction(
@@ -560,26 +595,30 @@ export function registerConsolidationPipelineFunction(
             KV.semantic,
             decayCost,
           );
-          applyDecay(semantic, decayDays);
-          for (const s of semantic) {
-            await kv.set(KV.semantic, s.id, s);
-            decayCost.rowsWritten++;
-          }
+          const semanticResult = await decayAndWriteChanged(
+            kv,
+            KV.semantic,
+            semantic,
+            decayDays,
+          );
+          decayCost.rowsWritten += semanticResult.written;
 
           const procedural = await measuredList<ProceduralMemory>(
             kv,
             KV.procedural,
             decayCost,
           );
-          applyDecay(procedural, decayDays);
-          for (const p of procedural) {
-            await kv.set(KV.procedural, p.id, p);
-            decayCost.rowsWritten++;
-          }
+          const proceduralResult = await decayAndWriteChanged(
+            kv,
+            KV.procedural,
+            procedural,
+            decayDays,
+          );
+          decayCost.rowsWritten += proceduralResult.written;
 
           results.decay = withStatus("ok", {
-            semantic: semantic.length,
-            procedural: procedural.length,
+            semantic: semanticResult,
+            procedural: proceduralResult,
           });
         }
 

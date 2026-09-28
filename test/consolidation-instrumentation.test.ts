@@ -262,10 +262,9 @@ describe("Consolidation tier instrumentation", () => {
     expect(semantic.readBytes).toBeGreaterThanOrEqual(summaryRead.bytes);
   });
 
-  it("counts the decay tier's write-back, one row per row it read", async () => {
-    // This is the number that makes the case for deriving decayed strength at
-    // read instead: the tier writes every row back whether or not decay changed
-    // anything, so rowsWritten tracks corpus size rather than actual change.
+  it("counts only the decay rows that changed, not every row it read", async () => {
+    // The tier used to write every row back whether or not decay changed it,
+    // so rowsWritten tracked corpus size. It now tracks actual change.
     const provider = {
       name: "test",
       compress: vi.fn(),
@@ -291,8 +290,8 @@ describe("Consolidation tier instrumentation", () => {
     await sdk.trigger("mem::consolidate-pipeline", { tier: "decay" });
 
     const decay = runRow(store).results!["decay"]!;
-    // Every row rewritten, and not one of them decayed: they are all fresh.
-    expect(decay.rowsWritten).toBe(7);
+    // All seven are fresh, so none decayed and none is written back.
+    expect(decay.rowsWritten).toBe(0);
     expect(decay.reads!.find((r) => r.scope === KV.semantic)!.rows).toBe(7);
   });
 
