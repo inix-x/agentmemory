@@ -440,7 +440,7 @@ describe("Consolidation Pipeline", () => {
     expect(stored[0]!.confidence).toBe(0.9);
   });
 
-  it("evicts the least recently accessed rows once mem:semantic is past the cap, never the new fact", async () => {
+  it("evicts the oldest one-off rows once mem:semantic is past the cap, never the new fact", async () => {
     const provider = {
       name: "test",
       compress: vi.fn(),
@@ -464,7 +464,7 @@ describe("Consolidation Pipeline", () => {
       await kv.set("mem:semantic", id, makeSemanticMemory({
         id,
         fact: id,
-        accessCount: 3,
+        accessCount: 1,
         strength: 1,
         lastAccessedAt: "2026-01-01T00:00:00.000Z",
       }));
@@ -480,6 +480,50 @@ describe("Consolidation Pipeline", () => {
     const ids = new Set(stored.map((s) => s.id));
     for (const id of stale) expect(ids.has(id)).toBe(false);
     expect(stored.some((s) => s.fact === "A brand new fact")).toBe(true);
+  });
+
+  // The cleanup kept the reinforced facts, and they carry the oldest
+  // lastAccessedAt in the scope. Eviction by recency alone would delete
+  // exactly those first once the cap fills.
+  it("evicts old one-off facts before older reinforced ones", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">A brand new fact</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+    const reinforced = ["sem_reinforced_a", "sem_reinforced_b"];
+    for (const id of reinforced) {
+      await kv.set("mem:semantic", id, makeSemanticMemory({
+        id,
+        fact: id,
+        accessCount: 3,
+        lastAccessedAt: "2026-08-13T00:00:00.000Z",
+      }));
+    }
+    for (let i = 0; i < SEMANTIC_MAX_ROWS - 2; i++) {
+      await kv.set("mem:semantic", `sem_oneoff_${i}`, makeSemanticMemory({
+        id: `sem_oneoff_${i}`,
+        fact: `one-off fact ${i}`,
+        accessCount: 1,
+        lastAccessedAt: new Date(Date.UTC(2026, 8, 1) + i * 60_000).toISOString(),
+      }));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { evicted?: number }> };
+
+    const ids = new Set((await kv.list<SemanticMemory>("mem:semantic")).map((s) => s.id));
+    expect(result.results.semantic.evicted).toBe(1);
+    for (const id of reinforced) expect(ids.has(id)).toBe(true);
+    expect(ids.has("sem_oneoff_0")).toBe(false);
+    expect(ids.has("sem_oneoff_1")).toBe(true);
   });
 });
 

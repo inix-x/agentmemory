@@ -59,23 +59,24 @@ function applyDecay(
 export const SEMANTIC_MAX_ROWS = 10_000;
 
 /**
- * Deletes the least recently accessed rows past SEMANTIC_MAX_ROWS, lower
- * strength first on a tie. A merge that re-extracts a fact refreshes its
- * lastAccessedAt, so reinforced facts stay, and a new fact is never the first
- * to go. Without a bound the scope grows until the read guard refuses it, and
- * the semantic tier stops for good.
+ * Deletes the weakest rows past SEMANTIC_MAX_ROWS: never-reinforced facts
+ * first, least recently accessed first among those, lower strength on a tie.
+ * Reinforced facts outlive one-off extractions however old they are, and a new
+ * fact goes only after every older one-off. Without a bound the scope grows
+ * until the read guard refuses it, and the semantic tier stops for good.
  */
 async function evictPastCap(
   kv: StateKV,
   rows: SemanticMemory[],
 ): Promise<string[]> {
   if (rows.length <= SEMANTIC_MAX_ROWS) return [];
-  const staleFirst = [...rows].sort(
+  const weakestFirst = [...rows].sort(
     (a, b) =>
-      a.lastAccessedAt.localeCompare(b.lastAccessedAt) ||
+      a.accessCount - b.accessCount ||
+      (a.lastAccessedAt ?? "").localeCompare(b.lastAccessedAt ?? "") ||
       a.strength - b.strength,
   );
-  const evicted = staleFirst
+  const evicted = weakestFirst
     .slice(0, rows.length - SEMANTIC_MAX_ROWS)
     .map((row) => row.id);
   for (const id of evicted) {
