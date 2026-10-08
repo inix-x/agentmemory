@@ -9,7 +9,10 @@ vi.mock("../src/config.js", () => ({
   isConsolidationEnabled: vi.fn(() => true),
 }));
 
-import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import {
+  registerConsolidationPipelineFunction,
+  SEMANTIC_MAX_ROWS,
+} from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 import { auditQueryScopes } from "../src/functions/audit.js";
@@ -435,6 +438,48 @@ describe("Consolidation Pipeline", () => {
     expect(stored).toHaveLength(1);
     expect(stored[0]!.accessCount).toBe(2);
     expect(stored[0]!.confidence).toBe(0.9);
+  });
+
+  it("evicts the least recently accessed rows once mem:semantic is past the cap, never the new fact", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">A brand new fact</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+    for (let i = 0; i < SEMANTIC_MAX_ROWS - 1; i++) {
+      await kv.set("mem:semantic", `sem_keep_${i}`, makeSemanticMemory({
+        id: `sem_keep_${i}`,
+        fact: `kept fact ${i}`,
+        strength: 0.1,
+      }));
+    }
+    const stale = ["sem_stale_a", "sem_stale_b"];
+    for (const id of stale) {
+      await kv.set("mem:semantic", id, makeSemanticMemory({
+        id,
+        fact: id,
+        accessCount: 3,
+        strength: 1,
+        lastAccessedAt: "2026-01-01T00:00:00.000Z",
+      }));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { evicted?: number }> };
+
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(SEMANTIC_MAX_ROWS);
+    expect(result.results.semantic.evicted).toBe(2);
+    const ids = new Set(stored.map((s) => s.id));
+    for (const id of stale) expect(ids.has(id)).toBe(false);
+    expect(stored.some((s) => s.fact === "A brand new fact")).toBe(true);
   });
 });
 

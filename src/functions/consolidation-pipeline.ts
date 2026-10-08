@@ -54,6 +54,36 @@ function applyDecay(
   }
 }
 
+// About 1.3 KB per row in production, so 10,000 rows stay near 13 MB, under the
+// 15 MiB scope-size ceiling the semantic read is bounded by.
+export const SEMANTIC_MAX_ROWS = 10_000;
+
+/**
+ * Deletes the least recently accessed rows past SEMANTIC_MAX_ROWS, lower
+ * strength first on a tie. A merge that re-extracts a fact refreshes its
+ * lastAccessedAt, so reinforced facts stay, and a new fact is never the first
+ * to go. Without a bound the scope grows until the read guard refuses it, and
+ * the semantic tier stops for good.
+ */
+async function evictPastCap(
+  kv: StateKV,
+  rows: SemanticMemory[],
+): Promise<string[]> {
+  if (rows.length <= SEMANTIC_MAX_ROWS) return [];
+  const staleFirst = [...rows].sort(
+    (a, b) =>
+      a.lastAccessedAt.localeCompare(b.lastAccessedAt) ||
+      a.strength - b.strength,
+  );
+  const evicted = staleFirst
+    .slice(0, rows.length - SEMANTIC_MAX_ROWS)
+    .map((row) => row.id);
+  for (const id of evicted) {
+    await kv.delete(KV.semantic, id);
+  }
+  return evicted;
+}
+
 /** Key within KV.config: createdAt of the newest summary the semantic tier consumed. */
 const SEMANTIC_WATERMARK_KEY = "consolidation:semanticWatermark";
 
@@ -514,10 +544,19 @@ export function registerConsolidationPipelineFunction(
               await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
                 at: recentSummaries[0]!.createdAt,
               });
+              const evicted = await evictPastCap(kv, existingSemantic);
+              if (evicted.length > 0) {
+                await recordAudit(kv, "delete", "mem::consolidate-pipeline", evicted, {
+                  resource: "semantic",
+                  reason: "semantic row cap",
+                  cap: SEMANTIC_MAX_ROWS,
+                });
+              }
               results.semantic = withStatus("ok", {
                 newFacts,
                 totalSummaries: summaries.length,
                 consumedSummaries: recentSummaries.length,
+                evicted: evicted.length,
               });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
