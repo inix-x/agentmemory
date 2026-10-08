@@ -20,7 +20,8 @@ import {
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
-import { payloadByteLength } from "../state/frame-guard.js";
+import { payloadByteLength, type OversizedPayload } from "../state/frame-guard.js";
+import { isOversized, listBounded } from "../state/scope-size.js";
 import { logger } from "../logger.js";
 
 function applyDecay(
@@ -178,6 +179,37 @@ async function measuredList<T>(
   const rows = await kv.list<T>(scope);
   cost.reads.push({ scope, rows: rows.length, bytes: payloadByteLength(rows) });
   return rows;
+}
+
+/**
+ * measuredList behind the scope-size guard, for the scopes this pipeline grows.
+ *
+ * mem:semantic reached 104.8 MB in production on 2026-10-07, past the 100 MiB
+ * `ws` maxPayload. Every run after that died at the frame length header, and the
+ * dropped socket took every in-flight observe and enrich call down with it, once
+ * per session stop. A tier whose scope is over the ceiling skips instead, and it
+ * must never carry on with an empty list: the semantic tier would then insert
+ * every fact as new.
+ */
+async function boundedMeasuredList<T>(
+  kv: StateKV,
+  scope: string,
+  cost: TierCost,
+): Promise<T[] | OversizedPayload> {
+  const rows = await listBounded<T>(kv, scope, "consolidation skipped this tier");
+  if (!isOversized(rows)) {
+    cost.reads.push({ scope, rows: rows.length, bytes: payloadByteLength(rows) });
+  }
+  return rows;
+}
+
+function oversizedSkip(scope: string, refused: OversizedPayload) {
+  return withStatus("skipped", {
+    skipped: true,
+    reason: `${scope} is over the scope-size ceiling`,
+    bytes: refused.bytes,
+    limitBytes: refused.limitBytes,
+  });
 }
 
 /**
@@ -387,13 +419,15 @@ export function registerConsolidationPipelineFunction(
             KV.summaries,
             semanticCost,
           );
-          const existingSemantic = await measuredList<SemanticMemory>(
+          const existingSemantic = await boundedMeasuredList<SemanticMemory>(
             kv,
             KV.semantic,
             semanticCost,
           );
 
-          if (summaries.length >= 5) {
+          if (isOversized(existingSemantic)) {
+            results.semantic = oversizedSkip(KV.semantic, existingSemantic);
+          } else if (summaries.length >= 5) {
             const recentSummaries = summaries
               .sort(
                 (a, b) =>
@@ -524,11 +558,14 @@ export function registerConsolidationPipelineFunction(
               let match;
               let newProcs = 0;
               const now = new Date().toISOString();
-              const existingProcs = await measuredList<ProceduralMemory>(
+              const existingProcs = await boundedMeasuredList<ProceduralMemory>(
                 kv,
                 KV.procedural,
                 proceduralCost,
               );
+              if (isOversized(existingProcs)) {
+                throw new Error(`${KV.procedural} is over the scope-size ceiling`);
+              }
 
               while ((match = procRegex.exec(response)) !== null) {
                 const name = match[1];
@@ -590,36 +627,42 @@ export function registerConsolidationPipelineFunction(
         const decayCost = newTierCost();
 
         if (tier === "all" || tier === "decay") {
-          const semantic = await measuredList<SemanticMemory>(
+          const semantic = await boundedMeasuredList<SemanticMemory>(
             kv,
             KV.semantic,
             decayCost,
           );
-          const semanticResult = await decayAndWriteChanged(
-            kv,
-            KV.semantic,
-            semantic,
-            decayDays,
-          );
-          decayCost.rowsWritten += semanticResult.written;
-
-          const procedural = await measuredList<ProceduralMemory>(
+          const procedural = await boundedMeasuredList<ProceduralMemory>(
             kv,
             KV.procedural,
             decayCost,
           );
-          const proceduralResult = await decayAndWriteChanged(
-            kv,
-            KV.procedural,
-            procedural,
-            decayDays,
-          );
-          decayCost.rowsWritten += proceduralResult.written;
 
-          results.decay = withStatus("ok", {
-            semantic: semanticResult,
-            procedural: proceduralResult,
-          });
+          if (isOversized(semantic)) {
+            results.decay = oversizedSkip(KV.semantic, semantic);
+          } else if (isOversized(procedural)) {
+            results.decay = oversizedSkip(KV.procedural, procedural);
+          } else {
+            const semanticResult = await decayAndWriteChanged(
+              kv,
+              KV.semantic,
+              semantic,
+              decayDays,
+            );
+            const proceduralResult = await decayAndWriteChanged(
+              kv,
+              KV.procedural,
+              procedural,
+              decayDays,
+            );
+            decayCost.rowsWritten +=
+              semanticResult.written + proceduralResult.written;
+
+            results.decay = withStatus("ok", {
+              semantic: semanticResult,
+              procedural: proceduralResult,
+            });
+          }
         }
 
         stampTier(results, "decay", decayStartedMs, decayCost);

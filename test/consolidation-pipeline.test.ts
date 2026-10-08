@@ -314,6 +314,42 @@ describe("Consolidation Pipeline", () => {
     expect(result.results).toBeDefined();
     vi.mocked(isConsolidationEnabled).mockReturnValue(true);
   });
+
+  // Production, 2026-10-07: mem:semantic reached 104.8 MB, past the 100 MiB ws
+  // frame limit, and every run after that dropped the engine socket. A scope
+  // already measured over the ceiling must be skipped before it is read, and
+  // the semantic tier must not fall through to inserting every fact as new.
+  it("skips the semantic and decay tiers without reading a semantic scope measured over the ceiling", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+    await kv.set("mem:semantic", "sem_1", makeSemanticMemory());
+    await kv.set("mem:scope-size", "mem:semantic", {
+      rows: 89_229,
+      bytes: 104_802_587,
+      measuredAt: "2026-10-07T06:02:34.351Z",
+    });
+    const listSpy = vi.spyOn(kv, "list");
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+    })) as { success: boolean; results: Record<string, { status: string; reason?: string }> };
+
+    expect(listSpy).not.toHaveBeenCalledWith("mem:semantic");
+    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(result.results.semantic).toMatchObject({ status: "skipped" });
+    expect(result.results.semantic.reason).toContain("mem:semantic");
+    expect(result.results.decay).toMatchObject({ status: "skipped" });
+    expect(await kv.list("mem:semantic")).toHaveLength(1);
+  });
 });
 
 describe("Consolidation Pipeline decay tier", () => {
