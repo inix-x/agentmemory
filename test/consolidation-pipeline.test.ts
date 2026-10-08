@@ -414,6 +414,28 @@ describe("Consolidation Pipeline", () => {
     expect(first.results.semantic.status).toBe("error");
     expect(second.results.semantic).toMatchObject({ status: "ok", consumedSummaries: 6 });
   });
+
+  it("stores a fact once when one response repeats it", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.8">TypeScript is the primary language</fact>` +
+          `<fact confidence="0.9">typescript is the primary language</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.accessCount).toBe(2);
+    expect(stored[0]!.confidence).toBe(0.9);
+  });
 });
 
 describe("Consolidation Pipeline decay tier", () => {

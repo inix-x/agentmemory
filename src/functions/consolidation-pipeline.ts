@@ -508,6 +508,7 @@ export function registerConsolidationPipelineFunction(
                   await kv.set(KV.semantic, sem.id, sem);
                   semanticCost.rowsWritten++;
                   newFacts++;
+                  existingSemantic.push(sem);
                 }
               }
               await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
