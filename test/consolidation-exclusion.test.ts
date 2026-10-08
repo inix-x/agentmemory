@@ -152,6 +152,12 @@ describe("Consolidation run exclusion", () => {
 
     state.release();
     await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+    // A summary the first run has not consumed, so the second has work to do.
+    await kv.set(KV.summaries, "ses_new", {
+      ...makeSummary(0),
+      sessionId: "ses_new",
+      createdAt: new Date(Date.now() + 60_000).toISOString(),
+    });
     await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
 
     // A guard never released turns the pipeline into a one-shot that runs at

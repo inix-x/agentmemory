@@ -350,6 +350,70 @@ describe("Consolidation Pipeline", () => {
     expect(result.results.decay).toMatchObject({ status: "skipped" });
     expect(await kv.list("mem:semantic")).toHaveLength(1);
   });
+
+  // Production re-sent the same 20 newest summaries on every run, and each
+  // rewording of a fact passed the exact-text dedupe as new.
+  it("does not re-send summaries a successful run already consumed", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi
+        .fn()
+        .mockResolvedValueOnce(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`)
+        .mockResolvedValueOnce(`<facts><fact confidence="0.9">The project is written mainly in TypeScript</fact></facts>`)
+        .mockResolvedValue(`<facts><fact confidence="0.8">Vitest runs the tests</fact></facts>`),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 1; i <= 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+    const second = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { status: string; reason?: string }> };
+
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(second.results.semantic).toMatchObject({ status: "skipped" });
+    expect(second.results.semantic.reason).toContain("no summaries since");
+    expect(await kv.list("mem:semantic")).toHaveLength(1);
+
+    await kv.set("mem:summaries", "ses_0", makeSummary(0));
+    const third = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { consumedSummaries?: number }> };
+
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+    expect(third.results.semantic.consumedSummaries).toBe(1);
+    const prompt = vi.mocked(provider.summarize).mock.calls[1]![1] as string;
+    expect(prompt).toContain("Session 0 summary");
+    expect(prompt).not.toContain("Session 1 summary");
+  });
+
+  it("re-sends the same summaries when the run that read them failed", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("provider down"))
+        .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const first = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { status: string }> };
+    const second = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { status: string; consumedSummaries?: number }> };
+
+    expect(first.results.semantic.status).toBe("error");
+    expect(second.results.semantic).toMatchObject({ status: "ok", consumedSummaries: 6 });
+  });
 });
 
 describe("Consolidation Pipeline decay tier", () => {

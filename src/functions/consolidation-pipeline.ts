@@ -54,6 +54,9 @@ function applyDecay(
   }
 }
 
+/** Key within KV.config: createdAt of the newest summary the semantic tier consumed. */
+const SEMANTIC_WATERMARK_KEY = "consolidation:semanticWatermark";
+
 /** Fixed key holding a pointer to the in-flight run, if there is one. */
 const RUN_POINTER_KEY = "current";
 
@@ -425,17 +428,36 @@ export function registerConsolidationPipelineFunction(
             semanticCost,
           );
 
+          // Only summaries written since the last successful semantic run. Without
+          // this, every run re-sent the same 20 newest summaries: 61% of 2,118
+          // production runs had no new session at all, and the exact-text dedupe
+          // below let each rewording through, which is how mem:semantic reached
+          // 89k rows. A re-summarized session gets a fresh createdAt, so it is
+          // picked up again. Past 20 unconsumed, the oldest are dropped, as the
+          // newest-20 window always did.
+          const watermark = await kv
+            .get<{ at?: string }>(KV.config, SEMANTIC_WATERMARK_KEY)
+            .catch(() => null);
+          const consumedThrough = watermark?.at
+            ? new Date(watermark.at).getTime()
+            : -Infinity;
+          const recentSummaries = summaries
+            .filter((s) => new Date(s.createdAt).getTime() > consumedThrough)
+            .sort(
+              (a, b) =>
+                new Date(b.createdAt).getTime() -
+                new Date(a.createdAt).getTime(),
+            )
+            .slice(0, 20);
+
           if (isOversized(existingSemantic)) {
             results.semantic = oversizedSkip(KV.semantic, existingSemantic);
+          } else if (summaries.length >= 5 && recentSummaries.length === 0) {
+            results.semantic = withStatus("skipped", {
+              skipped: true,
+              reason: "no summaries since the last semantic run",
+            });
           } else if (summaries.length >= 5) {
-            const recentSummaries = summaries
-              .sort(
-                (a, b) =>
-                  new Date(b.createdAt).getTime() -
-                  new Date(a.createdAt).getTime(),
-              )
-              .slice(0, 20);
-
             const prompt = buildSemanticMergePrompt(
               recentSummaries.map((s) => ({
                 title: s.title,
@@ -488,9 +510,13 @@ export function registerConsolidationPipelineFunction(
                   newFacts++;
                 }
               }
+              await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
+                at: recentSummaries[0]!.createdAt,
+              });
               results.semantic = withStatus("ok", {
                 newFacts,
                 totalSummaries: summaries.length,
+                consumedSummaries: recentSummaries.length,
               });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
