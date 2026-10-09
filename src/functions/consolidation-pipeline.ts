@@ -624,67 +624,68 @@ export function registerConsolidationPipelineFunction(
             const prompt = buildProceduralExtractionPrompt(patterns);
 
             try {
-              const response = await provider.summarize(
-                PROCEDURAL_EXTRACTION_SYSTEM,
-                prompt,
-              );
-
-              const procRegex =
-                /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
-              let match;
-              let newProcs = 0;
-              const now = new Date().toISOString();
               const existingProcs = await boundedMeasuredList<ProceduralMemory>(
                 kv,
                 KV.procedural,
                 proceduralCost,
               );
               if (isOversized(existingProcs)) {
-                throw new Error(`${KV.procedural} is over the scope-size ceiling`);
-              }
-
-              while ((match = procRegex.exec(response)) !== null) {
-                const name = match[1];
-                const trigger = match[2];
-                const stepsBlock = match[3];
-                const steps: string[] = [];
-
-                const stepRegex = /<step>([^<]+)<\/step>/g;
-                let stepMatch;
-                while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
-                  steps.push(stepMatch[1].trim());
-                }
-
-                const existing = existingProcs.find(
-                  (p) => p.name.toLowerCase() === name.toLowerCase(),
+                results.procedural = oversizedSkip(KV.procedural, existingProcs);
+              } else {
+                const response = await provider.summarize(
+                  PROCEDURAL_EXTRACTION_SYSTEM,
+                  prompt,
                 );
-                if (existing) {
-                  existing.frequency++;
-                  existing.updatedAt = now;
-                  existing.strength = Math.min(1, existing.strength + 0.1);
-                  await kv.set(KV.procedural, existing.id, existing);
-                  proceduralCost.rowsWritten++;
-                } else {
-                  const proc: ProceduralMemory = {
-                    id: generateId("proc"),
-                    name,
-                    steps,
-                    triggerCondition: trigger,
-                    frequency: 1,
-                    sourceSessionIds: [],
-                    strength: 0.5,
-                    createdAt: now,
-                    updatedAt: now,
-                  };
-                  await kv.set(KV.procedural, proc.id, proc);
-                  proceduralCost.rowsWritten++;
-                  newProcs++;
+
+                const procRegex =
+                  /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
+                let match;
+                let newProcs = 0;
+                const now = new Date().toISOString();
+
+                while ((match = procRegex.exec(response)) !== null) {
+                  const name = match[1];
+                  const trigger = match[2];
+                  const stepsBlock = match[3];
+                  const steps: string[] = [];
+
+                  const stepRegex = /<step>([^<]+)<\/step>/g;
+                  let stepMatch;
+                  while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
+                    steps.push(stepMatch[1].trim());
+                  }
+
+                  const existing = existingProcs.find(
+                    (p) => p.name.toLowerCase() === name.toLowerCase(),
+                  );
+                  if (existing) {
+                    existing.frequency++;
+                    existing.updatedAt = now;
+                    existing.strength = Math.min(1, existing.strength + 0.1);
+                    await kv.set(KV.procedural, existing.id, existing);
+                    proceduralCost.rowsWritten++;
+                  } else {
+                    const proc: ProceduralMemory = {
+                      id: generateId("proc"),
+                      name,
+                      steps,
+                      triggerCondition: trigger,
+                      frequency: 1,
+                      sourceSessionIds: [],
+                      strength: 0.5,
+                      createdAt: now,
+                      updatedAt: now,
+                    };
+                    await kv.set(KV.procedural, proc.id, proc);
+                    proceduralCost.rowsWritten++;
+                    newProcs++;
+                  }
                 }
+                results.procedural = withStatus("ok", {
+                  newProcedures: newProcs,
+                  patternsAnalyzed: patterns.length,
+                });
               }
-              results.procedural = withStatus("ok", {
-                newProcedures: newProcs,
-                patternsAnalyzed: patterns.length,
-              });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               logger.error("Procedural extraction failed", { error: msg });

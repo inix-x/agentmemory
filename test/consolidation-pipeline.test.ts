@@ -381,6 +381,29 @@ describe("Consolidation Pipeline", () => {
     );
   });
 
+  // The procedural tier used to pay for the LLM call before its read guard,
+  // then throw and report an error for the same refusal the other tiers skip.
+  it("skips the procedural tier without an LLM call when mem:procedural is refused", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 3; i++) {
+      await kv.set("mem:memories", `mem_${i}`, makePattern(i));
+    }
+    await kv.set("mem:scope-size", "mem:procedural", {
+      rows: 50_000,
+      bytes: 40_000_000,
+      measuredAt: "2026-10-08T00:00:00.000Z",
+    });
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "procedural",
+    })) as { results: Record<string, { status: string; reason?: string }> };
+
+    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(result.results.procedural).toMatchObject({ status: "skipped" });
+    expect(result.results.procedural.reason).toContain("mem:procedural");
+  });
+
   // Production re-sent the same 20 newest summaries on every run, and each
   // rewording of a fact passed the exact-text dedupe as new.
   it("does not re-send summaries a successful run already consumed", async () => {
