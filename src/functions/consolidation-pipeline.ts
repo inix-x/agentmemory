@@ -515,9 +515,11 @@ export function registerConsolidationPipelineFunction(
               const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
               let match;
               let newFacts = 0;
+              let parsedFacts = 0;
               const now = new Date().toISOString();
 
               while ((match = factRegex.exec(response)) !== null) {
+                parsedFacts++;
                 const parsedConf = parseFloat(match[1]);
                 const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
                 const fact = match[2].trim();
@@ -550,6 +552,14 @@ export function registerConsolidationPipelineFunction(
                   newFacts++;
                   existingSemantic.push(sem);
                 }
+              }
+              // An empty or tag-free reply is a failed merge. A well-formed
+              // <facts></facts> is a merge that found nothing in 2+ episodes,
+              // which the prompt allows. Advancing past a failed merge would
+              // drop these summaries for good; the old newest-20 window re-sent
+              // them on the next run.
+              if (parsedFacts === 0 && !/<facts[\s>]/.test(response)) {
+                throw new Error("no facts parsed from the merge response");
               }
               await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
                 at: recentSummaries[0]!.createdAt,

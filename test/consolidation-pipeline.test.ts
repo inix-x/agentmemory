@@ -443,6 +443,32 @@ describe("Consolidation Pipeline", () => {
     expect(prompt).not.toContain("Session 1 summary");
   });
 
+  it("does not advance the watermark when the merge response yields no facts", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi
+        .fn()
+        .mockResolvedValueOnce("")
+        .mockResolvedValueOnce("I could not find any durable facts in these summaries.")
+        .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    type Run = { results: Record<string, { status: string; error?: string; consumedSummaries?: number }> };
+    const empty = (await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" })) as Run;
+    const tagFree = (await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" })) as Run;
+    const good = (await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" })) as Run;
+
+    expect(empty.results.semantic).toMatchObject({ status: "error" });
+    expect(empty.results.semantic.error).toMatch(/no facts parsed/);
+    expect(tagFree.results.semantic).toMatchObject({ status: "error" });
+    expect(good.results.semantic).toMatchObject({ status: "ok", consumedSummaries: 6 });
+  });
+
   it("re-sends the same summaries when the run that read them failed", async () => {
     const provider = {
       name: "test",
