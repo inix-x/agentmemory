@@ -5,6 +5,7 @@ import {
   isOversized,
   readScopeSize,
   SAFE_ENUMERATION_BYTES,
+  UNFINISHED_ATTEMPT_TTL_MS,
 } from "../src/state/scope-size.js";
 
 function mockKV() {
@@ -157,6 +158,33 @@ describe("scope-size guard (#814 pattern, non-graph scopes)", () => {
     if (isOversized(result)) {
       expect(result.error).toMatch(/never completed/i);
     }
+  });
+
+  it("retries a latched scope once its unfinished-read marker is older than the expiry window", async () => {
+    // Two transient failures used to latch a healthy scope off for good: a
+    // refusal writes nothing, so the marker never aged out.
+    const kv = mockKV();
+    seedRows(kv, KV.semantic, 3);
+    const stale = new Date(Date.now() - UNFINISHED_ATTEMPT_TTL_MS - 60_000).toISOString();
+    await kv.set(KV.scopeSize, `attempt:${KV.semantic}`, { attempts: 2, startedAt: stale });
+
+    const result = await listBounded(kv as never, KV.semantic, HINT);
+
+    expect(isOversized(result)).toBe(false);
+    expect(Array.isArray(result) && result.length).toBe(3);
+    expect(await kv.get(KV.scopeSize, `attempt:${KV.semantic}`)).toBeNull();
+  });
+
+  it("keeps refusing a latched scope inside the expiry window", async () => {
+    const kv = mockKV();
+    seedRows(kv, KV.semantic, 3);
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    await kv.set(KV.scopeSize, `attempt:${KV.semantic}`, { attempts: 2, startedAt: recent });
+
+    const result = await listBounded(kv as never, KV.semantic, HINT);
+
+    expect(isOversized(result)).toBe(true);
+    expect(kv.listCalls).not.toContain(KV.semantic);
   });
 
   it("clears the attempt marker after a read that survives", async () => {

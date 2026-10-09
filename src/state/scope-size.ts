@@ -89,6 +89,13 @@ const attemptKey = (scope: string) => `attempt:${scope}`;
 // land mid-enumeration does not blacklist a healthy scope.
 const MAX_UNFINISHED_ATTEMPTS = 1;
 
+// A refusal writes nothing, so without an expiry two transient failures latch
+// a healthy scope off until someone deletes the marker by hand. Clearing the
+// marker on a rejected read instead would reopen the outage it guards: a read
+// that drops the worker socket surfaces here as a rejection too. Expiring it
+// costs a scope that really does kill the worker one retry per window.
+export const UNFINISHED_ATTEMPT_TTL_MS = 6 * 60 * 60 * 1000;
+
 function unfinishedReadError(
   scope: string,
   attempts: number,
@@ -133,7 +140,12 @@ export async function listBounded<T>(
   // itself is what does not survive.
   const attemptK = attemptKey(scope);
   const prior = await kv.get<ReadAttempt>(KV.scopeSize, attemptK).catch(() => null);
-  const unfinished = typeof prior?.attempts === "number" ? prior.attempts : 0;
+  const lastAttemptMs = Date.parse(prior?.startedAt ?? "");
+  const expired =
+    !Number.isFinite(lastAttemptMs) ||
+    Date.now() - lastAttemptMs > UNFINISHED_ATTEMPT_TTL_MS;
+  const unfinished =
+    typeof prior?.attempts === "number" && !expired ? prior.attempts : 0;
   if (unfinished > MAX_UNFINISHED_ATTEMPTS) {
     return unfinishedReadError(scope, unfinished, hint);
   }
