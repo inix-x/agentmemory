@@ -14,6 +14,7 @@ import {
   SEMANTIC_MAX_ROWS,
 } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
+import { logger } from "../src/logger.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 import { auditQueryScopes } from "../src/functions/audit.js";
 
@@ -352,6 +353,32 @@ describe("Consolidation Pipeline", () => {
     expect(result.results.semantic.reason).toContain("mem:semantic");
     expect(result.results.decay).toMatchObject({ status: "skipped" });
     expect(await kv.list("mem:semantic")).toHaveLength(1);
+  });
+
+  // A refusal from earlier reads that never completed carries bytes 0. Reported
+  // as "over the ceiling", it sends an operator to trim a scope that is small.
+  it("reports why a latched scope was refused, and warns", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+    await kv.set("mem:scope-size", "attempt:mem:semantic", {
+      attempts: 2,
+      startedAt: new Date().toISOString(),
+    });
+    vi.mocked(logger.warn).mockClear();
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: Record<string, { status: string; reason?: string; bytes?: number }> };
+
+    expect(result.results.semantic).toMatchObject({ status: "skipped", bytes: 0 });
+    expect(result.results.semantic.reason).toMatch(/never completed/);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Consolidation scope read refused",
+      expect.objectContaining({ scope: "mem:semantic" }),
+    );
   });
 
   // Production re-sent the same 20 newest summaries on every run, and each

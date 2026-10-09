@@ -231,16 +231,25 @@ async function boundedMeasuredList<T>(
   cost: TierCost,
 ): Promise<T[] | OversizedPayload> {
   const rows = await listBounded<T>(kv, scope, "consolidation skipped this tier");
-  if (!isOversized(rows)) {
+  if (isOversized(rows)) {
+    logger.warn("Consolidation scope read refused", {
+      scope,
+      bytes: rows.bytes,
+      limitBytes: rows.limitBytes,
+      error: rows.error,
+    });
+  } else {
     cost.reads.push({ scope, rows: rows.length, bytes: payloadByteLength(rows) });
   }
   return rows;
 }
 
+// The refusal has two causes: a measured size over the ceiling, or earlier
+// reads that never completed (bytes 0). Only refused.error tells them apart.
 function oversizedSkip(scope: string, refused: OversizedPayload) {
   return withStatus("skipped", {
     skipped: true,
-    reason: `${scope} is over the scope-size ceiling`,
+    reason: `${scope} read refused: ${refused.error}`,
     bytes: refused.bytes,
     limitBytes: refused.limitBytes,
   });
