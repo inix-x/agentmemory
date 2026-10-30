@@ -104,6 +104,7 @@ import { registerSentinelsFunction } from "./functions/sentinels.js";
 import { registerSketchesFunction } from "./functions/sketches.js";
 import { registerCrystallizeFunction } from "./functions/crystallize.js";
 import { registerDiagnosticsFunction } from "./functions/diagnostics.js";
+import { registerDiagnosticsStoreFunction } from "./functions/diagnostics-store.js";
 import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
@@ -396,6 +397,7 @@ async function main() {
   registerSketchesFunction(sdk, kv);
   registerCrystallizeFunction(sdk, kv, provider);
   registerDiagnosticsFunction(sdk, kv);
+  registerDiagnosticsStoreFunction(sdk);
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
@@ -644,7 +646,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 147 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 148 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
