@@ -36,6 +36,7 @@ import { VectorIndex } from "./state/vector-index.js";
 import type { SearchLayer } from "./state/search-layer.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
+import { armEnginePrimitiveBound, boundEnginePrimitives } from "./sdk-timeouts.js";
 import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, runStartupCleanup, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction, withWriteScrubbing } from "./functions/privacy.js";
 import { withRegistrationDefaults } from "./runtime/registration.js";
@@ -239,7 +240,7 @@ async function main() {
     `REST API: http://localhost:${config.restPort}/agentmemory/*`,
   );
 
-  const sdk = withWriteScrubbing(withRegistrationDefaults(registerWorker(config.engineUrl, {
+  const sdk = boundEnginePrimitives(withWriteScrubbing(withRegistrationDefaults(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -259,7 +260,7 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  })));
+  }))));
 
   writeWorkerPidfile();
 
@@ -547,6 +548,8 @@ async function main() {
       );
     }
   }
+
+  armEnginePrimitiveBound();
 
   const auditMigration = startAuditMigration(kv).catch(() => {});
 
