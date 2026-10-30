@@ -480,6 +480,13 @@ export function isGraphExtractionEnabled(): boolean {
   return getMergedEnv()["GRAPH_EXTRACTION_ENABLED"] === "true";
 }
 
+// Fork-only gate on mem::graph-extract (heuristic and LLM passes alike). The
+// iii engine keeps every KV write resident, so graph writes stay off until a
+// fresh generation is measured. Set GRAPH_WRITES_ENABLED=true to re-enable.
+export function isGraphWriteEnabled(): boolean {
+  return getMergedEnv()["GRAPH_WRITES_ENABLED"] === "true";
+}
+
 export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
 }

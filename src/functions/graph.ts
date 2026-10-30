@@ -17,7 +17,7 @@ import {
   GRAPH_EXTRACTION_SYSTEM,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
-import { isGraphExtractionEnabled } from "../config.js";
+import { isGraphExtractionEnabled, isGraphWriteEnabled } from "../config.js";
 import { recordAudit, safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { scrubRecord } from "./privacy.js";
@@ -721,6 +721,9 @@ export function registerGraphFunction(
   const kv = state;
   sdk.registerFunction("mem::graph-extract",
     async (data: { observations: CompressedObservation[] }) => {
+      if (!isGraphWriteEnabled()) {
+        return { success: true, skipped: true, reason: "GRAPH_WRITES_ENABLED is not set" };
+      }
       const kv = await pinGraphState(state);
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };

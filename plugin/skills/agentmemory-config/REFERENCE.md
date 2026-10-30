@@ -89,3 +89,7 @@ Configuration is read from the environment and from `~/.agentmemory/.env` (no `e
 - `AGENTMEMORY_REDIS_URL`: required with `redis`, plain `redis://` only (the pinned state worker has no Redis TLS). The URL never appears in `/agentmemory/status` or the viewer.
 
 Changing backends selects the target backend's existing data; a new target starts empty. It does not move or delete the old data. Pause writes and back up the original store before moving supported collections with `/agentmemory/export` and `/agentmemory/import`. Give each concurrent instance its own Redis database or server so their state cannot mix. Viewer events are broadcast by the running agentmemory process; they do not rely on Redis pub/sub. See the [state storage guide](https://github.com/rohitg00/agentmemory/blob/main/docs/reliability/state-storage.md) for persistence, isolation and migration details.
+
+## Graph writes
+
+- `GRAPH_WRITES_ENABLED`: `true` lets `mem::graph-extract` write the knowledge graph. Unset (default), extraction returns `skipped` and writes nothing, from the session-stop handler, `POST /agentmemory/graph/extract`, and `POST /agentmemory/graph/build` alike. Graph import, mesh sync, snapshot restore, and `mem::temporal-graph-extract` are not gated. `GRAPH_EXTRACTION_ENABLED` still controls the LLM relation pass once writes are on.
