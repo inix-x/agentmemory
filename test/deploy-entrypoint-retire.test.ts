@@ -213,8 +213,8 @@ describe("the last fork boot before the upstream cutover", { timeout: 20000 }, (
   beforeEach(() => {
     mkdirSync(join(dir, "bin"));
     mkdirSync(storeDir(), { recursive: true });
-    stub("chown");
-    stub("gosu", 'touch "$HOME/.gosu-ran"');
+    // Leaves a marker, so a hold placed below the chown of /data shows.
+    stub("chown", 'touch "$HOME/.chown-ran"');
     // Counts calls instead of reading the clock, so a per-scope stamp shows up
     // as eleven directories instead of hiding inside one second.
     stub("date", [
@@ -279,6 +279,20 @@ describe("the last fork boot before the upstream cutover", { timeout: 20000 }, (
     expect(moved.sort()).toEqual(CUTOVER.slice(0, 6).sort());
   });
 
+  it("says so when a cutover file fails to move, and still moves the rest", () => {
+    seedStore();
+    const audit = enc("mem:audit");
+    stub("mv", `case "$1" in */${audit}) exit 1;; esac\nexec /bin/mv "$@"`);
+
+    const out = boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+
+    expect(out).toContain(`cutover FAILED to retire ${audit}, still in `);
+    expect(out).not.toContain(`cutover retired ${audit}`);
+    expect(readdirSync(storeDir()).sort()).toEqual([audit, ...KEEP].sort());
+    // The first ten, 1 + 2 + ... + 10 bytes.
+    expect(out).toContain("cutover retired 10 scope file(s), 55 bytes, to ");
+  });
+
   /** Every path under /data with its size and mtime, so any write shows. */
   function snapshot(root: string): string[] {
     return readdirSync(root, { recursive: true, withFileTypes: true })
@@ -299,6 +313,21 @@ describe("the last fork boot before the upstream cutover", { timeout: 20000 }, (
     });
   }
 
+  /** Boots held and waits for the healthcheck path to answer. */
+  async function holdBoot(port: number, extra: Record<string, string> = {}) {
+    const child = spawn("sh", [ENTRYPOINT], {
+      env: bootEnv({ DATA_HOLD: "true", ...extra }),
+      stdio: "ignore",
+    });
+    const base = `http://127.0.0.1:${port}`;
+    let live: Response | undefined;
+    for (let i = 0; i < 100 && !live; i++) {
+      live = await fetch(`${base}/agentmemory/livez`).catch(() => undefined);
+      if (!live) await new Promise((r) => setTimeout(r, 50));
+    }
+    return { child, base, live };
+  }
+
   it("DATA_HOLD starts no engine, changes nothing under /data, and answers the healthcheck", async () => {
     // Every flag that moves a file is on, and every kind of file is seeded, so a
     // hold placed below any of them fails here.
@@ -308,29 +337,35 @@ describe("the last fork boot before the upstream cutover", { timeout: 20000 }, (
     const before = snapshot(dataDir());
     const port = await freePort();
 
-    const child = spawn("sh", [ENTRYPOINT], {
-      env: bootEnv({
-        DATA_HOLD: "true",
-        CUTOVER_RETIRE_AT_BOOT: "true",
-        INDEX_GENERATIONS_RETIRE_AT_BOOT: "true",
-        GRAPH_ROWS_REWRITE_AT_BOOT: "1",
-        PORT: String(port),
-      }),
-      stdio: "ignore",
+    const { child, base, live } = await holdBoot(port, {
+      CUTOVER_RETIRE_AT_BOOT: "true",
+      INDEX_GENERATIONS_RETIRE_AT_BOOT: "true",
+      GRAPH_ROWS_REWRITE_AT_BOOT: "1",
+      PORT: String(port),
     });
     try {
-      const base = `http://127.0.0.1:${port}`;
-      let live: Response | undefined;
-      for (let i = 0; i < 100 && !live; i++) {
-        live = await fetch(`${base}/agentmemory/livez`).catch(() => undefined);
-        if (!live) await new Promise((r) => setTimeout(r, 50));
-      }
+      // The body is fixed, so the runbook can tell the hold from the engine.
       expect(live?.status).toBe(200);
+      expect(await live?.text()).toBe("held\n");
       const write = await fetch(`${base}/agentmemory/remember`, { method: "POST" });
       expect(write.status).toBe(503);
 
-      expect(existsSync(join(dir, ".gosu-ran"))).toBe(false);
+      // livez answering at all is the no-engine proof: an unheld boot here dies
+      // writing the iii config, before anything listens.
+      expect(existsSync(join(dir, ".chown-ran"))).toBe(false);
       expect(snapshot(dataDir())).toEqual(before);
+    } finally {
+      child.kill("SIGTERM");
+    }
+  });
+
+  it("DATA_HOLD listens on 3111 when PORT is unset", async () => {
+    // fly and coolify inject no PORT. A busy 3111 makes this fail, not pass,
+    // because the body check below is specific to the hold.
+    const { child, live } = await holdBoot(3111);
+    try {
+      expect(live?.status).toBe(200);
+      expect(await live?.text()).toBe("held\n");
     } finally {
       child.kill("SIGTERM");
     }

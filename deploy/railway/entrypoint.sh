@@ -31,7 +31,8 @@ III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-conf
 # it gives no guaranteed window for the backup over `railway ssh`. Hooks get a
 # loud 503 rather than a silent drop.
 #
-# The literal "true", the same shape as the retire flags below.
+# The literal "true", the same shape as CUTOVER_RETIRE_AT_BOOT and
+# INDEX_GENERATIONS_RETIRE_AT_BOOT below.
 if [ "${DATA_HOLD:-}" = "true" ]; then
     echo "agentmemory: DATA_HOLD=true, engine not started, $DATA_DIR left untouched"
     exec node -e '
@@ -197,11 +198,16 @@ if [ "${CUTOVER_RETIRE_AT_BOOT:-}" = "true" ]; then
         mem:graph:obs-index \
         mem:audit
     do
+        _cut_name="$(printf '%s' "$_scope" | sed 's/:/%3A/g').bin"
         _cut_count=$_retire_count
         _cut_bytes=$_retire_bytes
-        retire_scope "$DATA_DIR/state_store.db" "$_scope"
+        retire_matching_file "$DATA_DIR/state_store.db" "$_cut_name"
         if [ "$_retire_count" -gt "$_cut_count" ]; then
-            echo "agentmemory: cutover retired $(printf '%s' "$_scope" | sed 's/:/%3A/g').bin, $((_retire_bytes - _cut_bytes)) bytes, to $_retire_dest"
+            echo "agentmemory: cutover retired $_cut_name, $((_retire_bytes - _cut_bytes)) bytes, to $_retire_dest"
+        elif [ -f "$DATA_DIR/state_store.db/$_cut_name" ]; then
+            # retire_matching_file is silent when mkdir or mv fails, and a file
+            # left here is one the upstream build must not read.
+            echo "agentmemory: cutover FAILED to retire $_cut_name, still in $DATA_DIR/state_store.db"
         fi
     done
     if [ "$_retire_count" -gt 0 ]; then
