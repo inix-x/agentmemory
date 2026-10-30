@@ -20,6 +20,30 @@ HMAC_FILE="${AGENTMEMORY_HMAC_FILE:-/data/.hmac}"
 RUN_AS="node:node"
 III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-config.yaml"
 
+# KTD10 of the fork-sync plan. Both stores are file_based and hold state in
+# memory with periodic saves, so a tar of a live /data is torn and a restore
+# under a live engine is overwritten. DATA_HOLD=true starts no engine and
+# touches nothing under /data, so it sits above the chown and the flagless
+# retires, which would otherwise move files on a held boot.
+#
+# The hold answers the platform healthcheck path with 200 and every other path
+# with 503. A bare sleep never passes the healthcheck, and a deploy that fails
+# it gives no guaranteed window for the backup over `railway ssh`. Hooks get a
+# loud 503 rather than a silent drop.
+#
+# The literal "true", the same shape as the retire flags below.
+if [ "${DATA_HOLD:-}" = "true" ]; then
+    echo "agentmemory: DATA_HOLD=true, engine not started, $DATA_DIR left untouched"
+    exec node -e '
+const http = require("http");
+http.createServer((req, res) => {
+  const live = (req.url || "").split("?")[0] === "/agentmemory/livez";
+  res.writeHead(live ? 200 : 503, { "content-type": "text/plain" });
+  res.end(live ? "held\n" : "DATA_HOLD: engine not started\n");
+}).listen(Number(process.env.PORT) || 3111, "0.0.0.0");
+'
+fi
+
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_AS" "$DATA_DIR"
 
@@ -142,6 +166,48 @@ if [ -n "${GRAPH_ROWS_REWRITE_AT_BOOT:-}" ]; then
     do
         retire_scope "$DATA_DIR/state_store.db" "$_scope"
     done
+fi
+
+# KTD4 and KTD5 of the fork-sync plan. The last fork boot before the upstream
+# cutover moves every scope file upstream must not read: the ten graph scopes,
+# because the cutover keeps graph writes off and starts a fresh generation
+# later, and the legacy mem:audit scope, which upstream would migrate and then
+# list whole. The audit month partitions (mem:audit:<YYYY-MM>, mem:audit:months)
+# are separate files and stay.
+#
+# This is not GRAPH_ROWS_REWRITE_AT_BOOT: that path retires six scopes and arms
+# the rewrite loader, and the cutover wants neither.
+#
+# One stamp for the run, so putting everything back is one mv, and one line per
+# moved file, because the boot log is the record of exactly what moved.
+if [ "${CUTOVER_RETIRE_AT_BOOT:-}" = "true" ]; then
+    _retire_dest="$DATA_DIR/retired/$(date -u +%Y%m%dT%H%M%SZ)"
+    _retire_count=0
+    _retire_bytes=0
+    for _scope in \
+        mem:graph:nodes \
+        mem:graph:edges \
+        mem:graph:snapshot \
+        mem:graph:name-index \
+        mem:graph:edge-key \
+        mem:graph:node-degree \
+        mem:graph:adj \
+        mem:graph:names \
+        mem:graph:batches \
+        mem:graph:obs-index \
+        mem:audit
+    do
+        _cut_count=$_retire_count
+        _cut_bytes=$_retire_bytes
+        retire_scope "$DATA_DIR/state_store.db" "$_scope"
+        if [ "$_retire_count" -gt "$_cut_count" ]; then
+            echo "agentmemory: cutover retired $(printf '%s' "$_scope" | sed 's/:/%3A/g').bin, $((_retire_bytes - _cut_bytes)) bytes, to $_retire_dest"
+        fi
+    done
+    if [ "$_retire_count" -gt 0 ]; then
+        echo "agentmemory: cutover retired $_retire_count scope file(s), $_retire_bytes bytes, to $_retire_dest"
+    fi
+    unset _retire_dest
 fi
 
 # Lever b' of the memory-reduction loop, generalised. Index persistence mints a

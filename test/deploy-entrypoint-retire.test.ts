@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -7,7 +7,9 @@ import {
   readdirSync,
   existsSync,
   rmSync,
+  statSync,
 } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -132,6 +134,198 @@ describe("entrypoint retires the stream store", () => {
     // silently miss the change.
     for (const target of ["railway", "render", "coolify", "fly"]) {
       expect(extractFn(target), target).toBe(extractFn("railway"));
+    }
+  });
+});
+
+// KTD4, KTD5, and KTD10 of the 2026-10-30 fork-sync plan. These boot the real
+// Railway entrypoint, like deploy-entrypoint-index-retire, so the flag gates and
+// their order against the chown, the flagless retires, and the engine start are
+// the ones that ship. Past the retire steps the script writes the iii config
+// under /opt/agentmemory, which does not exist here, so a non-held boot exits
+// non-zero; its effects are read off the filesystem and stdout either way.
+// deploy-entrypoint-drift holds the other three targets to the same body.
+describe("the last fork boot before the upstream cutover", { timeout: 20000 }, () => {
+  const ENTRYPOINT = fileURLToPath(
+    new URL("../deploy/railway/entrypoint.sh", import.meta.url),
+  );
+  const dataDir = () => join(dir, "data");
+  const storeDir = () => join(dataDir(), "state_store.db");
+  const enc = (scope: string) => `${scope.replace(/:/g, "%3A")}.bin`;
+
+  const CUTOVER = [
+    "mem:graph:nodes",
+    "mem:graph:edges",
+    "mem:graph:snapshot",
+    "mem:graph:name-index",
+    "mem:graph:edge-key",
+    "mem:graph:node-degree",
+    "mem:graph:adj",
+    "mem:graph:names",
+    "mem:graph:batches",
+    "mem:graph:obs-index",
+    "mem:audit",
+  ].map(enc);
+  // Near-misses a loose match would take: the audit month partitions KTD5
+  // keeps, a graph-prefixed scope outside the ten, and unrelated live scopes.
+  const KEEP = [
+    "mem:audit:2026-09",
+    "mem:audit:months",
+    "mem:graph:nodes-extra",
+    "mem:obs:ses_abc",
+    "mem:memories",
+  ].map(enc);
+
+  function stub(name: string, body = "exit 0") {
+    writeFileSync(join(dir, "bin", name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  }
+
+  function bootEnv(extra: Record<string, string> = {}) {
+    return {
+      PATH: `${join(dir, "bin")}:${process.env["PATH"] ?? "/usr/bin:/bin"}`,
+      HOME: dir,
+      AGENTMEMORY_DATA_DIR: dataDir(),
+      AGENTMEMORY_HMAC_FILE: join(dataDir(), ".hmac"),
+      ...extra,
+    };
+  }
+
+  function boot(extra: Record<string, string> = {}): string {
+    try {
+      return execFileSync("sh", [ENTRYPOINT], {
+        encoding: "utf8",
+        env: bootEnv(extra),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      return (err as { stdout?: string }).stdout ?? "";
+    }
+  }
+
+  const retiredRoot = () => join(dataDir(), "retired");
+  const stamps = () => (existsSync(retiredRoot()) ? readdirSync(retiredRoot()) : []);
+
+  function seedStore() {
+    CUTOVER.forEach((f, i) => writeFileSync(join(storeDir(), f), Buffer.alloc(i + 1)));
+    KEEP.forEach((f) => writeFileSync(join(storeDir(), f), Buffer.alloc(3)));
+  }
+
+  beforeEach(() => {
+    mkdirSync(join(dir, "bin"));
+    mkdirSync(storeDir(), { recursive: true });
+    stub("chown");
+    stub("gosu", 'touch "$HOME/.gosu-ran"');
+    // Counts calls instead of reading the clock, so a per-scope stamp shows up
+    // as eleven directories instead of hiding inside one second.
+    stub("date", [
+      'n=$(($(cat "$HOME/.date-calls" 2>/dev/null || echo 0) + 1))',
+      'echo "$n" > "$HOME/.date-calls"',
+      'printf "20261030T%06dZ\\n" "$n"',
+    ].join("\n"));
+  });
+
+  it("moves the 11 cutover files into one stamp and keeps the rest", () => {
+    seedStore();
+
+    const out = boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+
+    expect(readdirSync(storeDir()).sort()).toEqual([...KEEP].sort());
+    expect(stamps()).toHaveLength(1);
+    expect(readdirSync(join(retiredRoot(), stamps()[0]!)).sort()).toEqual(
+      [...CUTOVER].sort(),
+    );
+    // One line per moved file, with its name and byte count, then a total.
+    CUTOVER.forEach((f, i) =>
+      expect(out).toContain(`cutover retired ${f}, ${i + 1} bytes, to `),
+    );
+    expect(out).toContain("cutover retired 11 scope file(s), 66 bytes, to ");
+  });
+
+  it("moves nothing with the flag unset or not the literal true", () => {
+    seedStore();
+
+    boot();
+    boot({ CUTOVER_RETIRE_AT_BOOT: "1" });
+
+    expect(readdirSync(storeDir()).sort()).toEqual([...CUTOVER, ...KEEP].sort());
+    expect(stamps()).toEqual([]);
+  });
+
+  it("is clean on a second boot after the files are gone", () => {
+    seedStore();
+    boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+    const afterFirst = stamps();
+
+    const out = boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+
+    expect(out).not.toContain("cutover retired");
+    expect(stamps()).toEqual(afterFirst);
+    expect(readdirSync(storeDir()).sort()).toEqual([...KEEP].sort());
+  });
+
+  it("leaves GRAPH_ROWS_REWRITE_AT_BOOT's six-scope retire as it was", () => {
+    seedStore();
+
+    boot({ GRAPH_ROWS_REWRITE_AT_BOOT: "1" });
+
+    const moved = stamps().flatMap((s) => readdirSync(join(retiredRoot(), s)));
+    expect(moved.sort()).toEqual(CUTOVER.slice(0, 6).sort());
+  });
+
+  /** Every path under /data with its size and mtime, so any write shows. */
+  function snapshot(root: string): string[] {
+    return readdirSync(root, { recursive: true, withFileTypes: true })
+      .map((e) => {
+        const p = join(e.parentPath, e.name);
+        const s = statSync(p);
+        return `${p.slice(root.length)} ${e.isDirectory() ? "d" : s.size} ${s.mtimeMs}`;
+      })
+      .sort();
+  }
+
+  function freePort(): Promise<number> {
+    return new Promise((resolve) => {
+      const srv = createServer().listen(0, "127.0.0.1", () => {
+        const port = (srv.address() as AddressInfo).port;
+        srv.close(() => resolve(port));
+      });
+    });
+  }
+
+  it("DATA_HOLD starts no engine, changes nothing under /data, and answers the healthcheck", async () => {
+    // Every flag that moves a file is on, and every kind of file is seeded, so a
+    // hold placed below any of them fails here.
+    seedStore();
+    writeFileSync(join(dataDir(), "stream_store", "ses_abc.bin"), Buffer.alloc(4));
+    writeFileSync(join(storeDir(), "mem%3Aindex%3Abm25.bin"), Buffer.alloc(5));
+    const before = snapshot(dataDir());
+    const port = await freePort();
+
+    const child = spawn("sh", [ENTRYPOINT], {
+      env: bootEnv({
+        DATA_HOLD: "true",
+        CUTOVER_RETIRE_AT_BOOT: "true",
+        INDEX_GENERATIONS_RETIRE_AT_BOOT: "true",
+        GRAPH_ROWS_REWRITE_AT_BOOT: "1",
+        PORT: String(port),
+      }),
+      stdio: "ignore",
+    });
+    try {
+      const base = `http://127.0.0.1:${port}`;
+      let live: Response | undefined;
+      for (let i = 0; i < 100 && !live; i++) {
+        live = await fetch(`${base}/agentmemory/livez`).catch(() => undefined);
+        if (!live) await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(live?.status).toBe(200);
+      const write = await fetch(`${base}/agentmemory/remember`, { method: "POST" });
+      expect(write.status).toBe(503);
+
+      expect(existsSync(join(dir, ".gosu-ran"))).toBe(false);
+      expect(snapshot(dataDir())).toEqual(before);
+    } finally {
+      child.kill("SIGTERM");
     }
   });
 });
