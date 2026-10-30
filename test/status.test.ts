@@ -419,6 +419,13 @@ describe("status for beginners", () => {
     expect(describeHealthAlert("connection_disconnected").message).toMatch(/iii engine is disconnected/);
   });
 
+  it("describes a failed KV probe as an error instead of echoing the slug", () => {
+    const alert = describeHealthAlert("kv_probe_failed");
+    expect(alert.level).toBe("error");
+    expect(alert.message).toMatch(/state store did not answer/);
+    expect(alert.fix).not.toMatch(/server log/);
+  });
+
   it("gives every problem a fix", () => {
     const report = evaluateStatus(
       inputs({
@@ -498,6 +505,12 @@ describe("status wiring", () => {
     const report = evaluateStatus(inputs({ enginePinnedVersion: "0.24.6" }));
     expect(report.service.enginePinnedVersion).toBe("0.24.6");
     expect(report.service).not.toHaveProperty("engineVersion");
+  });
+
+  it("gives the viewer a sentence for a failed KV probe", () => {
+    const source = viewer.slice(viewer.indexOf("function humanizeHealthFlag("), viewer.indexOf("function humanizeSubtitle("));
+    const humanizeHealthFlag = new Function(`${source}; return humanizeHealthFlag;`)() as (f: string) => string;
+    expect(humanizeHealthFlag("kv_probe_failed")).toMatch(/^State store slow or unreachable/);
   });
 
   it("registers GET /agentmemory/status behind the same auth check as the other endpoints", () => {
