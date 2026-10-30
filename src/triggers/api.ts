@@ -3922,6 +3922,24 @@ export function registerApiTriggers(
   });
   sdk.registerTrigger({ type: "http", function_id: "api::diagnose", config: { api_path: "/agentmemory/diagnostics", http_method: "POST" } });
 
+  // Fork-only: on-disk store bytes and per-process compose RSS, so memory gates
+  // are judgeable without shell access on the container.
+  sdk.registerFunction("api::diagnostics-store", async (req: HttpRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const result = await sdk.trigger({ function_id: "mem::diagnostics-store", payload: {} });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::diagnostics-store",
+    config: {
+      api_path: "/agentmemory/diagnostics/store",
+      http_method: "GET",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::heal",  async (req: HttpRequest) => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;

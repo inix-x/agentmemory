@@ -34,6 +34,7 @@ import { VectorIndex } from "./state/vector-index.js";
 import type { SearchLayer } from "./state/search-layer.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
+import { armEnginePrimitiveBound, boundEnginePrimitives } from "./sdk-timeouts.js";
 import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, runStartupCleanup, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction, withWriteScrubbing } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
@@ -100,6 +101,7 @@ import { registerSentinelsFunction } from "./functions/sentinels.js";
 import { registerSketchesFunction } from "./functions/sketches.js";
 import { registerCrystallizeFunction } from "./functions/crystallize.js";
 import { registerDiagnosticsFunction } from "./functions/diagnostics.js";
+import { registerDiagnosticsStoreFunction } from "./functions/diagnostics-store.js";
 import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
@@ -230,7 +232,7 @@ async function main() {
     `REST API: http://localhost:${config.restPort}/agentmemory/*`,
   );
 
-  const sdk = withWriteScrubbing(registerWorker(config.engineUrl, {
+  const sdk = boundEnginePrimitives(withWriteScrubbing(registerWorker(config.engineUrl, {
     workerName: "agentmemory",
     invocationTimeoutMs: 180000,
     otel: {
@@ -250,7 +252,7 @@ async function main() {
       language: "node",
       framework: "iii-sdk",
     },
-  }));
+  })));
 
   writeWorkerPidfile();
 
@@ -376,6 +378,7 @@ async function main() {
   registerSketchesFunction(sdk, kv);
   registerCrystallizeFunction(sdk, kv, provider);
   registerDiagnosticsFunction(sdk, kv);
+  registerDiagnosticsStoreFunction(sdk);
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
@@ -529,6 +532,8 @@ async function main() {
     }
   }
 
+  armEnginePrimitiveBound();
+
   const auditMigration = startAuditMigration(kv).catch(() => {});
 
   const keywordStart = Date.now();
@@ -601,7 +606,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 146 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 147 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
