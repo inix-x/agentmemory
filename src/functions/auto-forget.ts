@@ -10,9 +10,25 @@ import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
+import {
+  getObsRetentionDays,
+  getObsRetentionMaxImportance,
+  getObsRetentionMaxPerRun,
+} from "../config.js";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const CONTRADICTION_THRESHOLD = 0.9;
+
+// A session is idle by when it was last touched, never by status: `completed`
+// flips on every turn and observations keep appending after it. A session with
+// neither updatedAt nor endedAt falls back to startedAt.
+function lastTouched(session: Session): number {
+  const stamps = [session.updatedAt, session.endedAt, session.startedAt]
+    .filter((s): s is string => typeof s === "string")
+    .map((s) => new Date(s).getTime())
+    .filter((t) => Number.isFinite(t));
+  return stamps.length > 0 ? Math.max(...stamps) : 0;
+}
 
 interface AutoForgetResult {
   ttlExpired: string[];
@@ -22,6 +38,8 @@ interface AutoForgetResult {
     similarity: number;
   }>;
   lowValueObs: string[];
+  // Eligible observations the per-run cap did not reach. The next run takes them.
+  lowValueRemaining: number;
   dryRun: boolean;
 }
 
@@ -36,6 +54,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         ttlExpired: [],
         contradictions: [],
         lowValueObs: [],
+        lowValueRemaining: 0,
         dryRun,
       };
 
@@ -55,11 +74,6 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
                 }
                 await kv.delete(KV.memories, mem.id);
                 facetIds.add(mem.id);
-                await recordAudit(kv, "delete", "mem::auto-forget", [mem.id], {
-                  resource: "memory",
-                  reason: "auto-forget TTL",
-                  timestamp: mem.forgetAfter,
-                });
                 await deleteAccessLog(kv, mem.id);
                 getSearchIndex().remove(mem.id);
                 vectorIndexRemove(mem.id);
@@ -69,6 +83,16 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         }
       } finally {
         await deleteFacetsForTargets(kv, facetIds);
+        // One row per run for every memory actually deleted, written here so a
+        // delete that throws partway still records the ones before it.
+        if (facetIds.size > 0) {
+          await recordAudit(kv, "delete", "mem::auto-forget", [...facetIds], {
+            resource: "memory",
+            reason: "auto-forget TTL",
+            evicted: facetIds.size,
+            byReason: { "auto-forget TTL": facetIds.size },
+          });
+        }
       }
 
       const latestMemories = memories
@@ -103,6 +127,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         }
       }
 
+      const demotedIds = new Set<string>();
       const compared = new Set<string>();
       for (const [, memIds] of conceptIndex) {
         for (let i = 0; i < memIds.length; i++) {
@@ -142,16 +167,20 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
                     : memB;
                 older.isLatest = false;
                 await kv.set(KV.memories, older.id, older);
-                await recordAudit(kv, "forget", "mem::auto-forget", [older.id], {
-                  resource: "memory",
-                  reason: "auto-forget contradiction",
-                  olderId: older.id,
-                  similarity: sim,
-                });
+                demotedIds.add(older.id);
               }
             }
           }
         }
+      }
+
+      if (demotedIds.size > 0) {
+        await recordAudit(kv, "forget", "mem::auto-forget", [...demotedIds], {
+          resource: "memory",
+          reason: "auto-forget contradiction",
+          demoted: demotedIds.size,
+          byReason: { "auto-forget contradiction": demotedIds.size },
+        });
       }
 
       const sessions = await kv.list<Session>(KV.sessions);
@@ -167,20 +196,34 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         );
         obsPerSession.push(...results);
       }
+      const retentionDays = getObsRetentionDays();
+      const maxImportance = getObsRetentionMaxImportance();
+      const maxPerRun = getObsRetentionMaxPerRun();
+      const cutoff = now - retentionDays * MS_PER_DAY;
+      // A row with no importance was never scored, so it is kept.
+      const isLowValue = (o: CompressedObservation | null): o is CompressedObservation =>
+        !!o?.timestamp &&
+        new Date(o.timestamp).getTime() < cutoff &&
+        typeof o.importance === "number" &&
+        o.importance <= maxImportance;
+      const deletedObs: string[] = [];
       for (let i = 0; i < sessions.length; i++) {
+        // The whole session has to be idle, not just the row, so a live
+        // session does not lose rows its next turn would re-extract.
+        if (lastTouched(sessions[i]) > cutoff) continue;
         for (const obs of obsPerSession[i]) {
-          if (!obs.timestamp) continue;
-          const age = now - new Date(obs.timestamp).getTime();
-          if (age > 180 * MS_PER_DAY && (obs.importance ?? 5) <= 2) {
+          if (isLowValue(obs)) {
+            if (result.lowValueObs.length >= maxPerRun) {
+              result.lowValueRemaining++;
+              continue;
+            }
             result.lowValueObs.push(obs.id);
             if (!dryRun) {
               let removed: CompressedObservation | null = null;
               try {
                 removed = await withKeyedLock(`obs:${sessions[i].id}`, async () => {
                   const current = await kv.get<CompressedObservation>(KV.observations(sessions[i].id), obs.id);
-                  if (!current?.timestamp) return null;
-                  const currentAge = now - new Date(current.timestamp).getTime();
-                  if (!(currentAge > 180 * MS_PER_DAY && (current.importance ?? 5) <= 2)) return null;
+                  if (!isLowValue(current)) return null;
                   await markCaptureEventDeleted(kv, current);
                   await kv.delete(KV.observations(sessions[i].id), obs.id);
                   getSearchIndex().remove(obs.id);
@@ -192,20 +235,31 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
               }
               if (removed) {
                 await unindexObservationSession(kv, obs.id).catch(() => {});
-                if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData);
+                // The row is already deleted, so a failed release must not drop its audit entry.
+                const releaseFailed = (err: unknown) =>
+                  logger.warn("Auto-forget image ref release failed", {
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData).catch(releaseFailed);
                 if (removed.imageRef && removed.imageRef !== removed.imageData) {
-                  await decrementImageRef(kv, sdk, removed.imageRef);
+                  await decrementImageRef(kv, sdk, removed.imageRef).catch(releaseFailed);
                 }
-                await recordAudit(kv, "delete", "mem::auto-forget", [obs.id], {
-                  resource: "observation",
-                  reason: "auto-forget low-value observation",
-                  sessionId: sessions[i].id,
-                  timestamp: obs.timestamp,
-                });
+                deletedObs.push(obs.id);
               }
             }
           }
         }
+      }
+      if (deletedObs.length > 0) {
+        await recordAudit(kv, "delete", "mem::auto-forget", deletedObs, {
+          resource: "observation",
+          reason: "auto-forget low-value observation",
+          evicted: deletedObs.length,
+          byReason: { "auto-forget low-value observation": deletedObs.length },
+          remaining: result.lowValueRemaining,
+          retentionDays,
+          maxImportance,
+        });
       }
 
       if (!dryRun && (result.ttlExpired.length > 0 || result.lowValueObs.length > 0)) {
@@ -216,6 +270,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         ttlExpired: result.ttlExpired.length,
         contradictions: result.contradictions.length,
         lowValueObs: result.lowValueObs.length,
+        lowValueRemaining: result.lowValueRemaining,
         dryRun,
       });
       return result;
