@@ -847,7 +847,12 @@ export function registerGraphFunction(
       const started = Date.now();
       const forceRebuild = data?.force === true;
       try {
-        const existing = await readSnapshot(kv);
+        // Read directly: readSnapshot swallows a failed read as "no
+        // snapshot", which would let `force` reach the unsized kv.list below.
+        // An unknown schema version still reads as no snapshot, so `force`
+        // stays the recovery path for it.
+        const raw = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
+        const existing = raw && typeof raw === "object" && raw.version === 1 ? raw : null;
         if (!existing && !forceRebuild) {
           logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
             hint: "legacy corpus or empty store",
@@ -868,8 +873,18 @@ export function registerGraphFunction(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn("Graph snapshot pre-flight read failed", { error: msg });
-        // Fall through; the user passed force=true or the snapshot
-        // read itself failed (separate problem).
+        // Fail closed, even with force. Falling through reaches the raw
+        // kv.list below, and a failed pre-flight means the graph size is
+        // unknown, which is not permission to attempt an unbounded read.
+        return {
+          success: false,
+          preflightFailed: true,
+          error:
+            `Rebuild refused: graph snapshot pre-flight read failed (${msg}). ` +
+            "Rebuild would call kv.list on KV.graphNodes/Edges with no size " +
+            "check. Retry once the snapshot is readable, or call POST " +
+            "/agentmemory/graph/reset to drop into incremental-only mode.",
+        };
       }
 
       try {
