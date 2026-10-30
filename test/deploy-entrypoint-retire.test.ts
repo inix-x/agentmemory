@@ -252,12 +252,19 @@ describe("the last fork boot before the upstream cutover", { timeout: 20000 }, (
   });
 
   it("is clean on a second boot after the files are gone", () => {
+    // boot() swallows the exit code, so "nothing logged" alone cannot tell a
+    // clean pass from a block that died under set -eu. The index retire runs
+    // after the cutover block and, with no manifest seeded, prints its skip
+    // line: seeing it proves the script got through.
+    const flags = { CUTOVER_RETIRE_AT_BOOT: "true", INDEX_GENERATIONS_RETIRE_AT_BOOT: "true" };
+    const reached = "index generation retire skipped, no mem%3Aindex%3Abm25.bin on disk";
     seedStore();
-    boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+    expect(boot(flags)).toContain(reached);
     const afterFirst = stamps();
 
-    const out = boot({ CUTOVER_RETIRE_AT_BOOT: "true" });
+    const out = boot(flags);
 
+    expect(out).toContain(reached);
     expect(out).not.toContain("cutover retired");
     expect(stamps()).toEqual(afterFirst);
     expect(readdirSync(storeDir()).sort()).toEqual([...KEEP].sort());
