@@ -405,6 +405,23 @@ export function getAuditRetentionMonths(): number {
   return safeParseInt(getMergedEnv()["AGENTMEMORY_AUDIT_RETENTION_MONTHS"], 0);
 }
 
+// Low-value observation retention in mem::auto-forget. The defaults are the
+// values that pass used before they moved to env. A cap of 0 stops deletion.
+export function getObsRetentionDays(): number {
+  const n = safeParseInt(getMergedEnv()["AGENTMEMORY_OBS_RETENTION_DAYS"], 180);
+  return n >= 1 ? n : 180;
+}
+
+export function getObsRetentionMaxImportance(): number {
+  const n = safeParseInt(getMergedEnv()["AGENTMEMORY_OBS_RETENTION_MAX_IMPORTANCE"], 2);
+  return n >= 0 ? n : 2;
+}
+
+export function getObsRetentionMaxPerRun(): number {
+  const n = safeParseInt(getMergedEnv()["AGENTMEMORY_OBS_RETENTION_MAX_PER_RUN"], 500);
+  return n >= 0 ? n : 500;
+}
+
 export function getAuditMigrateMaxBytes(): number {
   return safeParseInt(
     getMergedEnv()["AGENTMEMORY_AUDIT_MIGRATE_MAX_BYTES"],

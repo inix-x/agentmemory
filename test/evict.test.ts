@@ -169,12 +169,16 @@ describe("mem::evict stale sessions", () => {
     expect(result.staleSessions).toBe(1);
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
     expect(await kv.get(KV.summaryRepairs, sessionId)).toBeNull();
+    // One row per resource per run, with per-item reasons as a count map.
     const audits = await kv.list<{
-      details: { reason: string };
+      targetIds: string[];
+      details: { resource: string; byReason: Record<string, number> };
     }>(currentAuditScope());
-    expect(audits[0].details.reason).toBe(
-      "stale_session_recovered_then_evicted",
-    );
+    const sessionRow = audits.find((a) => a.details.resource === "session");
+    expect(sessionRow?.targetIds).toEqual([sessionId]);
+    expect(sessionRow?.details.byReason).toEqual({
+      stale_session_recovered_then_evicted: 1,
+    });
     expect(calls.map((call) => call.function_id)).toContain(
       "event::session::stopped",
     );
@@ -466,6 +470,86 @@ describe("mem::evict memory cleanup", () => {
     expect(result.nonLatestMemories).toBe(1);
     const remaining = await kv.list<{ id: string }>(KV.facets);
     expect(remaining.map((f) => f.id)).toEqual(["fct_2"]);
+  });
+
+  it("writes one audit row per resource for a run that hits all five delete sites", async () => {
+    const kv = mockKV(new Map());
+    const { sdk } = mockSdk();
+    // Stale session with no summary and no observations.
+    await kv.set(KV.sessions, "ses_stale", { ...makeSession("ses_stale"), project: "p1" });
+    // Live session with a summary, holding one old low-importance row and a
+    // cap of 1 per project, so the cap pass evicts the next-lowest row.
+    const live = { ...makeSession("ses_live"), project: "p2" };
+    await kv.set(KV.sessions, live.id, live);
+    await kv.set(KV.summaries, live.id, { sessionId: live.id });
+    await kv.set(KV.config, "eviction", { maxObservationsPerProject: 1 });
+    const row = (id: string, ageDays: number, importance: number) => ({
+      ...makeObservation(live.id),
+      id,
+      timestamp: daysAgo(ageDays),
+      importance,
+    });
+    await kv.set(KV.observations(live.id), "obs_low", row("obs_low", 100, 1));
+    await kv.set(KV.observations(live.id), "obs_cap", row("obs_cap", 1, 5));
+    await kv.set(KV.observations(live.id), "obs_keep", row("obs_keep", 1, 9));
+    await kv.set(KV.memories, "mem_expired", makeEvictMemory({ id: "mem_expired", forgetAfter: daysAgo(1) }));
+    await kv.set(
+      KV.memories,
+      "mem_old",
+      makeEvictMemory({ id: "mem_old", createdAt: daysAgo(120), isLatest: false }),
+    );
+
+    registerEvictStubs(sdk, kv);
+    const result = (await sdk.trigger({ function_id: "mem::evict", payload: {} })) as Record<string, number>;
+
+    expect(result).toMatchObject({
+      staleSessions: 1,
+      lowImportanceObs: 1,
+      capEvictions: 1,
+      expiredMemories: 1,
+      nonLatestMemories: 1,
+    });
+    const audits = await kv.list<{
+      targetIds: string[];
+      details: { resource: string; evicted: number; byReason: Record<string, number> };
+    }>(currentAuditScope());
+    expect(audits).toHaveLength(3);
+    const byResource = Object.fromEntries(audits.map((a) => [a.details.resource, a]));
+    expect(byResource.session.targetIds).toEqual(["ses_stale"]);
+    expect(byResource.session.details.byReason).toEqual({ stale_session_without_summary: 1 });
+    expect(byResource.observation.targetIds).toEqual(["obs_low", "obs_cap"]);
+    expect(byResource.observation.details.byReason).toEqual({
+      low_importance_old_observation: 1,
+      project_observation_cap: 1,
+    });
+    expect(byResource.memory.targetIds).toEqual(["mem_expired", "mem_old"]);
+    expect(byResource.memory.details).toMatchObject({
+      evicted: 2,
+      byReason: { expired_memory: 1, old_non_latest_memory: 1 },
+    });
+  });
+
+  it("still writes the session row when the memory pass throws", async () => {
+    const kv = mockKV(new Map());
+    const { sdk } = mockSdk();
+    await kv.set(KV.sessions, "ses_stale", makeSession("ses_stale"));
+    await kv.set(
+      KV.memories,
+      "mem_expired",
+      makeEvictMemory({ id: "mem_expired", forgetAfter: daysAgo(1), imageRef: "img.png" }),
+    );
+    const realDelete = kv.delete;
+    kv.delete = async (scope, key) => {
+      if (scope === KV.imageEmbeddings) throw new Error("engine timeout");
+      return realDelete(scope, key);
+    };
+
+    registerEvictStubs(sdk, kv);
+    await expect(sdk.trigger({ function_id: "mem::evict", payload: {} })).rejects.toThrow("engine timeout");
+
+    const audits = await kv.list<{ targetIds: string[]; details: { resource: string } }>(currentAuditScope());
+    expect(audits.map((a) => a.details.resource)).toEqual(["session"]);
+    expect(audits[0].targetIds).toEqual(["ses_stale"]);
   });
 
   it("keeps facets in dryRun", async () => {

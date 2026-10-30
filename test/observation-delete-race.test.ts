@@ -21,7 +21,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function fixture() {
+async function fixture(sessionStartedAt = new Date().toISOString()) {
   const store = new Map<string, Map<string, unknown>>();
   const handlers = new Map<string, (data: any) => Promise<any>>();
   const kv = {
@@ -42,7 +42,7 @@ async function fixture() {
     ...buildSyntheticCompression({ id: "obs_race", sessionId, timestamp: "2020-01-01T00:00:00Z", hookType: "post_tool_use", toolName: "Edit", toolOutput: "Original durable evidence", raw: {} }),
     importance: 1, compression: pendingCompression(),
   };
-  await kv.set(KV.sessions, sessionId, { id: sessionId, project: "race", cwd: "/race", startedAt: new Date().toISOString() });
+  await kv.set(KV.sessions, sessionId, { id: sessionId, project: "race", cwd: "/race", startedAt: sessionStartedAt });
   await kv.set(KV.observations(sessionId), obs.id, obs);
   getSearchIndex().add(obs);
   const vectors = new VectorIndex(); vectors.add(obs.id, sessionId, new Float32Array([1, 0])); setVectorIndex(vectors);
@@ -63,7 +63,8 @@ afterEach(() => {
 
 describe("observation deletion and compression commits", () => {
   it.each(["selected", "session", "auto-forget", "evict"])("serializes %s deletion with a compression commit and removes both indexes", async (mode) => {
-    const f = await fixture(); const entered = deferred(); const release = deferred();
+    // Auto-forget only deletes from sessions idle past the retention window.
+    const f = await fixture(mode === "auto-forget" ? "2020-01-01T00:00:00Z" : undefined); const entered = deferred(); const release = deferred();
     const write = f.kv.set;
     vi.spyOn(f.kv, "set").mockImplementation(async (scope, key, value) => {
       if (scope === KV.observations(sessionId) && (value as CompressedObservation).compression?.status === "complete") {
@@ -104,7 +105,7 @@ describe("observation deletion and compression commits", () => {
   });
 
   it.each(["auto-forget", "low-importance", "cap"])("rechecks a %s candidate changed after the sweep's scan", async (mode) => {
-    const f = await fixture(); const scanned = deferred(); const release = deferred();
+    const f = await fixture(mode === "auto-forget" ? "2020-01-01T00:00:00Z" : undefined); const scanned = deferred(); const release = deferred();
     if (mode === "cap") await f.kv.set(KV.config, "eviction", { lowImportanceMaxDays: 10000, maxObservationsPerProject: 0 });
     const list = f.kv.list; let paused = false;
     vi.spyOn(f.kv, "list").mockImplementation(async (scope) => {
