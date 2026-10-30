@@ -759,3 +759,84 @@ describe("IndexPersistence orphaned legacy generation sweep", () => {
     }
   });
 });
+
+// The fork (inix-x/agentmemory production) writes legacy shards through generateId("idx") and
+// keeps a reclaim ledger beside each manifest at `<manifest>:gc`. Upstream's sweep must treat that
+// store the way it treats its own: keep the live generations, delete the stranded ones.
+describe("IndexPersistence orphan sweep on a fork-written store", () => {
+  const SWEEP_KEY = "legacy:sweep";
+  const LIVE_BM25 = "idx_mh0w3k2p_4be1c09d7a32";
+  const LIVE_VECTORS = "idx_mh0w3k2q_9f03e5aa1c7d";
+  const STRANDED_TRACKED = "idx_mgzt81c4_0d6b2f9e4a15";
+  const STRANDED_UNTRACKED = "idx_mgq5xw0n_7c2a1e8f3b90";
+  let kv: MockKV;
+
+  beforeEach(() => {
+    kv = mockKV();
+  });
+
+  // Mirrors the fork's saveShardedIndex: shards first, then the manifest, ledger beside it.
+  async function writeForkGeneration(leg: "bm25" | "vectors", generation: string, serialized: string) {
+    const shards: Array<{ scope: string; key: string; chars: number }> = [];
+    for (let offset = 0, i = 0; offset < serialized.length; offset += 40, i++) {
+      const scope = `${INDEX_SCOPE}:${leg}:${generation}:${String(i).padStart(5, "0")}`;
+      const chunk = serialized.slice(offset, offset + 40);
+      await kv.set(scope, "data", chunk);
+      shards.push({ scope, key: "data", chars: chunk.length });
+    }
+    return { v: 1 as const, generation, shards, chars: serialized.length };
+  }
+
+  async function writeForkStore(vector: VectorIndex) {
+    const bm25 = new SearchIndex();
+    bm25.add(obs("obs_fork"));
+    const liveBm25 = await writeForkGeneration("bm25", LIVE_BM25, bm25.serialize());
+    const liveVectors = await writeForkGeneration("vectors", LIVE_VECTORS, vector.serialize());
+    const strandedTracked = await writeForkGeneration("bm25", STRANDED_TRACKED, "stranded bm25 generation the ledger still lists");
+    const strandedUntracked = await writeForkGeneration("vectors", STRANDED_UNTRACKED, "stranded vector generation no ledger lists");
+    await kv.set(INDEX_SCOPE, "data:manifest", liveBm25);
+    await kv.set(INDEX_SCOPE, "vectors:manifest", liveVectors);
+    const ledgerEntry = (m: typeof liveBm25) => ({ generation: m.generation, shards: m.shards.map(({ scope, key }) => ({ scope, key })) });
+    await kv.set(INDEX_SCOPE, "data:manifest:gc", { v: 1, generations: [ledgerEntry(strandedTracked), ledgerEntry(liveBm25)] });
+    await kv.set(INDEX_SCOPE, "vectors:manifest:gc", { v: 1, generations: [ledgerEntry(liveVectors)] });
+    const scopes = (m: typeof liveBm25) => m.shards.map((s) => s.scope);
+    return {
+      liveVectors: scopes(liveVectors),
+      orphans: [...scopes(strandedTracked), ...scopes(strandedUntracked)],
+    };
+  }
+
+  function present(scopes: string[]): boolean[] {
+    return scopes.map((scope) => kv.store.get(scope)?.has("data") ?? false);
+  }
+
+  it("keeps the live vector generation and deletes the stranded ones when vector search is off", async () => {
+    const vector = vectorWith([["obs_a", [0.1, 0.2, 0.3]], ["obs_b", [0.4, 0.5, 0.6]]]);
+    const { liveVectors, orphans } = await writeForkStore(vector);
+    expect(liveVectors.length).toBeGreaterThan(1);
+    expect(orphans.length).toBeGreaterThan(2);
+
+    await new IndexPersistence(kv as never, null, { bucketSize: 16 }).load();
+
+    expect(present(liveVectors).every(Boolean)).toBe(true);
+    expect(await kv.get(INDEX_SCOPE, "vectors:manifest")).toMatchObject({ generation: LIVE_VECTORS });
+    expect(present(orphans).some(Boolean)).toBe(false);
+    expect(await kv.get(INDEX_SCOPE, SWEEP_KEY)).toMatchObject({ v: 1, generations: 2, shards: orphans.length, failed: 0 });
+  });
+
+  it("migrates the live vector generation into buckets and deletes the stranded ones", async () => {
+    const vector = vectorWith([["obs_a", [0.1, 0.2, 0.3]], ["obs_b", [0.4, 0.5, 0.6]]]);
+    const { orphans } = await writeForkStore(vector);
+
+    const loaded = await new IndexPersistence(kv as never, new VectorIndex(), { bucketSize: 16 }).load();
+
+    expect(loaded.state).toBe("migrated");
+    expectSameVectors(loaded.vector, vector);
+    expect(present(orphans).some(Boolean)).toBe(false);
+    expect(await kv.get(INDEX_SCOPE, SWEEP_KEY)).toMatchObject({ v: 1, generations: 2, shards: orphans.length, failed: 0 });
+    expect([...kv.store.keys()].filter((scope) => scope.startsWith(`${INDEX_SCOPE}:bm25:`) && kv.store.get(scope)!.size > 0)).toEqual([]);
+    // Upstream does not know the fork's ledgers, so they outlive the migration as inert keys.
+    expect(await kv.get(INDEX_SCOPE, "data:manifest:gc")).not.toBeNull();
+    expect(await kv.get(INDEX_SCOPE, "vectors:manifest:gc")).not.toBeNull();
+  });
+});
