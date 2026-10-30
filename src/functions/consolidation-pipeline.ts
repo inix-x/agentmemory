@@ -16,6 +16,8 @@ import {
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
+import { deleteAccessLog } from "./access-tracker.js";
+import { deleteFacetsForTargets } from "./facets.js";
 import { CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_MIN_SESSIONS_PER_PATTERN, patternFrequency } from "./consolidation-status.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
@@ -78,8 +80,26 @@ async function decayAndWriteChanged<
   return { scanned: items.length, written: dirty.length };
 }
 
-/** Key within KV.config: createdAt of the newest summary the semantic tier consumed. */
+/**
+ * Key within KV.config: the newest summary the semantic tier consumed, as its
+ * createdAt plus sessionId so two summaries with one createdAt stay ordered.
+ * A value written before the id existed covers every summary at that time.
+ */
 const SEMANTIC_WATERMARK_KEY = "consolidation:semanticWatermark";
+const SEMANTIC_BATCH_SIZE = 20;
+
+type SemanticCursor = { at: number; id?: string };
+
+function isAfterCursor(at: number, id: string, cursor: SemanticCursor): boolean {
+  return at > cursor.at || (at === cursor.at && cursor.id !== undefined && id > cursor.id);
+}
+
+async function readSemanticCursor(kv: StateKV): Promise<SemanticCursor | null> {
+  const stored = await kv
+    .get<{ at?: string; id?: string }>(KV.config, SEMANTIC_WATERMARK_KEY)
+    .catch(() => null);
+  return stored?.at ? { at: new Date(stored.at).getTime(), id: stored.id } : null;
+}
 
 export const SEMANTIC_MAX_ROWS = 10_000;
 
@@ -87,8 +107,8 @@ export const SEMANTIC_MAX_ROWS = 10_000;
  * Deletes the weakest rows past SEMANTIC_MAX_ROWS: never-reinforced facts
  * first, least recently accessed first among those, lower strength on a tie.
  * Reinforced facts outlive one-off extractions however old they are, and a new
- * fact goes only after every older one-off. Nothing else deletes semantic rows,
- * so without a bound the scope grows on every merge.
+ * fact goes only after every older one-off. No other path bounds the scope, so
+ * without this it grows on every merge. Cleanup mirrors mem::retention-evict.
  */
 async function evictPastCap(
   kv: StateKV,
@@ -106,7 +126,10 @@ async function evictPastCap(
     .map((row) => row.id);
   for (const id of evicted) {
     await kv.delete(KV.semantic, id);
+    await kv.delete(KV.retentionScores, id);
+    await deleteAccessLog(kv, id);
   }
+  await deleteFacetsForTargets(kv, evicted);
   return evicted;
 }
 
@@ -128,24 +151,29 @@ export function registerConsolidationPipelineFunction(
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await collectAll<SemanticMemory>(kv, KV.semantic);
 
-        // Only summaries written since the last successful semantic run. Re-sending
-        // the same newest 20 every run let each rewording of a known fact past the
-        // exact-text dedupe below. A re-summarized session gets a fresh createdAt,
-        // so it is merged again.
-        const watermark = await kv
-          .get<{ at?: string }>(KV.config, SEMANTIC_WATERMARK_KEY)
-          .catch(() => null);
-        const consumedThrough = watermark?.at
-          ? new Date(watermark.at).getTime()
-          : -Infinity;
-        const recentSummaries = summaries
-          .filter((s) => new Date(s.createdAt).getTime() > consumedThrough)
+        // Only summaries written since the last successful semantic run, oldest
+        // first, 20 per run, so a backlog drains over several runs. Re-sending the
+        // same newest 20 every run let each rewording of a known fact past the
+        // exact-text dedupe below. With no watermark yet, the first run takes the
+        // newest 20 instead of walking the whole history. A re-summarized session
+        // gets a fresh createdAt, so it is merged again. A future-dated summary
+        // (clock skew) waits until its time, so it never holds the watermark ahead.
+        const cursor = await readSemanticCursor(kv);
+        const selectedAt = Date.now();
+        const pending = summaries
+          .map((s) => ({ s, at: new Date(s.createdAt).getTime() }))
+          .filter(
+            ({ s, at }) =>
+              at <= selectedAt && (!cursor || isAfterCursor(at, s.sessionId, cursor)),
+          )
           .sort(
             (a, b) =>
-              new Date(b.createdAt).getTime() -
-              new Date(a.createdAt).getTime(),
+              a.at - b.at || (a.s.sessionId < b.s.sessionId ? -1 : a.s.sessionId > b.s.sessionId ? 1 : 0),
           )
-          .slice(0, 20);
+          .map(({ s }) => s);
+        const recentSummaries = cursor
+          ? pending.slice(0, SEMANTIC_BATCH_SIZE)
+          : pending.slice(-SEMANTIC_BATCH_SIZE);
 
         if (summaries.length >= 5 && recentSummaries.length === 0) {
           results.semantic = {
@@ -206,15 +234,33 @@ export function registerConsolidationPipelineFunction(
                 existingSemantic.push(sem);
               }
             }
-            // An empty or tag-free reply is a failed merge, so the watermark stays
-            // and the next run retries these summaries. A well-formed <facts></facts>
-            // is a merge that found nothing, which the prompt allows.
-            if (parsedFacts === 0 && !/<facts[\s>]/.test(response)) {
+            // A reply with no complete fact and no closed list (empty, tag-free, or
+            // cut off) is a failed merge, so the watermark stays and the next run
+            // retries this batch. A closed <facts></facts> or <facts/> is a merge
+            // that found nothing, which the prompt allows. A cut-off reply with
+            // complete facts keeps them and advances: retrying a batch that always
+            // truncates would stall the tier on it.
+            const closed = /<\/facts>|<facts\s*\/>/.test(response);
+            if (parsedFacts === 0 && !closed) {
               throw new Error("no facts parsed from the merge response");
             }
-            await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
-              at: recentSummaries[0]!.createdAt,
-            });
+            if (!closed) {
+              logger.warn("Semantic merge reply has no closing </facts>; kept its complete facts", {
+                parsedFacts,
+              });
+            }
+            // Overlapping runs can finish out of order; never move the watermark back.
+            const newest = recentSummaries[recentSummaries.length - 1]!;
+            const stored = await readSemanticCursor(kv);
+            if (
+              !stored ||
+              isAfterCursor(new Date(newest.createdAt).getTime(), newest.sessionId, stored)
+            ) {
+              await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
+                at: newest.createdAt,
+                id: newest.sessionId,
+              });
+            }
             const evicted = await evictPastCap(kv, existingSemantic);
             if (evicted.length > 0) {
               await recordAudit(kv, "delete", "mem::consolidate-pipeline", evicted, {

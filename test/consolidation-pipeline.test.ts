@@ -14,6 +14,7 @@ import {
   SEMANTIC_MAX_ROWS,
 } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
+import { logger } from "../src/logger.js";
 import { currentAuditScope } from "./helpers/mocks.js";
 import type {
   AuditEntry,
@@ -456,15 +457,18 @@ describe("Consolidation Pipeline semantic regrowth", () => {
         .fn()
         .mockResolvedValueOnce("")
         .mockResolvedValueOnce("I could not find any durable facts in these summaries.")
+        .mockResolvedValueOnce(`<facts>\n  <fact confidence="0.9">TypeScript is the prim`)
         .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
     );
     await seedSummaries(0, 5);
 
     const empty = await run();
     const tagFree = await run();
+    const truncated = await run();
 
     expect(empty.results.semantic.error).toMatch(/no facts parsed/);
     expect(tagFree.results.semantic.error).toMatch(/no facts parsed/);
+    expect(truncated.results.semantic.error).toMatch(/no facts parsed/);
     expect(await watermark()).toBeNull();
 
     const good = await run();
@@ -483,6 +487,157 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     expect(await watermark()).not.toBeNull();
     expect(second.results.semantic).toMatchObject({ skipped: true });
     expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("advances the watermark on a self-closing <facts/> reply", async () => {
+    providerWith(vi.fn().mockResolvedValue("<facts/>"));
+    await seedSummaries(0, 5);
+
+    const result = await run();
+
+    expect(result.results.semantic).toMatchObject({ newFacts: 0, consumedSummaries: 6 });
+    expect(await watermark()).not.toBeNull();
+  });
+
+  // With no watermark yet (every existing install), the first run starts at the
+  // newest 20, as upstream's window did, instead of walking the whole history.
+  it("starts a store with no watermark at its newest 20 summaries", async () => {
+    const provider = providerWith(
+      vi.fn().mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    );
+    await seedSummaries(0, 29);
+
+    const first = await run();
+    const second = await run();
+
+    expect(first.results.semantic.consumedSummaries).toBe(20);
+    const prompt = vi.mocked(provider.summarize).mock.calls[0]![1] as string;
+    expect(prompt).toContain("Session 0 summary");
+    expect(prompt).toContain("Session 19 summary");
+    expect(prompt).not.toContain("Session 20 summary");
+    expect(second.results.semantic).toMatchObject({ skipped: true });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains a 45-summary backlog oldest-first over 3 runs, skipping none", async () => {
+    const provider = providerWith(
+      vi.fn().mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    );
+    await seedSummaries(0, 44);
+    // A tie on createdAt across the first batch boundary: a time-only cursor
+    // would skip whichever of the pair lands 21st.
+    const ses25 = await kv.get<SessionSummary>("mem:summaries", "ses_25");
+    await kv.set("mem:summaries", "ses_24", { ...makeSummary(24), createdAt: ses25!.createdAt });
+    const at = new Date(Date.now() - 50 * 86400000).toISOString();
+    await kv.set("mem:config", "consolidation:semanticWatermark", { at });
+
+    const consumed: SemanticResult[] = [];
+    for (let i = 0; i < 4; i++) consumed.push((await run()).results.semantic);
+
+    expect(consumed.slice(0, 3).map((r) => r.consumedSummaries)).toEqual([20, 20, 5]);
+    expect(consumed[3]).toMatchObject({ skipped: true });
+    const prompts = vi.mocked(provider.summarize).mock.calls.map((c) => c[1] as string);
+    expect(prompts).toHaveLength(3);
+    expect(prompts[0]).toContain("Session 44 summary");
+    expect(prompts[2]).toContain("Session 0 summary");
+    for (let i = 0; i <= 44; i++) {
+      const sent = prompts.filter((p) => p.includes(`Session ${i} summary`));
+      expect(sent, `ses_${i}`).toHaveLength(1);
+    }
+  });
+
+  it("keeps a truncated reply's complete facts once and warns on the missing </facts>", async () => {
+    providerWith(
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          `<facts>\n  <fact confidence="0.9">TypeScript is the primary language</fact>\n  <fact confidence="0.8">Vitest ru`,
+        )
+        .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    );
+    await seedSummaries(1, 6);
+
+    const first = await run();
+    await seedSummaries(0, 0);
+    const second = await run();
+
+    expect(first.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining("</facts>"),
+      expect.anything(),
+    );
+    expect(second.results.semantic).toMatchObject({ newFacts: 0, consumedSummaries: 1 });
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.accessCount).toBe(2);
+  });
+
+  it("keeps the watermark monotonic when an older overlapping run finishes last", async () => {
+    let releaseA!: (reply: string) => void;
+    let markAEntered!: () => void;
+    const aEntered = new Promise<void>((resolve) => (markAEntered = resolve));
+    providerWith(
+      vi
+        .fn()
+        .mockImplementationOnce(() => {
+          markAEntered();
+          return new Promise<string>((resolve) => (releaseA = resolve));
+        })
+        .mockResolvedValue(`<facts><fact confidence="0.8">Vitest runs the tests</fact></facts>`),
+    );
+    await seedSummaries(1, 6);
+
+    // Run A has listed summaries 1 to 6 and waits on the LLM.
+    const runA = run();
+    await aEntered;
+    await seedSummaries(0, 0);
+    const b = await run();
+    releaseA(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`);
+    await runA;
+
+    const newest = await kv.get<SessionSummary>("mem:summaries", "ses_0");
+    expect(b.results.semantic.consumedSummaries).toBe(7);
+    expect((await watermark())!.at).toBe(newest!.createdAt);
+    expect((await run()).results.semantic).toMatchObject({ skipped: true });
+  });
+
+  it("holds a future-dated summary until the clock passes it, then sends it once", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = Date.parse("2026-10-30T00:00:00.000Z");
+      vi.setSystemTime(start);
+      const provider = providerWith(
+        vi.fn().mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+      );
+      await seedSummaries(1, 5);
+      await kv.set("mem:summaries", "ses_future", {
+        ...makeSummary(0),
+        sessionId: "ses_future",
+        title: "Future-dated summary",
+        createdAt: new Date(start + 3_600_000).toISOString(),
+      });
+
+      const first = await run();
+      const second = await run();
+
+      expect(first.results.semantic.consumedSummaries).toBe(5);
+      const firstPrompt = vi.mocked(provider.summarize).mock.calls[0]![1] as string;
+      expect(firstPrompt).not.toContain("Future-dated summary");
+      expect(Date.parse((await watermark())!.at)).toBeLessThanOrEqual(start);
+      expect(second.results.semantic).toMatchObject({ skipped: true });
+
+      vi.setSystemTime(start + 2 * 3_600_000);
+      const third = await run();
+      const fourth = await run();
+
+      expect(third.results.semantic.consumedSummaries).toBe(1);
+      const thirdPrompt = vi.mocked(provider.summarize).mock.calls[1]![1] as string;
+      expect(thirdPrompt).toContain("Future-dated summary");
+      expect(fourth.results.semantic).toMatchObject({ skipped: true });
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("re-sends the same summaries when the run that read them failed", async () => {
@@ -540,6 +695,18 @@ describe("Consolidation Pipeline semantic regrowth", () => {
         lastAccessedAt: "2026-01-01T00:00:00.000Z",
       }));
     }
+    for (const id of [...stale, "sem_keep_0"]) {
+      await kv.set("mem:facets", `fct_${id}`, {
+        id: `fct_${id}`,
+        targetId: id,
+        targetType: "memory",
+        dimension: "topic",
+        value: "test",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await kv.set("mem:retention", id, { memoryId: id, score: 0.1 });
+      await kv.set("mem:access", id, { memoryId: id, count: 1 });
+    }
 
     const result = await run();
 
@@ -549,6 +716,14 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     const ids = new Set(stored.map((s) => s.id));
     for (const id of stale) expect(ids.has(id)).toBe(false);
     expect(stored.some((s) => s.fact === "A brand new fact")).toBe(true);
+    for (const id of stale) {
+      expect(await kv.get("mem:facets", `fct_${id}`)).toBeNull();
+      expect(await kv.get("mem:retention", id)).toBeNull();
+      expect(await kv.get("mem:access", id)).toBeNull();
+    }
+    expect(await kv.get("mem:facets", "fct_sem_keep_0")).not.toBeNull();
+    expect(await kv.get("mem:retention", "sem_keep_0")).not.toBeNull();
+    expect(await kv.get("mem:access", "sem_keep_0")).not.toBeNull();
 
     const deletes = (await kv.list<AuditEntry>(currentAuditScope())).filter(
       (a) => a.operation === "delete",
