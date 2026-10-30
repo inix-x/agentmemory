@@ -12,7 +12,7 @@ export interface GraphIngestionOptions {
 
 const TOP_N = 500;
 const BATCH_SIZE = 50;
-const MAX_SNAPSHOT_EDGES = 2000;
+export const MAX_SNAPSHOT_EDGES = 2000;
 const nodeKey = (node: GraphNode) => `${node.type}|${node.name}`;
 const edgeKey = (edge: GraphEdge) => `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
 const membershipKey = (scope: string, key: string) => JSON.stringify([scope, key]);
