@@ -451,24 +451,22 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     expect((await watermark())!.at).toBe(newest!.createdAt);
   });
 
-  it("does not advance the watermark when the merge response yields no facts", async () => {
+  it.each([
+    ["empty", ""],
+    ["tag-free", "I could not find any durable facts in these summaries."],
+    ["truncated", `<facts>\n  <fact confidence="0.9">TypeScript is the prim`],
+  ])("does not advance the watermark when the merge response yields no facts (%s)", async (_, reply) => {
     providerWith(
       vi
         .fn()
-        .mockResolvedValueOnce("")
-        .mockResolvedValueOnce("I could not find any durable facts in these summaries.")
-        .mockResolvedValueOnce(`<facts>\n  <fact confidence="0.9">TypeScript is the prim`)
+        .mockResolvedValueOnce(reply)
         .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
     );
     await seedSummaries(0, 5);
 
-    const empty = await run();
-    const tagFree = await run();
-    const truncated = await run();
+    const failed = await run();
 
-    expect(empty.results.semantic.error).toMatch(/no facts parsed/);
-    expect(tagFree.results.semantic.error).toMatch(/no facts parsed/);
-    expect(truncated.results.semantic.error).toMatch(/no facts parsed/);
+    expect(failed.results.semantic.error).toMatch(/no facts parsed/);
     expect(await watermark()).toBeNull();
 
     const good = await run();
@@ -654,6 +652,78 @@ describe("Consolidation Pipeline semantic regrowth", () => {
 
     expect(first.results.semantic.error).toBe("provider down");
     expect(second.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
+  });
+
+  it("skips a batch that fails 3 runs in a row and merges the next one", async () => {
+    const provider = providerWith(
+      vi.fn(async (_system: string, prompt: string) => {
+        if (prompt.includes("Session 44 summary")) throw new Error("content policy refusal");
+        return `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`;
+      }),
+    );
+    await seedSummaries(0, 44);
+    const at = new Date(Date.now() - 50 * 86400000).toISOString();
+    await kv.set("mem:config", "consolidation:semanticWatermark", { at });
+    const firstBatch = Array.from({ length: 20 }, (_, i) => `ses_${44 - i}`);
+
+    const failed: SemanticResult[] = [];
+    for (let i = 0; i < 3; i++) failed.push((await run()).results.semantic);
+    const next = await run();
+
+    expect(failed.map((r) => r.error)).toEqual(Array(3).fill("content policy refusal"));
+    expect(next.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 20 });
+    const prompts = vi.mocked(provider.summarize).mock.calls.map((c) => c[1] as string);
+    expect(prompts).toHaveLength(4);
+    expect(prompts[3]).toContain("Session 24 summary");
+    expect(prompts[3]).not.toContain("Session 44 summary");
+    const skips = (await kv.list<AuditEntry>(currentAuditScope())).filter(
+      (a) => a.details["reason"] === "semantic batch failed 3 runs in a row",
+    );
+    expect(skips).toHaveLength(1);
+    expect(skips[0]!.targetIds).toEqual(firstBatch);
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining("skipped"),
+      expect.objectContaining({ sessionIds: firstBatch }),
+    );
+  });
+
+  it("keeps the failure count across failed runs and clears it on a success", async () => {
+    providerWith(
+      vi
+        .fn()
+        .mockRejectedValueOnce(new Error("provider down"))
+        .mockRejectedValueOnce(new Error("provider down"))
+        .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    );
+    await seedSummaries(0, 5);
+    const failures = () => kv.get("mem:config", "consolidation:semanticFailedBatch");
+
+    await run();
+    await run();
+    expect(await failures()).toMatchObject({ id: "ses_5", count: 2 });
+
+    const good = await run();
+    expect(good.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
+    expect(await failures()).toBeNull();
+  });
+
+  it("fails the tier, sending nothing, when the watermark read errors", async () => {
+    const provider = providerWith(
+      vi.fn().mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+    );
+    await seedSummaries(0, 29);
+    const get = kv.get;
+    kv.get = (async (scope: string, key: string) => {
+      if (key === "consolidation:semanticWatermark") throw new Error("kv unavailable");
+      return get(scope, key);
+    }) as typeof kv.get;
+
+    const result = await run();
+
+    expect(result.results.semantic.error).toBe("kv unavailable");
+    expect(provider.summarize).not.toHaveBeenCalled();
+    kv.get = get;
+    expect(await watermark()).toBeNull();
   });
 
   it("stores a fact once when one response repeats it", async () => {

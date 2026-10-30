@@ -81,7 +81,8 @@ async function decayAndWriteChanged<
 }
 
 /**
- * Key within KV.config: the newest summary the semantic tier consumed, as its
+ * Key within KV.config: the newest summary the semantic tier consumed (or
+ * skipped after repeated failed runs), as its
  * createdAt plus sessionId so two summaries with one createdAt stay ordered.
  * A value written before the id existed covers every summary at that time.
  */
@@ -94,11 +95,60 @@ function isAfterCursor(at: number, id: string, cursor: SemanticCursor): boolean 
   return at > cursor.at || (at === cursor.at && cursor.id !== undefined && id > cursor.id);
 }
 
+// Throws on a read error: treating it as "no watermark" would take the seed
+// path and jump the cursor past the whole backlog.
 async function readSemanticCursor(kv: StateKV): Promise<SemanticCursor | null> {
-  const stored = await kv
-    .get<{ at?: string; id?: string }>(KV.config, SEMANTIC_WATERMARK_KEY)
-    .catch(() => null);
+  const stored = await kv.get<{ at?: string; id?: string }>(KV.config, SEMANTIC_WATERMARK_KEY);
   return stored?.at ? { at: new Date(stored.at).getTime(), id: stored.id } : null;
+}
+
+// Overlapping runs can finish out of order; never move the watermark back.
+async function advanceSemanticCursor(kv: StateKV, newest: SessionSummary): Promise<void> {
+  const stored = await readSemanticCursor(kv);
+  if (!stored || isAfterCursor(new Date(newest.createdAt).getTime(), newest.sessionId, stored)) {
+    await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
+      at: newest.createdAt,
+      id: newest.sessionId,
+    });
+  }
+}
+
+/**
+ * Key within KV.config: consecutive failed runs on one batch, keyed to the
+ * batch's oldest summary. The drain re-selects the same oldest batch until a
+ * run succeeds, so a batch the provider always refuses would block every later
+ * summary. After SEMANTIC_MAX_BATCH_FAILURES the watermark moves past it.
+ */
+const SEMANTIC_FAILED_BATCH_KEY = "consolidation:semanticFailedBatch";
+const SEMANTIC_MAX_BATCH_FAILURES = 3;
+
+async function recordSemanticFailure(kv: StateKV, batch: SessionSummary[]): Promise<void> {
+  const head = batch[0]!;
+  const prev = await kv.get<{ id: string; at: string; count: number }>(
+    KV.config,
+    SEMANTIC_FAILED_BATCH_KEY,
+  );
+  const count =
+    prev?.id === head.sessionId && prev.at === head.createdAt ? prev.count + 1 : 1;
+  if (count < SEMANTIC_MAX_BATCH_FAILURES) {
+    await kv.set(KV.config, SEMANTIC_FAILED_BATCH_KEY, {
+      id: head.sessionId,
+      at: head.createdAt,
+      count,
+    });
+    return;
+  }
+  await advanceSemanticCursor(kv, batch[batch.length - 1]!);
+  await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY);
+  const sessionIds = batch.map((s) => s.sessionId);
+  logger.warn("Semantic batch skipped after repeated failed runs", {
+    failures: count,
+    sessionIds,
+  });
+  await recordAudit(kv, "consolidate", "mem::consolidate-pipeline", sessionIds, {
+    resource: "semantic",
+    reason: `semantic batch failed ${count} runs in a row`,
+  });
 }
 
 export const SEMANTIC_MAX_ROWS = 10_000;
@@ -158,7 +208,13 @@ export function registerConsolidationPipelineFunction(
         // newest 20 instead of walking the whole history. A re-summarized session
         // gets a fresh createdAt, so it is merged again. A future-dated summary
         // (clock skew) waits until its time, so it never holds the watermark ahead.
-        const cursor = await readSemanticCursor(kv);
+        let cursor: SemanticCursor | null = null;
+        let cursorError: string | undefined;
+        try {
+          cursor = await readSemanticCursor(kv);
+        } catch (err) {
+          cursorError = err instanceof Error ? err.message : String(err);
+        }
         const selectedAt = Date.now();
         const pending = summaries
           .map((s) => ({ s, at: new Date(s.createdAt).getTime() }))
@@ -175,7 +231,10 @@ export function registerConsolidationPipelineFunction(
           ? pending.slice(0, SEMANTIC_BATCH_SIZE)
           : pending.slice(-SEMANTIC_BATCH_SIZE);
 
-        if (summaries.length >= 5 && recentSummaries.length === 0) {
+        if (cursorError) {
+          logger.error("Semantic consolidation failed", { error: cursorError });
+          results.semantic = { error: cursorError };
+        } else if (summaries.length >= 5 && recentSummaries.length === 0) {
           results.semantic = {
             skipped: true,
             reason: "no summaries since the last semantic run",
@@ -249,18 +308,10 @@ export function registerConsolidationPipelineFunction(
                 parsedFacts,
               });
             }
-            // Overlapping runs can finish out of order; never move the watermark back.
-            const newest = recentSummaries[recentSummaries.length - 1]!;
-            const stored = await readSemanticCursor(kv);
-            if (
-              !stored ||
-              isAfterCursor(new Date(newest.createdAt).getTime(), newest.sessionId, stored)
-            ) {
-              await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
-                at: newest.createdAt,
-                id: newest.sessionId,
-              });
-            }
+            await advanceSemanticCursor(kv, recentSummaries[recentSummaries.length - 1]!);
+            // Best-effort: a stale count names a head behind the cursor, so it
+            // can never match a future batch.
+            await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY).catch(() => {});
             const evicted = await evictPastCap(kv, existingSemantic);
             if (evicted.length > 0) {
               await recordAudit(kv, "delete", "mem::consolidate-pipeline", evicted, {
@@ -279,6 +330,11 @@ export function registerConsolidationPipelineFunction(
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
             results.semantic = { error: msg };
+            await recordSemanticFailure(kv, recentSummaries).catch((countErr) =>
+              logger.warn("Could not record the semantic batch failure", {
+                error: countErr instanceof Error ? countErr.message : String(countErr),
+              }),
+            );
           }
         } else {
           results.semantic = {
