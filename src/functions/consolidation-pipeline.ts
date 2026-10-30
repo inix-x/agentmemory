@@ -15,6 +15,8 @@ import {
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
+import { deleteAccessLog } from "./access-tracker.js";
+import { deleteFacetsForTargets } from "./facets.js";
 import { CONSOLIDATION_LAST_RUN_KEY } from "./consolidation-status.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
@@ -78,6 +80,132 @@ async function decayAndWriteChanged<
   return { scanned: items.length, written: dirty.length };
 }
 
+/**
+ * Key within KV.config: the newest summary the semantic tier consumed (or
+ * skipped after repeated failed runs), as its
+ * createdAt plus sessionId so two summaries with one createdAt stay ordered.
+ * A value written before the id existed covers every summary at that time.
+ */
+const SEMANTIC_WATERMARK_KEY = "consolidation:semanticWatermark";
+const SEMANTIC_BATCH_SIZE = 20;
+
+type SemanticCursor = { at: number; id?: string };
+
+function isAfterCursor(at: number, id: string, cursor: SemanticCursor): boolean {
+  return at > cursor.at || (at === cursor.at && cursor.id !== undefined && id > cursor.id);
+}
+
+// Throws on a read error: treating it as "no watermark" would take the seed
+// path and jump the cursor past the whole backlog.
+async function readSemanticCursor(kv: StateKV): Promise<SemanticCursor | null> {
+  const stored = await kv.get<{ at?: string; id?: string }>(KV.config, SEMANTIC_WATERMARK_KEY);
+  return stored?.at ? { at: new Date(stored.at).getTime(), id: stored.id } : null;
+}
+
+// Overlapping runs can finish out of order; never move the watermark back.
+async function advanceSemanticCursor(kv: StateKV, newest: SessionSummary): Promise<void> {
+  const stored = await readSemanticCursor(kv);
+  if (!stored || isAfterCursor(new Date(newest.createdAt).getTime(), newest.sessionId, stored)) {
+    await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
+      at: newest.createdAt,
+      id: newest.sessionId,
+    });
+  }
+}
+
+/**
+ * Key within KV.config: consecutive content failures on one batch, keyed to the
+ * batch's oldest summary. The drain re-selects the same oldest batch until a
+ * run succeeds, so a batch the provider always refuses would block every later
+ * summary. After SEMANTIC_MAX_BATCH_FAILURES the watermark moves past it.
+ */
+const SEMANTIC_FAILED_BATCH_KEY = "consolidation:semanticFailedBatch";
+const SEMANTIC_MAX_BATCH_FAILURES = 3;
+const NO_FACTS_ERROR = "no facts parsed from the merge response";
+// 408/429 are transient; 401/402/403/404 are provider config outages that fail
+// every batch alike. Neither says anything about this batch.
+const NOT_BATCH_SPECIFIC_4XX = new Set([401, 402, 403, 404, 408, 429]);
+
+/**
+ * True when the failure is caused by this batch's content: a reply with no
+ * facts and no closed list (a refusal, prose, or empty reply), or a provider
+ * 4xx that rejects the request itself. Transport failures (network, timeout,
+ * 5xx, an open circuit breaker), provider outages, and KV errors return false
+ * so they neither count toward a skip nor reset the count.
+ */
+function isSemanticContentFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.message === NO_FACTS_ERROR) return true;
+  // Anthropic SDK errors carry a numeric status; the fetch-based providers
+  // put it in the message: "OpenAI API error (400):", "MiniMax API error 400:".
+  const raw = (err as { status?: unknown }).status;
+  const status =
+    typeof raw === "number" ? raw : Number(/API error \(?(\d{3})\)?:/.exec(err.message)?.[1]);
+  return status >= 400 && status < 500 && !NOT_BATCH_SPECIFIC_4XX.has(status);
+}
+
+async function recordSemanticFailure(kv: StateKV, batch: SessionSummary[]): Promise<void> {
+  const head = batch[0]!;
+  const prev = await kv.get<{ id: string; at: string; count: number }>(
+    KV.config,
+    SEMANTIC_FAILED_BATCH_KEY,
+  );
+  const count =
+    prev?.id === head.sessionId && prev.at === head.createdAt ? prev.count + 1 : 1;
+  if (count < SEMANTIC_MAX_BATCH_FAILURES) {
+    await kv.set(KV.config, SEMANTIC_FAILED_BATCH_KEY, {
+      id: head.sessionId,
+      at: head.createdAt,
+      count,
+    });
+    return;
+  }
+  await advanceSemanticCursor(kv, batch[batch.length - 1]!);
+  const sessionIds = batch.map((s) => s.sessionId);
+  logger.warn("Semantic batch skipped after repeated failed runs", {
+    failures: count,
+    sessionIds,
+  });
+  await recordAudit(kv, "consolidate", "mem::consolidate-pipeline", sessionIds, {
+    resource: "semantic",
+    reason: `semantic batch failed ${count} runs in a row`,
+  });
+  // Best-effort: the head is now behind the cursor, so a stale count never matches.
+  await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY).catch(() => {});
+}
+
+export const SEMANTIC_MAX_ROWS = 10_000;
+
+/**
+ * Deletes the weakest rows past SEMANTIC_MAX_ROWS: never-reinforced facts
+ * first, least recently accessed first among those, lower strength on a tie.
+ * Reinforced facts outlive one-off extractions however old they are, and a new
+ * fact goes only after every older one-off. No other path bounds the scope, so
+ * without this it grows on every merge. Cleanup mirrors mem::retention-evict.
+ */
+async function evictPastCap(
+  kv: StateKV,
+  rows: SemanticMemory[],
+): Promise<string[]> {
+  if (rows.length <= SEMANTIC_MAX_ROWS) return [];
+  const weakestFirst = [...rows].sort(
+    (a, b) =>
+      a.accessCount - b.accessCount ||
+      (a.lastAccessedAt ?? "").localeCompare(b.lastAccessedAt ?? "") ||
+      a.strength - b.strength,
+  );
+  const evicted = weakestFirst
+    .slice(0, rows.length - SEMANTIC_MAX_ROWS)
+    .map((row) => row.id);
+  for (const id of evicted) {
+    await kv.delete(KV.semantic, id);
+    await kv.delete(KV.retentionScores, id);
+    await deleteAccessLog(kv, id);
+  }
+  await deleteFacetsForTargets(kv, evicted);
+  return evicted;
+}
+
 export function registerConsolidationPipelineFunction(
   sdk: IIIClient,
   kv: StateKV,
@@ -96,15 +224,45 @@ export function registerConsolidationPipelineFunction(
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
 
-        if (summaries.length >= 5) {
-          const recentSummaries = summaries
-            .sort(
-              (a, b) =>
-                new Date(b.createdAt).getTime() -
-                new Date(a.createdAt).getTime(),
-            )
-            .slice(0, 20);
+        // Only summaries written since the last successful semantic run, oldest
+        // first, 20 per run, so a backlog drains over several runs. Re-sending the
+        // same newest 20 every run let each rewording of a known fact past the
+        // exact-text dedupe below. With no watermark yet, the first run takes the
+        // newest 20 instead of walking the whole history. A re-summarized session
+        // gets a fresh createdAt, so it is merged again. A future-dated summary
+        // (clock skew) waits until its time, so it never holds the watermark ahead.
+        let cursor: SemanticCursor | null = null;
+        let cursorError: string | undefined;
+        try {
+          cursor = await readSemanticCursor(kv);
+        } catch (err) {
+          cursorError = err instanceof Error ? err.message : String(err);
+        }
+        const selectedAt = Date.now();
+        const pending = summaries
+          .map((s) => ({ s, at: new Date(s.createdAt).getTime() }))
+          .filter(
+            ({ s, at }) =>
+              at <= selectedAt && (!cursor || isAfterCursor(at, s.sessionId, cursor)),
+          )
+          .sort(
+            (a, b) =>
+              a.at - b.at || (a.s.sessionId < b.s.sessionId ? -1 : a.s.sessionId > b.s.sessionId ? 1 : 0),
+          )
+          .map(({ s }) => s);
+        const recentSummaries = cursor
+          ? pending.slice(0, SEMANTIC_BATCH_SIZE)
+          : pending.slice(-SEMANTIC_BATCH_SIZE);
 
+        if (cursorError) {
+          logger.error("Semantic consolidation failed", { error: cursorError });
+          results.semantic = { error: cursorError };
+        } else if (summaries.length >= 5 && recentSummaries.length === 0) {
+          results.semantic = {
+            skipped: true,
+            reason: "no summaries since the last semantic run",
+          };
+        } else if (summaries.length >= 5) {
           const prompt = buildSemanticMergePrompt(
             recentSummaries.map((s) => ({
               title: s.title,
@@ -122,9 +280,11 @@ export function registerConsolidationPipelineFunction(
             const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
             let match;
             let newFacts = 0;
+            let parsedFacts = 0;
             const now = new Date().toISOString();
 
             while ((match = factRegex.exec(response)) !== null) {
+              parsedFacts++;
               const parsedConf = parseFloat(match[1]);
               const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
               const fact = match[2].trim();
@@ -153,13 +313,53 @@ export function registerConsolidationPipelineFunction(
                 };
                 await kv.set(KV.semantic, sem.id, sem);
                 newFacts++;
+                existingSemantic.push(sem);
               }
             }
-            results.semantic = { newFacts, totalSummaries: summaries.length };
+            // A reply with no complete fact and no closed list (empty, tag-free, or
+            // cut off) is a failed merge, so the watermark stays and the next run
+            // retries this batch. A closed <facts></facts> or <facts/> is a merge
+            // that found nothing, which the prompt allows. A cut-off reply with
+            // complete facts keeps them and advances: retrying a batch that always
+            // truncates would stall the tier on it.
+            const closed = /<\/facts>|<facts\s*\/>/.test(response);
+            if (parsedFacts === 0 && !closed) {
+              throw new Error(NO_FACTS_ERROR);
+            }
+            if (!closed) {
+              logger.warn("Semantic merge reply has no closing </facts>; kept its complete facts", {
+                parsedFacts,
+              });
+            }
+            await advanceSemanticCursor(kv, recentSummaries[recentSummaries.length - 1]!);
+            // Best-effort: a stale count names a head behind the cursor, so it
+            // can never match a future batch.
+            await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY).catch(() => {});
+            const evicted = await evictPastCap(kv, existingSemantic);
+            if (evicted.length > 0) {
+              await recordAudit(kv, "delete", "mem::consolidate-pipeline", evicted, {
+                resource: "semantic",
+                reason: "semantic row cap",
+                cap: SEMANTIC_MAX_ROWS,
+              });
+            }
+            results.semantic = {
+              newFacts,
+              totalSummaries: summaries.length,
+              consumedSummaries: recentSummaries.length,
+              evicted: evicted.length,
+            };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
             results.semantic = { error: msg };
+            if (isSemanticContentFailure(err)) {
+              await recordSemanticFailure(kv, recentSummaries).catch((countErr) =>
+                logger.warn("Could not record the semantic batch failure", {
+                  error: countErr instanceof Error ? countErr.message : String(countErr),
+                }),
+              );
+            }
           }
         } else {
           results.semantic = {
