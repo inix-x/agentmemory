@@ -114,13 +114,35 @@ async function advanceSemanticCursor(kv: StateKV, newest: SessionSummary): Promi
 }
 
 /**
- * Key within KV.config: consecutive failed runs on one batch, keyed to the
+ * Key within KV.config: consecutive content failures on one batch, keyed to the
  * batch's oldest summary. The drain re-selects the same oldest batch until a
  * run succeeds, so a batch the provider always refuses would block every later
  * summary. After SEMANTIC_MAX_BATCH_FAILURES the watermark moves past it.
  */
 const SEMANTIC_FAILED_BATCH_KEY = "consolidation:semanticFailedBatch";
 const SEMANTIC_MAX_BATCH_FAILURES = 3;
+const NO_FACTS_ERROR = "no facts parsed from the merge response";
+// 408/429 are transient; 401/402/403/404 are provider config outages that fail
+// every batch alike. Neither says anything about this batch.
+const NOT_BATCH_SPECIFIC_4XX = new Set([401, 402, 403, 404, 408, 429]);
+
+/**
+ * True when the failure is caused by this batch's content: a reply with no
+ * facts and no closed list (a refusal, prose, or empty reply), or a provider
+ * 4xx that rejects the request itself. Transport failures (network, timeout,
+ * 5xx, an open circuit breaker), provider outages, and KV errors return false
+ * so they neither count toward a skip nor reset the count.
+ */
+function isSemanticContentFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.message === NO_FACTS_ERROR) return true;
+  // Anthropic SDK errors carry a numeric status; the fetch-based providers
+  // put it in the message: "OpenAI API error (400):", "MiniMax API error 400:".
+  const raw = (err as { status?: unknown }).status;
+  const status =
+    typeof raw === "number" ? raw : Number(/API error \(?(\d{3})\)?:/.exec(err.message)?.[1]);
+  return status >= 400 && status < 500 && !NOT_BATCH_SPECIFIC_4XX.has(status);
+}
 
 async function recordSemanticFailure(kv: StateKV, batch: SessionSummary[]): Promise<void> {
   const head = batch[0]!;
@@ -139,7 +161,6 @@ async function recordSemanticFailure(kv: StateKV, batch: SessionSummary[]): Prom
     return;
   }
   await advanceSemanticCursor(kv, batch[batch.length - 1]!);
-  await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY);
   const sessionIds = batch.map((s) => s.sessionId);
   logger.warn("Semantic batch skipped after repeated failed runs", {
     failures: count,
@@ -149,6 +170,8 @@ async function recordSemanticFailure(kv: StateKV, batch: SessionSummary[]): Prom
     resource: "semantic",
     reason: `semantic batch failed ${count} runs in a row`,
   });
+  // Best-effort: the head is now behind the cursor, so a stale count never matches.
+  await kv.delete(KV.config, SEMANTIC_FAILED_BATCH_KEY).catch(() => {});
 }
 
 export const SEMANTIC_MAX_ROWS = 10_000;
@@ -301,7 +324,7 @@ export function registerConsolidationPipelineFunction(
             // truncates would stall the tier on it.
             const closed = /<\/facts>|<facts\s*\/>/.test(response);
             if (parsedFacts === 0 && !closed) {
-              throw new Error("no facts parsed from the merge response");
+              throw new Error(NO_FACTS_ERROR);
             }
             if (!closed) {
               logger.warn("Semantic merge reply has no closing </facts>; kept its complete facts", {
@@ -330,11 +353,13 @@ export function registerConsolidationPipelineFunction(
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
             results.semantic = { error: msg };
-            await recordSemanticFailure(kv, recentSummaries).catch((countErr) =>
-              logger.warn("Could not record the semantic batch failure", {
-                error: countErr instanceof Error ? countErr.message : String(countErr),
-              }),
-            );
+            if (isSemanticContentFailure(err)) {
+              await recordSemanticFailure(kv, recentSummaries).catch((countErr) =>
+                logger.warn("Could not record the semantic batch failure", {
+                  error: countErr instanceof Error ? countErr.message : String(countErr),
+                }),
+              );
+            }
           }
         } else {
           results.semantic = {

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { APIConnectionTimeoutError, APIError } from "@anthropic-ai/sdk";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -584,49 +585,110 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     expect(second.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
   });
 
-  it("skips a batch that fails 3 runs in a row and merges the next one", async () => {
-    const provider = providerWith(
-      vi.fn(async (_system: string, prompt: string) => {
-        if (prompt.includes("Session 44 summary")) throw new Error("content policy refusal");
-        return `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`;
-      }),
-    );
-    await seedSummaries(0, 44);
-    const at = new Date(Date.now() - 50 * 86400000).toISOString();
-    await kv.set("mem:config", "consolidation:semanticWatermark", { at });
-    const firstBatch = Array.from({ length: 20 }, (_, i) => `ses_${44 - i}`);
+  const GOOD_REPLY = `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`;
+  const NO_FACTS = "no facts parsed from the merge response";
+  const ANTHROPIC_400_BODY = {
+    type: "error",
+    error: { type: "invalid_request_error", message: "prompt is too long" },
+  };
 
-    const failed: SemanticResult[] = [];
-    for (let i = 0; i < 3; i++) failed.push((await run()).results.semantic);
-    const next = await run();
+  // Failures caused by the batch itself: these count toward the skip.
+  const contentFailures: Array<[string, () => Promise<string>, string]> = [
+    ["a prose refusal", async () => "I can't help with that request.", NO_FACTS],
+    [
+      "a fetch-provider 400",
+      async () => {
+        throw new Error('OpenAI API error (400): {"error":"context_length_exceeded"}');
+      },
+      'OpenAI API error (400): {"error":"context_length_exceeded"}',
+    ],
+    [
+      "a MiniMax 422",
+      async () => {
+        throw new Error("MiniMax API error 422: invalid params");
+      },
+      "MiniMax API error 422: invalid params",
+    ],
+    [
+      "an Anthropic SDK 400",
+      async () => {
+        throw APIError.generate(400, ANTHROPIC_400_BODY, undefined, new Headers());
+      },
+      `400 ${JSON.stringify(ANTHROPIC_400_BODY)}`,
+    ],
+  ];
 
-    expect(failed.map((r) => r.error)).toEqual(Array(3).fill("content policy refusal"));
-    expect(next.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 20 });
-    const prompts = vi.mocked(provider.summarize).mock.calls.map((c) => c[1] as string);
-    expect(prompts).toHaveLength(4);
-    expect(prompts[3]).toContain("Session 24 summary");
-    expect(prompts[3]).not.toContain("Session 44 summary");
-    const skips = (await kv.list<AuditEntry>(currentAuditScope())).filter(
+  // Failures that say nothing about the batch: these neither count nor reset.
+  const transportFailures: Array<[string, () => Error]> = [
+    ["a network error", () => new TypeError("fetch failed")],
+    ["an SDK connection timeout", () => new APIConnectionTimeoutError()],
+    [
+      "a fetch-provider timeout",
+      () => new Error("OpenAI API request timed out after 60000ms — set OPENAI_TIMEOUT_MS"),
+    ],
+    ["a 408", () => new Error("OpenRouter API error (408): request timeout")],
+    ["an SDK 429", () => APIError.generate(429, {}, "rate limited", new Headers())],
+    ["a 503", () => new Error("MiniMax API error 503: unavailable")],
+    ["an SDK 529", () => APIError.generate(529, {}, "overloaded", new Headers())],
+    ["an open circuit breaker", () => new Error("circuit_breaker_open")],
+    ["a 402 (credits exhausted)", () => new Error("OpenRouter API error (402): insufficient credits")],
+    ["an SDK 401", () => APIError.generate(401, {}, "invalid x-api-key", new Headers())],
+    ["a 403", () => new Error("OpenAI API error (403): forbidden")],
+    ["a 404 (unknown model)", () => new Error("OpenAI API error (404): model not found")],
+  ];
+
+  it.each(contentFailures)(
+    "skips a batch that fails 3 runs in a row on %s and merges the next one",
+    async (_label, fail, message) => {
+      vi.mocked(logger.warn).mockClear();
+      const provider = providerWith(
+        vi.fn(async (_system: string, prompt: string) => {
+          if (prompt.includes("Session 44 summary")) return fail();
+          return GOOD_REPLY;
+        }),
+      );
+      await seedSummaries(0, 44);
+      const at = new Date(Date.now() - 50 * 86400000).toISOString();
+      await kv.set("mem:config", "consolidation:semanticWatermark", { at });
+      const firstBatch = Array.from({ length: 20 }, (_, i) => `ses_${44 - i}`);
+
+      const failed: SemanticResult[] = [];
+      for (let i = 0; i < 3; i++) failed.push((await run()).results.semantic);
+      const next = await run();
+
+      expect(failed.map((r) => r.error)).toEqual(Array(3).fill(message));
+      expect(next.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 20 });
+      const prompts = vi.mocked(provider.summarize).mock.calls.map((c) => c[1] as string);
+      expect(prompts).toHaveLength(4);
+      expect(prompts[3]).toContain("Session 24 summary");
+      expect(prompts[3]).not.toContain("Session 44 summary");
+      const skips = (await kv.list<AuditEntry>(currentAuditScope())).filter(
+        (a) => a.details["reason"] === "semantic batch failed 3 runs in a row",
+      );
+      expect(skips).toHaveLength(1);
+      expect(skips[0]!.targetIds).toEqual(firstBatch);
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+        expect.stringContaining("skipped"),
+        expect.objectContaining({ sessionIds: firstBatch }),
+      );
+    },
+  );
+
+  const failures = () => kv.get("mem:config", "consolidation:semanticFailedBatch");
+  const skipRows = async () =>
+    (await kv.list<AuditEntry>(currentAuditScope())).filter(
       (a) => a.details["reason"] === "semantic batch failed 3 runs in a row",
     );
-    expect(skips).toHaveLength(1);
-    expect(skips[0]!.targetIds).toEqual(firstBatch);
-    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
-      expect.stringContaining("skipped"),
-      expect.objectContaining({ sessionIds: firstBatch }),
-    );
-  });
 
   it("keeps the failure count across failed runs and clears it on a success", async () => {
     providerWith(
       vi
         .fn()
-        .mockRejectedValueOnce(new Error("provider down"))
-        .mockRejectedValueOnce(new Error("provider down"))
-        .mockResolvedValue(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`),
+        .mockResolvedValueOnce("I can't help with that request.")
+        .mockResolvedValueOnce("")
+        .mockResolvedValue(GOOD_REPLY),
     );
     await seedSummaries(0, 5);
-    const failures = () => kv.get("mem:config", "consolidation:semanticFailedBatch");
 
     await run();
     await run();
@@ -635,6 +697,79 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     const good = await run();
     expect(good.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
     expect(await failures()).toBeNull();
+  });
+
+  it.each(transportFailures)(
+    "never skips a batch on %s, however many runs fail",
+    async (_label, makeError) => {
+      const summarize = vi.fn(async () => {
+        throw makeError();
+      });
+      providerWith(summarize);
+      await seedSummaries(0, 5);
+
+      const failed: SemanticResult[] = [];
+      for (let i = 0; i < 4; i++) failed.push((await run()).results.semantic);
+
+      expect(failed.every((r) => typeof r.error === "string")).toBe(true);
+      expect(await failures()).toBeNull();
+      expect(await watermark()).toBeNull();
+      expect(await skipRows()).toHaveLength(0);
+
+      summarize.mockResolvedValue(GOOD_REPLY);
+      const good = await run();
+      expect(good.results.semantic).toMatchObject({ newFacts: 1, consumedSummaries: 6 });
+    },
+  );
+
+  it("counts only content failures when they mix with transport failures", async () => {
+    providerWith(
+      vi
+        .fn()
+        .mockResolvedValueOnce("Sorry, no.")
+        .mockRejectedValueOnce(new Error("MiniMax API error 503: unavailable"))
+        .mockRejectedValueOnce(new Error("OpenAI API error (400): bad request"))
+        .mockRejectedValueOnce(new Error("circuit_breaker_open"))
+        .mockResolvedValueOnce("")
+        .mockResolvedValue(GOOD_REPLY),
+    );
+    await seedSummaries(0, 5);
+
+    for (let i = 0; i < 4; i++) await run();
+    expect(await failures()).toMatchObject({ id: "ses_5", count: 2 });
+    expect(await watermark()).toBeNull();
+    expect(await skipRows()).toHaveLength(0);
+
+    const third = await run();
+    expect(third.results.semantic.error).toBe(NO_FACTS);
+    expect(await watermark()).toMatchObject({ id: "ses_0" });
+    expect(await failures()).toBeNull();
+    expect(await skipRows()).toHaveLength(1);
+  });
+
+  it("writes the skip warn and audit row even when clearing the count fails", async () => {
+    vi.mocked(logger.warn).mockClear();
+    providerWith(vi.fn().mockResolvedValue("Sorry, no."));
+    await seedSummaries(0, 5);
+    const del = kv.delete;
+    kv.delete = (async (scope: string, key: string) => {
+      if (key === "consolidation:semanticFailedBatch") throw new Error("kv unavailable");
+      return del(scope, key);
+    }) as typeof kv.delete;
+
+    for (let i = 0; i < 3; i++) await run();
+
+    expect(await watermark()).toMatchObject({ id: "ses_0" });
+    expect(await skipRows()).toHaveLength(1);
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining("skipped"),
+      expect.objectContaining({ failures: 3 }),
+    );
+    expect(vi.mocked(logger.warn)).not.toHaveBeenCalledWith(
+      "Could not record the semantic batch failure",
+      expect.anything(),
+    );
+    kv.delete = del;
   });
 
   it("fails the tier, sending nothing, when the watermark read errors", async () => {
