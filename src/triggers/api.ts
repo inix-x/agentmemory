@@ -63,6 +63,7 @@ import { registerCompressionApi } from "./compression.js";
 import {
   getFinalizeIdleMs,
   isGraphExtractionEnabled,
+  isGraphWriteEnabled,
   isConsolidationEnabled,
   getConsolidationIntervalMs,
   getConsolidationCooldownMs,
@@ -456,7 +457,7 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
       graph,
       graphIndex,
       graphCompaction: getGraphCompactBootStatus(),
-      graphExtractionEnabled: isGraphExtractionEnabled(),
+      graphExtractionEnabled: isGraphExtractionEnabled() && isGraphWriteEnabled(),
       auditLegacy: auditMigrationState
         ? { status: auditMigrationState.status, sizeBytes: auditMigrationState.legacySizeBytes }
         : null,
@@ -2349,6 +2350,13 @@ export function registerApiTriggers(
     async (req: HttpRequest<{ batchSize?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      // Fork-only: skip the corpus scan when every batch would return skipped.
+      if (!isGraphWriteEnabled()) {
+        return {
+          status_code: 200,
+          body: { success: true, skipped: true, reason: "GRAPH_WRITES_ENABLED is not set", sessions: 0, batches: 0, nodes: 0, edges: 0 },
+        };
+      }
       const batchSize = Math.max(
         1,
         Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
