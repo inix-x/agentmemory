@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 
 vi.mock("../src/logger.js", () => ({
@@ -22,8 +22,11 @@ import {
   isConsolidationEnabled,
   isGraphExtractionEnabled,
   getConsolidationCooldownMs,
+  detectLlmProviderKind,
 } from "../src/config.js";
 import { isReflectEnabled } from "../src/functions/slots.js";
+import { KV } from "../src/state/schema.js";
+import { CONSOLIDATION_MARKER_KEY } from "../src/functions/consolidation-status.js";
 import { logger } from "../src/logger.js";
 
 // event::session::stopped is the single source of truth for consolidation.
@@ -269,31 +272,74 @@ describe("session-stop consolidation debounce", () => {
     vi.mocked(getConsolidationCooldownMs).mockReturnValue(300000);
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // mem::consolidate-pipeline stamps the cooldown marker when a run ENDS. This
+  // stands in for that, so the debounce is testable at the events layer without
+  // running the real pipeline.
+  function stampingSdk(kv: ReturnType<typeof persistentKV>) {
+    const made = mockSdk();
+    made.trigger.mockImplementation(
+      async (input: { function_id: string }) => {
+        if (input.function_id === "mem::consolidate-pipeline") {
+          await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: Date.now() });
+        }
+        if (input.function_id === "mem::summarize") {
+          return { summary: "session summary", sessionId: "ses_1" };
+        }
+        return { ok: true };
+      },
+    );
+    return made;
+  }
+
+  const countOf = (trigger: ReturnType<typeof vi.fn>, id: string) =>
+    trigger.mock.calls.filter(
+      (c) => (c[0] as { function_id: string }).function_id === id,
+    ).length;
+
   it("consolidates at most once across many per-turn stops within the cooldown", async () => {
-    const { sdk, handlers, trigger } = mockSdk();
-    registerEventTriggers(sdk as never, persistentKV() as never);
+    const kv = persistentKV();
+    const { sdk, handlers, trigger } = stampingSdk(kv);
+    registerEventTriggers(sdk as never, kv as never);
     const stopped = handlers.get("event::session::stopped")!;
 
     // 5 per-turn Stop hooks in quick succession (all within the cooldown).
     for (let i = 0; i < 5; i++) await stopped({ sessionId: "ses_1" });
 
-    const count = (id: string) =>
-      trigger.mock.calls.filter(
-        (c) => (c[0] as { function_id: string }).function_id === id,
-      ).length;
-
     // Corpus consolidation runs ONCE, not five times.
-    expect(count("mem::consolidate-pipeline")).toBe(1);
-    expect(count("mem::auto-crystallize")).toBe(1);
+    expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(1);
+    expect(countOf(trigger, "mem::auto-crystallize")).toBe(1);
     // Per-turn summary capture still runs every turn (the cheap path).
-    expect(count("mem::summarize")).toBe(5);
+    expect(countOf(trigger, "mem::summarize")).toBe(5);
   });
 
-  it("consolidates once when stops arrive concurrently (serialized cooldown check)", async () => {
-    // Regression: without serialization, two stops racing through the marker
-    // read-check-write both observe the stale marker and both fire.
+  it("does not stamp the marker itself, so it does not debounce until a run has ended", async () => {
+    // The marker is written by the pipeline at run END, so before any run
+    // finishes every stop passes the cooldown read and dispatches. That is not
+    // five consolidations: the pipeline's own in-flight exclusion turns the
+    // extras away (covered in consolidation-exclusion.test.ts).
+    const kv = persistentKV();
     const { sdk, handlers, trigger } = mockSdk();
-    registerEventTriggers(sdk as never, persistentKV() as never);
+    registerEventTriggers(sdk as never, kv as never);
+    const stopped = handlers.get("event::session::stopped")!;
+
+    for (let i = 0; i < 5; i++) await stopped({ sessionId: "ses_1" });
+
+    expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(5);
+    expect(kv.set).not.toHaveBeenCalledWith(KV.config, CONSOLIDATION_MARKER_KEY, expect.anything());
+  });
+
+  it("debounces concurrent stops against the marker a finished run wrote", async () => {
+    // The check is a pure read, so concurrent stops all read the same marker
+    // and all agree about it. Collapsing simultaneous stops into one run is the
+    // pipeline exclusion's job, covered in consolidation-exclusion.test.ts.
+    const kv = persistentKV();
+    await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: Date.now() });
+    const { sdk, handlers, trigger } = mockSdk();
+    registerEventTriggers(sdk as never, kv as never);
     const stopped = handlers.get("event::session::stopped")!;
 
     await Promise.all([
@@ -302,10 +348,142 @@ describe("session-stop consolidation debounce", () => {
       stopped({ sessionId: "ses_3" }),
     ]);
 
-    const consolidateCount = trigger.mock.calls.filter(
-      (c) => (c[0] as { function_id: string }).function_id === "mem::consolidate-pipeline",
-    ).length;
-    expect(consolidateCount).toBe(1);
+    expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(0);
+    // The cheap per-turn path is untouched by the debounce.
+    expect(countOf(trigger, "mem::summarize")).toBe(3);
+  });
+
+  it("measures the cooldown from the end of a run that outlived it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const runStart = 10_000_000;
+    const runEnd = runStart + 600_000; // twice the 300,000 ms cooldown
+    const kv = persistentKV();
+    // The pipeline stamps the marker when the long run ends.
+    await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: runEnd });
+    const { sdk, handlers, trigger } = mockSdk();
+    registerEventTriggers(sdk as never, kv as never);
+    const stopped = handlers.get("event::session::stopped")!;
+
+    // One ms short of run end plus cooldown: still debounced, even though the
+    // run STARTED well over a cooldown ago.
+    vi.setSystemTime(runEnd + 300_000 - 1);
+    await stopped({ sessionId: "ses_1" });
+    expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(0);
+
+    vi.setSystemTime(runEnd + 300_000);
+    await stopped({ sessionId: "ses_1" });
+    expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(1);
+  });
+
+  describe("auto-crystallize keeps its own check-time cooldown", () => {
+    it("dispatches auto-crystallize once for several stops inside one pipeline run", async () => {
+      // No run has ended yet, so the pipeline's run-end marker is unset and
+      // every stop dispatches the pipeline (its exclusion turns the extras
+      // away). auto-crystallize only refuses OVERLAPPING runs, so a stop after
+      // one finished would start another; its own check-time marker keeps it
+      // to one dispatch per cooldown.
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      for (let i = 0; i < 4; i++) await stopped({ sessionId: `ses_${i}` });
+
+      expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(4);
+      expect(countOf(trigger, "mem::auto-crystallize")).toBe(1);
+    });
+
+    it("dispatches auto-crystallize once for concurrent stops", async () => {
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      await Promise.all([
+        stopped({ sessionId: "ses_1" }),
+        stopped({ sessionId: "ses_2" }),
+        stopped({ sessionId: "ses_3" }),
+      ]);
+
+      expect(countOf(trigger, "mem::auto-crystallize")).toBe(1);
+    });
+
+    it("dispatches auto-crystallize again once its own cooldown has passed", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(30_000_000);
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      await stopped({ sessionId: "ses_1" });
+      vi.setSystemTime(30_000_000 + 300_000 - 1);
+      await stopped({ sessionId: "ses_2" });
+      expect(countOf(trigger, "mem::auto-crystallize")).toBe(1);
+
+      vi.setSystemTime(30_000_000 + 300_000);
+      await stopped({ sessionId: "ses_3" });
+      expect(countOf(trigger, "mem::auto-crystallize")).toBe(2);
+    });
+  });
+
+  describe("skill-extract keeps its own check-time cooldown", () => {
+    beforeEach(() => {
+      vi.mocked(detectLlmProviderKind).mockReturnValue("llm");
+    });
+    afterEach(() => {
+      vi.mocked(detectLlmProviderKind).mockReturnValue("noop");
+    });
+
+    it("fires skill-extract once for two stops inside one run window", async () => {
+      // No run has ended yet, so the pipeline's run-end marker is unset and
+      // both stops dispatch the pipeline (its exclusion turns the second away).
+      // skill-extract has no exclusion of its own, so it keeps the check-time
+      // marker the shared fan-out used to have: one LLM call per cooldown.
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      await stopped({ sessionId: "ses_1" });
+      await stopped({ sessionId: "ses_2" });
+
+      expect(countOf(trigger, "mem::consolidate-pipeline")).toBe(2);
+      expect(countOf(trigger, "mem::skill-extract")).toBe(1);
+    });
+
+    it("fires skill-extract once for concurrent stops", async () => {
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      await Promise.all([
+        stopped({ sessionId: "ses_1" }),
+        stopped({ sessionId: "ses_2" }),
+        stopped({ sessionId: "ses_3" }),
+      ]);
+
+      expect(countOf(trigger, "mem::skill-extract")).toBe(1);
+    });
+
+    it("fires skill-extract again once its own cooldown has passed", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(20_000_000);
+      const kv = persistentKV();
+      const { sdk, handlers, trigger } = mockSdk();
+      registerEventTriggers(sdk as never, kv as never);
+      const stopped = handlers.get("event::session::stopped")!;
+
+      await stopped({ sessionId: "ses_1" });
+      vi.setSystemTime(20_000_000 + 300_000 - 1);
+      await stopped({ sessionId: "ses_2" });
+      expect(countOf(trigger, "mem::skill-extract")).toBe(1);
+
+      vi.setSystemTime(20_000_000 + 300_000);
+      await stopped({ sessionId: "ses_3" });
+      expect(countOf(trigger, "mem::skill-extract")).toBe(2);
+    });
   });
 
   it("consolidates on every stop when the cooldown is disabled (0)", async () => {
