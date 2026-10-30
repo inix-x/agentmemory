@@ -146,85 +146,109 @@ export function registerCrystallizeFunction(
     },
   );
 
+  // mem::auto-crystallize fires on the same Stop-hook trigger as the
+  // consolidation pipeline and on eviction's stale-session recovery, and reads
+  // mem:actions whole on the single worker that also serves hook ingest and
+  // recall. Unguarded, overlapping runs pile up on that worker, one whole-scope
+  // read each. One in-process flag, released in a finally, keeps it to one run.
+  //
+  // A dry run is not exempt: it skips the LLM pass but still pays the
+  // whole-scope read, which is the cost being bounded.
+  let autoCrystallizeInFlight = false;
+
   sdk.registerFunction("mem::auto-crystallize", 
     async (data: {
       olderThanDays?: number;
       project?: string;
       dryRun?: boolean;
     }) => {
-      const olderThanDays = data.olderThanDays ?? 7;
-      const dryRun = data.dryRun ?? false;
-      const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
-
-      let allActions = await kv.list<Action>(KV.actions);
-
-      allActions = allActions.filter(
-        (a) =>
-          a.status === "done" &&
-          !a.crystallizedInto &&
-          new Date(a.createdAt).getTime() < cutoff,
-      );
-
-      if (data.project) {
-        allActions = allActions.filter((a) => a.project === data.project);
-      }
-
-      if (allActions.length === 0) {
-        return { success: true, groupCount: 0, crystalIds: [] };
-      }
-
-      const groups = new Map<string, Action[]>();
-      for (const action of allActions) {
-        const key = action.parentId ?? action.project ?? "_ungrouped";
-        const group = groups.get(key);
-        if (group) {
-          group.push(action);
-        } else {
-          groups.set(key, [action]);
-        }
-      }
-
-      if (dryRun) {
-        const groupSummaries = Array.from(groups.entries()).map(
-          ([key, actions]) => ({
-            groupKey: key,
-            actionCount: actions.length,
-            actionIds: actions.map((a) => a.id),
-          }),
-        );
+      if (autoCrystallizeInFlight) {
         return {
           success: true,
-          dryRun: true,
-          groupCount: groups.size,
-          groups: groupSummaries,
+          skipped: true,
+          reason: "An auto-crystallize run is already in flight",
+          groupCount: 0,
           crystalIds: [],
         };
       }
+      autoCrystallizeInFlight = true;
+      try {
+        const olderThanDays = data.olderThanDays ?? 7;
+        const dryRun = data.dryRun ?? false;
+        const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
 
-      const crystalIds: string[] = [];
-      for (const [, groupActions] of groups) {
-        const actionIds = groupActions.map((a) => a.id);
-        const project = groupActions[0].project;
+        let allActions = await kv.list<Action>(KV.actions);
 
-        try {
-          const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
-            actionIds,
-            project,
-          } })) as { success: boolean; crystal?: Crystal };
+        allActions = allActions.filter(
+          (a) =>
+            a.status === "done" &&
+            !a.crystallizedInto &&
+            new Date(a.createdAt).getTime() < cutoff,
+        );
 
-          if (result.success && result.crystal) {
-            crystalIds.push(result.crystal.id);
-          }
-        } catch {
-          continue;
+        if (data.project) {
+          allActions = allActions.filter((a) => a.project === data.project);
         }
-      }
 
-      return {
-        success: true,
-        groupCount: groups.size,
-        crystalIds,
-      };
+        if (allActions.length === 0) {
+          return { success: true, groupCount: 0, crystalIds: [] };
+        }
+
+        const groups = new Map<string, Action[]>();
+        for (const action of allActions) {
+          const key = action.parentId ?? action.project ?? "_ungrouped";
+          const group = groups.get(key);
+          if (group) {
+            group.push(action);
+          } else {
+            groups.set(key, [action]);
+          }
+        }
+
+        if (dryRun) {
+          const groupSummaries = Array.from(groups.entries()).map(
+            ([key, actions]) => ({
+              groupKey: key,
+              actionCount: actions.length,
+              actionIds: actions.map((a) => a.id),
+            }),
+          );
+          return {
+            success: true,
+            dryRun: true,
+            groupCount: groups.size,
+            groups: groupSummaries,
+            crystalIds: [],
+          };
+        }
+
+        const crystalIds: string[] = [];
+        for (const [, groupActions] of groups) {
+          const actionIds = groupActions.map((a) => a.id);
+          const project = groupActions[0].project;
+
+          try {
+            const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
+              actionIds,
+              project,
+            } })) as { success: boolean; crystal?: Crystal };
+
+            if (result.success && result.crystal) {
+              crystalIds.push(result.crystal.id);
+            }
+          } catch {
+            continue;
+          }
+        }
+
+        return {
+          success: true,
+          groupCount: groups.size,
+          crystalIds,
+        };
+      } finally {
+        autoCrystallizeInFlight = false;
+      }
     },
   );
 }
