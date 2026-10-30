@@ -529,14 +529,35 @@ describe("mem::evict memory cleanup", () => {
     });
   });
 
-  it("still writes the session row when the memory pass throws", async () => {
+  it("records every committed delete when the image-ref release after it throws", async () => {
     const kv = mockKV(new Map());
     const { sdk } = mockSdk();
     await kv.set(KV.sessions, "ses_stale", makeSession("ses_stale"));
+    const live = { ...makeSession("ses_live"), project: "p2" };
+    await kv.set(KV.sessions, live.id, live);
+    await kv.set(KV.summaries, live.id, { sessionId: live.id });
+    await kv.set(KV.config, "eviction", { maxObservationsPerProject: 1 });
+    // Distinct imageData and imageRef on each row reach both release calls per site.
+    const row = (id: string, ageDays: number, importance: number) => ({
+      ...makeObservation(live.id),
+      id,
+      timestamp: daysAgo(ageDays),
+      importance,
+      imageData: `${id}-data.png`,
+      imageRef: `${id}-ref.png`,
+    });
+    await kv.set(KV.observations(live.id), "obs_low", row("obs_low", 100, 1));
+    await kv.set(KV.observations(live.id), "obs_cap", row("obs_cap", 1, 5));
+    await kv.set(KV.observations(live.id), "obs_keep", { ...row("obs_keep", 1, 9), imageData: undefined, imageRef: undefined });
     await kv.set(
       KV.memories,
       "mem_expired",
-      makeEvictMemory({ id: "mem_expired", forgetAfter: daysAgo(1), imageRef: "img.png" }),
+      makeEvictMemory({ id: "mem_expired", forgetAfter: daysAgo(1), imageRef: "exp.png" }),
+    );
+    await kv.set(
+      KV.memories,
+      "mem_old",
+      makeEvictMemory({ id: "mem_old", createdAt: daysAgo(120), isLatest: false, imageRef: "old.png" }),
     );
     const realDelete = kv.delete;
     kv.delete = async (scope, key) => {
@@ -545,11 +566,24 @@ describe("mem::evict memory cleanup", () => {
     };
 
     registerEvictStubs(sdk, kv);
-    await expect(sdk.trigger({ function_id: "mem::evict", payload: {} })).rejects.toThrow("engine timeout");
+    const result = (await sdk.trigger({ function_id: "mem::evict", payload: {} })) as Record<string, number>;
 
+    expect(result).toMatchObject({
+      staleSessions: 1,
+      lowImportanceObs: 1,
+      capEvictions: 1,
+      expiredMemories: 1,
+      nonLatestMemories: 1,
+    });
+    expect(await kv.get(KV.memories, "mem_expired")).toBeNull();
+    expect(await kv.get(KV.memories, "mem_old")).toBeNull();
     const audits = await kv.list<{ targetIds: string[]; details: { resource: string } }>(currentAuditScope());
-    expect(audits.map((a) => a.details.resource)).toEqual(["session"]);
-    expect(audits[0].targetIds).toEqual(["ses_stale"]);
+    const byResource = Object.fromEntries(audits.map((a) => [a.details.resource, a.targetIds]));
+    expect(byResource).toEqual({
+      session: ["ses_stale"],
+      observation: ["obs_low", "obs_cap"],
+      memory: ["mem_expired", "mem_old"],
+    });
   });
 
   it("keeps facets in dryRun", async () => {

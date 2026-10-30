@@ -12,6 +12,7 @@ import {
   getObsRetentionMaxImportance,
   getObsRetentionMaxPerRun,
 } from "../src/config.js";
+import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Memory, Session } from "../src/types.js";
 import { currentAuditScope, mockKV, mockSdk } from "./helpers/mocks.js";
 
@@ -218,6 +219,17 @@ describe("observation retention under env thresholds", () => {
     expect(await kv.get("mem:obs:s", "unscored")).not.toBeNull();
   });
 
+  it("keeps a row stored with a null importance", async () => {
+    process.env["AGENTMEMORY_OBS_RETENTION_MAX_IMPORTANCE"] = "5";
+    await seed(session("s", { updatedAt: daysAgo(40) }), [
+      obs("scored", "s", 40, 5),
+      { ...obs("nulled", "s", 40, 5), importance: null as unknown as number },
+    ]);
+
+    expect((await run()).lowValueObs).toEqual(["scored"]);
+    expect(await kv.get("mem:obs:s", "nulled")).not.toBeNull();
+  });
+
   it("stops at the per-run cap and reports the remainder", async () => {
     process.env["AGENTMEMORY_OBS_RETENTION_MAX_PER_RUN"] = "2";
     await seed(session("s", { updatedAt: daysAgo(40) }), [
@@ -267,6 +279,24 @@ describe("observation retention under env thresholds", () => {
     expect((await audits())[0]!.targetIds).toEqual(["ok"]);
   });
 
+  it("records a committed delete when the image-ref release after it throws", async () => {
+    await seed(session("s", { updatedAt: daysAgo(40) }), [
+      { ...obs("img", "s", 40, 1), imageData: "img-data.png", imageRef: "img-ref.png" },
+      obs("plain", "s", 40, 1),
+    ]);
+    const realDelete = kv.delete;
+    kv.delete = async (scope, key) => {
+      if (scope === KV.imageEmbeddings) throw new Error("engine timeout");
+      return realDelete(scope, key);
+    };
+
+    const result = await run();
+
+    expect(result.lowValueObs.sort()).toEqual(["img", "plain"]);
+    expect(await kv.get("mem:obs:s", "img")).toBeNull();
+    expect((await audits())[0]!.targetIds.sort()).toEqual(["img", "plain"]);
+  });
+
   it("dry run reports counts and deletes nothing from store, index, or audit log", async () => {
     await seed(session("s", { updatedAt: daysAgo(40) }), [obs("stale", "s", 40, 1)]);
 
@@ -311,6 +341,22 @@ describe("auto-forget audit rows", () => {
     expect(low.details).toMatchObject({
       resource: "observation",
       byReason: { "auto-forget low-value observation": 2 },
+    });
+  });
+
+  it("lists a memory demoted by two similar pairs once", async () => {
+    for (const [id, month] of [["dup_a", "01"], ["dup_b", "02"], ["dup_c", "03"]]) {
+      await kv.set("mem:memories", id, memory(id, { createdAt: `2026-${month}-01T00:00:00Z` }));
+    }
+
+    expect((await run()).contradictions).toHaveLength(3);
+
+    const rows = await audits();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.targetIds.sort()).toEqual(["dup_a", "dup_b"]);
+    expect(rows[0]!.details).toMatchObject({
+      demoted: 2,
+      byReason: { "auto-forget contradiction": 2 },
     });
   });
 
