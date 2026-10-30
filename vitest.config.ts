@@ -16,6 +16,10 @@ export default defineConfig({
     env: {
       HOME: testHome,
       USERPROFILE: testHome,
+      // Fork default is graph writes off; the upstream graph tests exercise
+      // extraction, so they run with writes on. test/graph-write-gate.test.ts
+      // covers the off path.
+      GRAPH_WRITES_ENABLED: "true",
     },
   },
 });
