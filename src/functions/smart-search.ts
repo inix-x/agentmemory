@@ -411,14 +411,6 @@ async function findObservation(
       return { observation: found, layer: "observation" };
     }
   }
-  // An index hit with no row in any session is a ghost: the observation was
-  // deleted but the index still carries it. Retention removes rows and index
-  // entries together, so this firing after a retention run means a removal missed.
-  logger.warn("smart-search: index hit has no observation in any session", {
-    obsId,
-    sessionIdHint: sessionIdHint ?? null,
-    sessionsProbed: sessions.length,
-  });
   return null;
 }
 

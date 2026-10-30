@@ -127,7 +127,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
         }
       }
 
-      const demotedIds: string[] = [];
+      const demotedIds = new Set<string>();
       const compared = new Set<string>();
       for (const [, memIds] of conceptIndex) {
         for (let i = 0; i < memIds.length; i++) {
@@ -167,19 +167,19 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
                     : memB;
                 older.isLatest = false;
                 await kv.set(KV.memories, older.id, older);
-                demotedIds.push(older.id);
+                demotedIds.add(older.id);
               }
             }
           }
         }
       }
 
-      if (demotedIds.length > 0) {
-        await recordAudit(kv, "forget", "mem::auto-forget", demotedIds, {
+      if (demotedIds.size > 0) {
+        await recordAudit(kv, "forget", "mem::auto-forget", [...demotedIds], {
           resource: "memory",
           reason: "auto-forget contradiction",
-          demoted: demotedIds.length,
-          byReason: { "auto-forget contradiction": demotedIds.length },
+          demoted: demotedIds.size,
+          byReason: { "auto-forget contradiction": demotedIds.size },
         });
       }
 
@@ -204,7 +204,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
       const isLowValue = (o: CompressedObservation | null): o is CompressedObservation =>
         !!o?.timestamp &&
         new Date(o.timestamp).getTime() < cutoff &&
-        o.importance !== undefined &&
+        typeof o.importance === "number" &&
         o.importance <= maxImportance;
       const deletedObs: string[] = [];
       for (let i = 0; i < sessions.length; i++) {
@@ -235,9 +235,14 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
               }
               if (removed) {
                 await unindexObservationSession(kv, obs.id).catch(() => {});
-                if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData);
+                // The row is already deleted, so a failed release must not drop its audit entry.
+                const releaseFailed = (err: unknown) =>
+                  logger.warn("Auto-forget image ref release failed", {
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData).catch(releaseFailed);
                 if (removed.imageRef && removed.imageRef !== removed.imageData) {
-                  await decrementImageRef(kv, sdk, removed.imageRef);
+                  await decrementImageRef(kv, sdk, removed.imageRef).catch(releaseFailed);
                 }
                 deletedObs.push(obs.id);
               }
