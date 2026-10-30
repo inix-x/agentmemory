@@ -4,6 +4,7 @@ import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { emitLiveEvent } from "../viewer/live-events.js";
 import { isReflectEnabled } from "../functions/slots.js";
+import { CONSOLIDATION_MARKER_KEY } from "../functions/consolidation-status.js";
 import {
   detectLlmProviderKind,
   getAgentId,
@@ -15,33 +16,61 @@ import { logger } from "../logger.js";
 import { getSummaryTriggerTimeoutMs } from "../functions/summary-state.js";
 import { noteMemoryChange, noteSessionChange } from "../state/viewer-counts.js";
 
-// Global marker recording when corpus consolidation last ran, used to debounce
-// the per-turn session-stop fan-out.
-const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
+// Keys within KV.config recording when the session-stop fan-out last
+// dispatched mem::auto-crystallize and mem::skill-extract. Unlike the
+// pipeline's run-end marker, these are stamped at check time. Neither job is
+// spaced by the pipeline's run, and skill-extract has no in-flight exclusion at
+// all, so the check-time stamp is what bounds each to one dispatch per cooldown.
+const AUTO_CRYSTALLIZE_MARKER_KEY = "autoCrystallize:lastDispatch";
+const SKILL_EXTRACT_MARKER_KEY = "skillExtract:lastDispatch";
 
-async function consolidationDueUnserialized(kv: StateKV): Promise<boolean> {
+async function cooldownPassed(
+  kv: StateKV,
+  key: string,
+  stampOnPass: boolean,
+): Promise<boolean> {
   const cooldownMs = getConsolidationCooldownMs();
   if (cooldownMs <= 0) return true; // debounce disabled
   const now = Date.now();
   const marker = await kv
-    .get<{ at?: number }>(KV.config, CONSOLIDATION_MARKER_KEY)
+    .get<{ at?: number }>(KV.config, key)
     .catch(() => null);
   const lastAt = typeof marker?.at === "number" ? marker.at : 0;
   if (now - lastAt < cooldownMs) return false;
-  await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: now }).catch(() => {});
+  if (stampOnPass) await kv.set(KV.config, key, { at: now }).catch(() => {});
   return true;
 }
 
-// Concurrent session-stop events would otherwise interleave the marker
-// read-check-write above and both pass the cooldown. Serialize the whole
-// check through an in-process chain so exactly one concurrent caller wins.
-let consolidationCheckChain: Promise<unknown> = Promise.resolve();
+// The consolidation check is a pure read: mem::consolidate-pipeline stamps
+// CONSOLIDATION_MARKER_KEY when a run ENDS, so the cooldown measures the gap
+// after a run rather than between two checks. Concurrent stops therefore all
+// read the same value and all agree, and it is the pipeline's own in-flight
+// exclusion that collapses them into one run.
+//
+// The auto-crystallize and skill-extract checks are still read-check-writes, so
+// all three checks run in one step of an in-process chain: concurrent stops
+// must not interleave them.
+let fanOutCheckChain: Promise<unknown> = Promise.resolve();
 
-function consolidationDue(kv: StateKV): Promise<boolean> {
-  const result = consolidationCheckChain.then(() =>
-    consolidationDueUnserialized(kv),
-  );
-  consolidationCheckChain = result.catch(() => false);
+function fanOutDue(
+  kv: StateKV,
+  checkSkillExtract: boolean,
+): Promise<{
+  consolidate: boolean;
+  autoCrystallize: boolean;
+  skillExtract: boolean;
+}> {
+  // The consolidation read goes last, so the time between it and the dispatch
+  // holds no other KV round trip in which a run could end and stamp.
+  const result = fanOutCheckChain.then(async () => {
+    const autoCrystallize = await cooldownPassed(kv, AUTO_CRYSTALLIZE_MARKER_KEY, true);
+    const skillExtract =
+      checkSkillExtract &&
+      (await cooldownPassed(kv, SKILL_EXTRACT_MARKER_KEY, true));
+    const consolidate = await cooldownPassed(kv, CONSOLIDATION_MARKER_KEY, false);
+    return { consolidate, autoCrystallize, skillExtract };
+  });
+  fanOutCheckChain = result.catch(() => undefined);
   return result;
 }
 
@@ -97,12 +126,15 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
     // firing them every turn is a cost/latency storm for connected agents.
     // Bound the global corpus consolidation to once per cooldown window.
     if (isConsolidationEnabled() && !data.skipConsolidation) {
-      if (await consolidationDue(kv)) {
+      const due = await fanOutDue(kv, detectLlmProviderKind() === "llm");
+      if (due.consolidate) {
         fireVoid("mem::consolidate-pipeline", { tier: "all", force: true });
+      }
+      if (due.autoCrystallize) {
         fireVoid("mem::auto-crystallize", { olderThanDays: 0 });
-        if (detectLlmProviderKind() === "llm") {
-          fireVoid("mem::skill-extract", { sessionId: data.sessionId });
-        }
+      }
+      if (due.skillExtract) {
+        fireVoid("mem::skill-extract", { sessionId: data.sessionId });
       }
     }
     return summary;

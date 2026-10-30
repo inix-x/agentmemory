@@ -1,4 +1,10 @@
 export const CONSOLIDATION_LAST_RUN_KEY = "consolidation:lastPipelineRun";
+// Key within KV.config recording when a consolidation run last ENDED, as
+// { at: epoch ms }. mem::consolidate-pipeline writes it when any run ends,
+// including a run that throws, and the session-stop trigger reads it as the
+// cooldown. Lives in this import-free module so the trigger module can read it
+// without pulling in the pipeline's dependency graph.
+export const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
 export const SEMANTIC_MIN_SUMMARIES = 5;
 export const PROCEDURAL_MIN_PATTERNS = 2;
 export const PROCEDURAL_MIN_SESSIONS_PER_PATTERN = 2;
