@@ -36,6 +36,7 @@ async function rig() {
   const store = new Map<string, Map<string, unknown>>();
   const handlers = new Map<string, (data: any) => Promise<any>>();
   const writes: string[] = [];
+  const lists: string[] = [];
   const rows = (scope: string) => {
     if (!store.has(scope)) store.set(scope, new Map());
     return store.get(scope)!;
@@ -48,6 +49,7 @@ async function rig() {
       if (id.startsWith("state::")) {
         const { scope, key } = payload;
         if (id !== "state::get" && id !== "state::list") writes.push(scope);
+        if (id === "state::list") lists.push(scope);
         if (id === "state::get") return structuredClone(rows(scope).get(key) ?? null);
         if (id === "state::list") return structuredClone([...rows(scope).values()]);
         if (id === "state::delete") { rows(scope).delete(key); return; }
@@ -75,9 +77,11 @@ async function rig() {
     await kv.set(KV.observations(SID), o.id, o);
   }
   writes.length = 0;
+  lists.length = 0;
   return {
     call: (id: string, data: unknown) => handlers.get(id)!(data),
     graphWrites: () => writes.filter((s) => s.startsWith("mem:graph")),
+    listedScopes: () => lists,
     session: () => store.get(KV.sessions)!.get(SID) as Record<string, unknown>,
   };
 }
@@ -116,12 +120,21 @@ describe.each([
     expect(r.graphWrites()).toEqual([]);
   });
 
-  it("POST /graph/build adds nothing and writes nothing", async () => {
+  it("POST /graph/build returns the skipped result without scanning or writing", async () => {
     vi.stubEnv("GRAPH_WRITES_ENABLED", value);
     const r = await rig();
     const res = await r.call("api::graph-build", { headers: auth, body: {} });
     expect(res.status_code).toBe(200);
-    expect(res.body).toMatchObject({ success: true, batches: 1, nodes: 0, edges: 0 });
+    expect(res.body).toEqual({
+      success: true,
+      skipped: true,
+      reason: "GRAPH_WRITES_ENABLED is not set",
+      sessions: 0,
+      batches: 0,
+      nodes: 0,
+      edges: 0,
+    });
+    expect(r.listedScopes()).toEqual([]);
     expect(r.graphWrites()).toEqual([]);
   });
 });

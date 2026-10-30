@@ -4156,7 +4156,8 @@
       renderGraphOverview();
       try {
         var result = await apiPost('graph/build', {});
-        g.rebuildResult = result && result.success
+        g.rebuildResult = result && result.skipped ? 'Rebuild skipped: ' + result.reason + '.'
+          : result && result.success
           ? 'Rebuilt from ' + (result.sessions || 0) + ' sessions: ' + (result.nodes || 0) + ' nodes and ' + (result.edges || 0) + ' relations extracted. New ones arrive on the SSE feed.'
           : 'The rebuild failed. Check the server log.';
       } finally {
