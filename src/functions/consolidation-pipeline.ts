@@ -78,6 +78,38 @@ async function decayAndWriteChanged<
   return { scanned: items.length, written: dirty.length };
 }
 
+/** Key within KV.config: createdAt of the newest summary the semantic tier consumed. */
+const SEMANTIC_WATERMARK_KEY = "consolidation:semanticWatermark";
+
+export const SEMANTIC_MAX_ROWS = 10_000;
+
+/**
+ * Deletes the weakest rows past SEMANTIC_MAX_ROWS: never-reinforced facts
+ * first, least recently accessed first among those, lower strength on a tie.
+ * Reinforced facts outlive one-off extractions however old they are, and a new
+ * fact goes only after every older one-off. Nothing else deletes semantic rows,
+ * so without a bound the scope grows on every merge.
+ */
+async function evictPastCap(
+  kv: StateKV,
+  rows: SemanticMemory[],
+): Promise<string[]> {
+  if (rows.length <= SEMANTIC_MAX_ROWS) return [];
+  const weakestFirst = [...rows].sort(
+    (a, b) =>
+      a.accessCount - b.accessCount ||
+      (a.lastAccessedAt ?? "").localeCompare(b.lastAccessedAt ?? "") ||
+      a.strength - b.strength,
+  );
+  const evicted = weakestFirst
+    .slice(0, rows.length - SEMANTIC_MAX_ROWS)
+    .map((row) => row.id);
+  for (const id of evicted) {
+    await kv.delete(KV.semantic, id);
+  }
+  return evicted;
+}
+
 export function registerConsolidationPipelineFunction(
   sdk: IIIClient,
   kv: StateKV,
@@ -96,15 +128,31 @@ export function registerConsolidationPipelineFunction(
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
 
-        if (summaries.length >= 5) {
-          const recentSummaries = summaries
-            .sort(
-              (a, b) =>
-                new Date(b.createdAt).getTime() -
-                new Date(a.createdAt).getTime(),
-            )
-            .slice(0, 20);
+        // Only summaries written since the last successful semantic run. Re-sending
+        // the same newest 20 every run let each rewording of a known fact past the
+        // exact-text dedupe below. A re-summarized session gets a fresh createdAt,
+        // so it is merged again.
+        const watermark = await kv
+          .get<{ at?: string }>(KV.config, SEMANTIC_WATERMARK_KEY)
+          .catch(() => null);
+        const consumedThrough = watermark?.at
+          ? new Date(watermark.at).getTime()
+          : -Infinity;
+        const recentSummaries = summaries
+          .filter((s) => new Date(s.createdAt).getTime() > consumedThrough)
+          .sort(
+            (a, b) =>
+              new Date(b.createdAt).getTime() -
+              new Date(a.createdAt).getTime(),
+          )
+          .slice(0, 20);
 
+        if (summaries.length >= 5 && recentSummaries.length === 0) {
+          results.semantic = {
+            skipped: true,
+            reason: "no summaries since the last semantic run",
+          };
+        } else if (summaries.length >= 5) {
           const prompt = buildSemanticMergePrompt(
             recentSummaries.map((s) => ({
               title: s.title,
@@ -122,9 +170,11 @@ export function registerConsolidationPipelineFunction(
             const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
             let match;
             let newFacts = 0;
+            let parsedFacts = 0;
             const now = new Date().toISOString();
 
             while ((match = factRegex.exec(response)) !== null) {
+              parsedFacts++;
               const parsedConf = parseFloat(match[1]);
               const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
               const fact = match[2].trim();
@@ -153,9 +203,32 @@ export function registerConsolidationPipelineFunction(
                 };
                 await kv.set(KV.semantic, sem.id, sem);
                 newFacts++;
+                existingSemantic.push(sem);
               }
             }
-            results.semantic = { newFacts, totalSummaries: summaries.length };
+            // An empty or tag-free reply is a failed merge, so the watermark stays
+            // and the next run retries these summaries. A well-formed <facts></facts>
+            // is a merge that found nothing, which the prompt allows.
+            if (parsedFacts === 0 && !/<facts[\s>]/.test(response)) {
+              throw new Error("no facts parsed from the merge response");
+            }
+            await kv.set(KV.config, SEMANTIC_WATERMARK_KEY, {
+              at: recentSummaries[0]!.createdAt,
+            });
+            const evicted = await evictPastCap(kv, existingSemantic);
+            if (evicted.length > 0) {
+              await recordAudit(kv, "delete", "mem::consolidate-pipeline", evicted, {
+                resource: "semantic",
+                reason: "semantic row cap",
+                cap: SEMANTIC_MAX_ROWS,
+              });
+            }
+            results.semantic = {
+              newFacts,
+              totalSummaries: summaries.length,
+              consumedSummaries: recentSummaries.length,
+              evicted: evicted.length,
+            };
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
