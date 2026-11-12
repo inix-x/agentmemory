@@ -1,6 +1,7 @@
 import { getGraphIndexStatus } from "../state/graph-retrieval-index.js";
 import { queryGraphIndex } from "./graph-index-query.js";
 import { isLegacyGraphState, pinGraphState, resetGraphGeneration } from "../state/graph-generation.js";
+import { MAX_SNAPSHOT_EDGES } from "../state/graph-ingestion.js";
 import type { IIIClient } from "iii-sdk";
 import type {
   GraphNode,
@@ -237,9 +238,21 @@ function snapshotPushEdgeIfBothInTop(
   const topIds = new Set(snap.topNodes.map((n) => n.id));
   if (topIds.has(edge.sourceNodeId) && topIds.has(edge.targetNodeId)) {
     // Dedupe in case the same edge gets pushed twice.
-    if (!snap.topEdges.find((e) => e.id === edge.id)) {
-      snap.topEdges.push(edge);
+    if (snap.topEdges.find((e) => e.id === edge.id)) return;
+    // topNodes is capped and evicted; topEdges needs the same bound or the
+    // snapshot, which every graph write reads and rewrites in full and hands
+    // whole to the graph-snapshot-changed state trigger, grows with every
+    // edge between two top nodes. When full, evict the lowest-weight edge only
+    // if the incoming one beats it; otherwise the new edge is not cached.
+    if (snap.topEdges.length >= MAX_SNAPSHOT_EDGES) {
+      let minIdx = 0;
+      for (let i = 1; i < snap.topEdges.length; i++) {
+        if ((snap.topEdges[i]!.weight ?? 0) < (snap.topEdges[minIdx]!.weight ?? 0)) minIdx = i;
+      }
+      if ((snap.topEdges[minIdx]!.weight ?? 0) >= (edge.weight ?? 0)) return;
+      snap.topEdges.splice(minIdx, 1);
     }
+    snap.topEdges.push(edge);
   }
 }
 
