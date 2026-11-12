@@ -17,6 +17,7 @@ describe("generated REST endpoint methods", () => {
     const rows = collectRestEndpointsInDirectory(fileURLToPath(new URL("../src/triggers", import.meta.url)));
     expect(rows).toHaveLength(147);
     expect(rows).toEqual(expect.arrayContaining([
+      { path: "/agentmemory/diagnostics/store", method: "GET" },
       { path: "/agentmemory/viewer/events", method: "GET" },
       { path: "/agentmemory/viewer/snapshot", method: "GET" },
       { path: "/agentmemory/counts", method: "GET" },
