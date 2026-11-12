@@ -116,6 +116,15 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
     async (data: { dryRun?: boolean }): Promise<EvictionStats> => {
       const dryRun = data?.dryRun ?? false;
       const { decrementImageRef } = await import("./image-refs.js");
+      // Runs after a committed delete, so a failure must not abort the run and
+      // drop the audit rows for deletes that already happened.
+      const releaseImageRef = (path: string) =>
+        decrementImageRef(kv, sdk, path).catch((err) => {
+          logger.warn("Eviction image ref release failed", {
+            path,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       let indexCleaned = false;
       const removeObservation = (
         sessionId: string,
@@ -145,6 +154,12 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
         expiredMemories: 0,
         nonLatestMemories: 0,
         dryRun,
+      };
+      // Only ids whose delete went through land here.
+      const evicted: Record<"session" | "observation" | "memory", Array<{ id: string; reason: string }>> = {
+        session: [],
+        observation: [],
+        memory: [],
       };
 
       let recoveredStaleSessions = 0;
@@ -220,12 +235,11 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
               session.project,
               session.id,
             ).catch(() => {});
-            await recordAudit(kv, "delete", "mem::evict", [session.id], {
-              resource: "session",
+            evicted.session.push({
+              id: session.id,
               reason: recovered
                 ? "stale_session_recovered_then_evicted"
                 : "stale_session_without_summary",
-              dryRun,
             });
           }
         }
@@ -271,14 +285,9 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
                 continue;
               }
               await unindexObservationSession(kv, o.id).catch(() => {});
-              if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData);
-              if (removed.imageRef && removed.imageRef !== removed.imageData) await decrementImageRef(kv, sdk, removed.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
-                reason: "low_importance_old_observation",
-                sessionId: session.id,
-                dryRun,
-              });
+              if (removed.imageData) await releaseImageRef(removed.imageData);
+              if (removed.imageRef && removed.imageRef !== removed.imageData) await releaseImageRef(removed.imageRef);
+              evicted.observation.push({ id: o.id, reason: "low_importance_old_observation" });
             }
           }
         }
@@ -319,14 +328,9 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
                 continue;
               }
               await unindexObservationSession(kv, o.id).catch(() => {});
-              if (removed.imageData) await decrementImageRef(kv, sdk, removed.imageData);
-              if (removed.imageRef && removed.imageRef !== removed.imageData) await decrementImageRef(kv, sdk, removed.imageRef);
-              await recordAudit(kv, "delete", "mem::evict", [o.id], {
-                resource: "observation",
-                reason: "project_observation_cap",
-                sessionId: o.sessionId,
-                dryRun,
-              });
+              if (removed.imageData) await releaseImageRef(removed.imageData);
+              if (removed.imageRef && removed.imageRef !== removed.imageData) await releaseImageRef(removed.imageRef);
+              evicted.observation.push({ id: o.id, reason: "project_observation_cap" });
             }
           }
         }
@@ -362,13 +366,9 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
                 vectorIndexRemove(mem.id);
                 indexCleaned = true;
                 if (mem.imageRef) {
-                  await decrementImageRef(kv, sdk, mem.imageRef);
+                  await releaseImageRef(mem.imageRef);
                 }
-                await recordAudit(kv, "delete", "mem::evict", [mem.id], {
-                  resource: "memory",
-                  reason: "expired_memory",
-                  dryRun,
-                });
+                evicted.memory.push({ id: mem.id, reason: "expired_memory" });
                 await deleteAccessLog(kv, mem.id);
               }
             }
@@ -401,13 +401,9 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
                 vectorIndexRemove(mem.id);
                 indexCleaned = true;
                 if (mem.imageRef) {
-                  await decrementImageRef(kv, sdk, mem.imageRef);
+                  await releaseImageRef(mem.imageRef);
                 }
-                await recordAudit(kv, "delete", "mem::evict", [mem.id], {
-                  resource: "memory",
-                  reason: "old_non_latest_memory",
-                  dryRun,
-                });
+                evicted.memory.push({ id: mem.id, reason: "old_non_latest_memory" });
                 await deleteAccessLog(kv, mem.id);
               }
             }
@@ -415,6 +411,17 @@ export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
         }
       } finally {
         await deleteFacetsForTargets(kv, deletedMemIds);
+        for (const [resource, rows] of Object.entries(evicted)) {
+          if (rows.length === 0) continue;
+          const byReason: Record<string, number> = {};
+          for (const r of rows) byReason[r.reason] = (byReason[r.reason] ?? 0) + 1;
+          await recordAudit(kv, "delete", "mem::evict", rows.map((r) => r.id), {
+            resource,
+            evicted: rows.length,
+            byReason,
+            dryRun,
+          });
+        }
         if (indexCleaned) await flushIndexSave();
       }
 
