@@ -575,7 +575,7 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     let releaseA!: (reply: string) => void;
     let markAEntered!: () => void;
     const aEntered = new Promise<void>((resolve) => (markAEntered = resolve));
-    providerWith(
+    const provider = providerWith(
       vi
         .fn()
         .mockImplementationOnce(() => {
@@ -586,11 +586,16 @@ describe("Consolidation Pipeline semantic regrowth", () => {
     );
     await seedSummaries(1, 6);
 
+    // The in-flight guard turns away a second run in the same worker, so run B
+    // comes from a second worker sharing the store, as two processes would.
+    const sdkB = mockSdk();
+    registerConsolidationPipelineFunction(sdkB as never, kv as never, provider as never);
+
     // Run A has listed summaries 1 to 6 and waits on the LLM.
     const runA = run();
     await aEntered;
     await seedSummaries(0, 0);
-    const b = await run();
+    const b = (await sdkB.trigger("mem::consolidate-pipeline", { tier: "semantic" })) as Run;
     releaseA(`<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`);
     await runA;
 
