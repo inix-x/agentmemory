@@ -36,8 +36,14 @@ async function rig(snapshotRead: "throws" | "ok" = "ok") {
   }
   const rebuild = (data?: { force?: boolean }) =>
     sdk.trigger("mem::graph-snapshot-rebuild", data) as Promise<Record<string, unknown>>;
+  // collectAll pages a scope through state::list_keys plus gets (#1636); a
+  // plain kv.list still goes through state::list. Either one is an enumeration.
   const graphLists = () =>
-    state.calls.filter((c) => c.id === "state::list" && (c.scope.startsWith(KV.graphNodes) || c.scope.startsWith(KV.graphEdges)));
+    state.calls.filter(
+      (c) =>
+        (c.id === "state::list" || c.id === "state::list_keys") &&
+        (c.scope.startsWith(KV.graphNodes) || c.scope.startsWith(KV.graphEdges)),
+    );
   return { ...state, rebuild, graphLists };
 }
 
