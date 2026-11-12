@@ -41,7 +41,11 @@ export function evaluateHealth(
     degraded = true;
   }
 
-
+  // kvConnectivity is absent on snapshots persisted before the probe existed.
+  if (snapshot.kvConnectivity?.status === "error") {
+    alerts.push("kv_probe_failed");
+    critical = true;
+  }
 
   if (snapshot.eventLoopLagMs > cfg.eventLoopLagCriticalMs) {
     alerts.push(

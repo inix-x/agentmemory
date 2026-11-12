@@ -186,6 +186,13 @@ export function describeHealthAlert(slug: string): { level: "warn" | "error"; me
     };
   }
 
+  if (slug === "kv_probe_failed") {
+    return {
+      level: "error",
+      message: "The state store did not answer a write and read within 5 seconds, so saves and searches may be failing or slow.",
+      fix: "If it does not clear on the next health check, restart agentmemory. Run npx @agentmemory/agentmemory doctor if it keeps failing.",
+    };
+  }
   if (slug === "connection_reconnecting") {
     return {
       level: "warn",

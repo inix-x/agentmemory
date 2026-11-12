@@ -1751,6 +1751,8 @@
         return 'CPU ' + (m[1] === 'critical' ? 'critically high' : 'elevated') + ': ' + m[2] + '%.';
       if ((m = /^event_loop_lag_(warn|critical)_(\d+)ms$/.exec(f)))
         return 'Event loop ' + (m[1] === 'critical' ? 'severely delayed' : 'delayed') + ': ' + m[2] + ' ms behind. The worker is busy or blocked.';
+      if (f === 'kv_probe_failed')
+        return 'State store slow or unreachable: the health probe did not read back what it wrote within 5 s. Search and recall may stall.';
       if (f === 'connection_reconnecting')
         return 'Engine connection lost — reconnecting.';
       if ((m = /^connection_(.+)$/.exec(f)))
