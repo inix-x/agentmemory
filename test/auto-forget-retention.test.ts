@@ -230,6 +230,47 @@ describe("observation retention under env thresholds", () => {
     expect(await kv.get("mem:obs:s", "nulled")).not.toBeNull();
   });
 
+  // Synthetic rows carry importance 5 while LLM compression is pending or has
+  // failed. Deleting one loses the only copy of an observation that compression
+  // recovery would still turn into a real one.
+  it("keeps rows whose compression is pending or failed", async () => {
+    process.env["AGENTMEMORY_OBS_RETENTION_DAYS"] = "7";
+    process.env["AGENTMEMORY_OBS_RETENTION_MAX_IMPORTANCE"] = "7";
+    const compression = (status: "pending" | "failed" | "complete") => ({
+      status,
+      revision: `r-${status}`,
+      attempts: status === "pending" ? 0 : 1,
+    });
+    await seed(session("s", { updatedAt: daysAgo(40) }), [
+      obs("scored", "s", 40, 5),
+      { ...obs("pending", "s", 40, 5), compression: compression("pending") },
+      { ...obs("failed", "s", 40, 5), compression: compression("failed") },
+      { ...obs("complete", "s", 40, 5), compression: compression("complete") },
+    ]);
+
+    expect((await run()).lowValueObs.sort()).toEqual(["complete", "scored"]);
+    expect(await kv.get("mem:obs:s", "pending")).not.toBeNull();
+    expect(await kv.get("mem:obs:s", "failed")).not.toBeNull();
+  });
+
+  it("keeps a legacy raw row that was never compressed", async () => {
+    process.env["AGENTMEMORY_OBS_RETENTION_DAYS"] = "7";
+    process.env["AGENTMEMORY_OBS_RETENTION_MAX_IMPORTANCE"] = "7";
+    const raw = {
+      id: "raw",
+      sessionId: "s",
+      timestamp: daysAgo(40),
+      hookType: "post_tool_use",
+      raw: { tool_name: "Bash" },
+    } as unknown as CompressedObservation;
+    await seed(session("s", { updatedAt: daysAgo(40) }), [obs("scored", "s", 40, 5)]);
+    // A raw row was never indexed, so it is stored without going through seed().
+    await kv.set("mem:obs:s", raw.id, raw);
+
+    expect((await run()).lowValueObs).toEqual(["scored"]);
+    expect(await kv.get("mem:obs:s", "raw")).not.toBeNull();
+  });
+
   it("stops at the per-run cap and reports the remainder", async () => {
     process.env["AGENTMEMORY_OBS_RETENTION_MAX_PER_RUN"] = "2";
     await seed(session("s", { updatedAt: daysAgo(40) }), [

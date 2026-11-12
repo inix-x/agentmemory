@@ -9,6 +9,8 @@ import { unindexObservationSession } from "../state/obs-index.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
+import { needsCompression } from "./compression-state.js";
+import { compressionInFlight } from "./compress.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
 import {
@@ -204,19 +206,25 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
       const maxImportance = getObsRetentionMaxImportance();
       const maxPerRun = getObsRetentionMaxPerRun();
       const cutoff = now - retentionDays * MS_PER_DAY;
-      // A row with no importance was never scored, so it is kept.
+      // A row with no importance was never scored, so it is kept. So is a row
+      // whose LLM compression is pending or failed: its importance is the
+      // synthetic placeholder, and compression recovery still needs the row.
+      // A row whose compression is running stays a candidate; the re-read under
+      // the observation lock waits for that commit and judges the final row.
       const isLowValue = (o: CompressedObservation | null): o is CompressedObservation =>
         !!o?.timestamp &&
         new Date(o.timestamp).getTime() < cutoff &&
         typeof o.importance === "number" &&
         o.importance <= maxImportance;
+      const isCandidate = (sessionId: string, o: CompressedObservation): boolean =>
+        isLowValue(o) && (!needsCompression(o) || compressionInFlight(kv, sessionId, o.id));
       const deletedObs: string[] = [];
       for (let i = 0; i < sessions.length; i++) {
         // The whole session has to be idle, not just the row, so a live
         // session does not lose rows its next turn would re-extract.
         if (lastTouched(sessions[i]) > cutoff) continue;
         for (const obs of obsPerSession[i]) {
-          if (isLowValue(obs)) {
+          if (isCandidate(sessions[i].id, obs)) {
             if (result.lowValueObs.length >= maxPerRun) {
               result.lowValueRemaining++;
               continue;
@@ -227,7 +235,7 @@ export function registerAutoForgetFunction(sdk: IIIClient, kv: StateKV): void {
               try {
                 removed = await withKeyedLock(`obs:${sessions[i].id}`, async () => {
                   const current = await kv.get<CompressedObservation>(KV.observations(sessions[i].id), obs.id);
-                  if (!isLowValue(current)) return null;
+                  if (!isLowValue(current) || needsCompression(current)) return null;
                   await markCaptureEventDeleted(kv, current);
                   await kv.delete(KV.observations(sessions[i].id), obs.id);
                   getSearchIndex().remove(obs.id);
