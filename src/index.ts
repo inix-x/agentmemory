@@ -10,6 +10,7 @@ import {
   loadTeamConfig,
   loadSnapshotConfig,
   isGraphExtractionEnabled,
+  isGraphWriteEnabled,
   isAutoCompressEnabled,
   isConsolidationEnabled,
   getConsolidationIntervalMs,
@@ -346,7 +347,9 @@ async function main() {
   const graphIndexMigration = registerGraphIndexMigrationFunctions(sdk, kv);
   registerGraphImportFunction(sdk, kv);
   bootLog(
-    `Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`,
+    isGraphWriteEnabled()
+      ? `Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`
+      : "Knowledge graph: graph writes off (GRAPH_WRITES_ENABLED is not set)",
   );
 
   registerConsolidationPipelineFunction(sdk, kv, provider);
