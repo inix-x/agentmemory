@@ -836,7 +836,10 @@ describe("IndexPersistence orphan sweep on a fork-written store", () => {
     expect(present(liveVectors).every(Boolean)).toBe(true);
     expect(await kv.get(INDEX_SCOPE, "vectors:manifest")).toMatchObject({ generation: LIVE_VECTORS });
     expect(present(orphans).some(Boolean)).toBe(false);
-    expect(await kv.get(INDEX_SCOPE, SWEEP_KEY)).toMatchObject({ v: 1, generations: 2, shards: orphans.length, failed: 0 });
+    // The merged #1256 (2c96ade) writes the done marker only once no legacy
+    // generation is left. The live vector generation stays while vector search
+    // is off, so the sweep stays armed and runs again on the next boot.
+    expect(await kv.get(INDEX_SCOPE, SWEEP_KEY)).toBeNull();
   });
 
   it("migrates the live vector generation into buckets and deletes the stranded ones", async () => {
